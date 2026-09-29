@@ -2460,6 +2460,34 @@ the *dithered output*, after per-frame checks had already said "identical" twice
 
 ## 12. Still open
 
+- **`--no-gpu` video is broken, and the cause is a byte-count disagreement rather
+  than anything to do with the dither.** The dither itself is fine: on a single image
+  `RiemersmaBlocksCpu` is bit-identical to `RiemersmaBlocksCuda` (AE 0 at 16 and 256
+  colours), and the flat octree search is exact. The fault is on the output side.
+  The dither's result is float4 RGBA, `FloatsToRawParallel` makes it rgba64le at
+  **8 bytes per pixel**, and then the writer measures the frame with
+  `out_frame_bytes = out_yuv444 ? pixels * 3 : ...` and spawns the encoder with
+  `-pix_fmt yuv444p`, which is **3 bytes per pixel**. The host pushes 8 into a pipe
+  declared as 3; the encoder reads rgba64le bytes as planar YUV and the stream
+  desynchronises. Measured: a red band comes out green, and two runs of the identical
+  command differ in **48.7% of all bytes** (242,334,808 of 497,659,680, every channel,
+  max delta 255) -- at `--cpu-threads 1` as well, so it is not a race. The fix is
+  small and already exists in two other files: convert float4 to planar 4:4:4 on the
+  host, bit-exactly matching `d_rgb_to_yuv444`.
+  The comment directly above `out_frame_bytes` records this same bug class being
+  found once before -- "sharing one meant a 605-frame render came out as 226" -- and
+  that fix covered the GPU path, where the device writes 4:4:4 and the two counts
+  agree. The host path is not the default, which is why nothing noticed. Guarded by
+  `tools\probe-video-determinism.ps1`, which reports it as a known defect rather than
+  failing the suite.
+  - **A measurement trap worth keeping.** `magick compare -metric AE` on a
+    multi-frame file reports **one frame, not the clip**: it printed
+    `378618 (0.18259)`, and 0.18259 x 2073600 -- exactly one 1920x1080 frame -- is
+    378619, where over 60 frames the same count would be 0.00304. Every AE figure
+    taken while chasing this understated the damage by a factor of about 60, and the
+    conclusions drawn from them about magnitude were wrong. Count bytes across the
+    whole decode instead. (And do not byte-loop 500 MB in PowerShell; it times out.)
+
 - **The walk's cost is the palette's tree, and it is content-dependent.** Measured on
   the 18001-frame 1080p clip that motivated round eighteen: the walk kernel takes
   **387 ms** there against 166-181 ms on `tests/L605.mp4`, at identical geometry and

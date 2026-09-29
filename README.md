@@ -405,8 +405,21 @@ approximation by necessity, and that is the honest answer to "is video bit-exact
 **no**.
 
 There is no bit-exact video mode, and `--no-gpu` is not one. `--no-gpu` runs the *same*
-block walk on host workers: same partition, same approximation, just off the GPU. It is
-the way to check the GPU is not lying to you, not the way to get a different answer.
+block walk on host workers, so on paper it is the way to check the GPU is not lying to
+you without a second GPU. **On video it currently is not, because it has real bugs.**
+
+One is fixed: the host path was writing rgba64le into a pipe declared as planar 4:4:4,
+so the encoder read the wrong bytes and a red band came out green. `--no-gpu` and CUDA
+are now **AE 0** against each other on the `rgba64le` path.
+
+Two are open. The `yuv444` input mode is still misread on the host (16-bit elements
+read from an 8-bit planar buffer), and the host pipeline does not reproduce run to
+run — two runs of the identical command still differ, at `--cpu-threads 1` as well, so
+it is not a race. The same engine on a single *image* is bit-exact against CUDA, so all
+of this is the video plumbing rather than the block walk. Measurements are in the
+comment at the top of `tools/probe-video-determinism.ps1`; look there before trusting
+`--no-gpu` on video. **Treat it as CUDA-only until that test passes.**
+
 If per-pixel agreement with ImageMagick matters more than throughput, the dither has to
 be cut rather than parallelised, and that is an architectural change to the video
 pipeline — not a flag. It is not built.
@@ -555,7 +568,8 @@ Beyond that suite, `verify.ps1` also runs:
 |---|---|---|
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
 | `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
-| `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, and no frames lost | identical |
+| `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
+| `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count | 2/2, **1 known defect** |
 | `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
 
 That last one is the odd one out and earns its place. The other three all compare
@@ -571,6 +585,15 @@ as a slightly dark value until the buffer is reused across batches. So the check
 against the **source** rather than against another engine, and carries a negative control —
 the unvisited pixel must match the source *and* its neighbour must **not**, or a renderer
 that dithered nothing would pass.
+
+`probe-video-determinism.ps1` is the same idea applied one level up, and for the same
+reason: the video pipeline had **no** self-comparison at all, so any fault both engines
+shared there was invisible. That is where the `-shortest` frame-deleting bug lived — both
+engines dropped the same three frames, so comparing them agreed — and frame accounting had
+to be bolted on afterwards as a separate, differently-shaped check. It now also verifies
+the frame count from the file rather than from rdither's own report, because a pipeline
+that consistently drops frames reports a consistent number, and a self-consistent report
+is not evidence.
 
 ---
 

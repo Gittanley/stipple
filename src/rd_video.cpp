@@ -306,6 +306,77 @@ void FloatsToRaw(const RgbaF* src, std::uint16_t* dst, std::size_t pixels) {
   }
 }
 
+// float4 RGBA -> planar 8-bit 4:4:4, 3 bytes per pixel: Y plane, then U, then V.
+//
+// This is the host half of a conversion the GPU engines already do on the device, and
+// its absence is a shipped bug rather than a missing feature.  `--no-gpu` used to call
+// FloatsToRaw, which produces rgba64le at 8 bytes per pixel, and the writer was
+// measuring the frame at 3 bytes per pixel because `out_yuv444` defaults to true and
+// spawning the encoder with `-pix_fmt yuv444p`.  So the host pushed 8 bytes into a
+// pipe declared as 3: the encoder read rgba64le bytes as planar YUV, the stream
+// desynchronised, a red band came out green, and two runs of the same command
+// differed in 48.7% of all bytes -- at one worker as well, so not a race.  Guarded by
+// tools\\probe-video-determinism.ps1, which is where the numbers are.
+//
+// The arithmetic is a transliteration of `d_rgb_to_yuv444` in rd_blocks_cuda.cu (and
+// of `scatter_yuv444` in rd_opencl.cpp, which is a transliteration of that), NOT a
+// fresh derivation.  It has to match them bit for bit, because the whole claim the
+// project rests on is that the three engines agree; a host conversion that merely
+// looked right would put them 0.5% of pixels apart, which is the class of difference
+// nobody can see and everybody is annoyed by.
+//
+// The cast order matters and matches the device: truncate the float to int FIRST,
+// then shift by 8.  Shifting the float and converting afterwards is not the same
+// operation, and would round differently on the values that matter.
+void FloatsToYuv444(const RgbaF* src, unsigned char* dst, std::size_t pixels) {
+  for (std::size_t i = 0; i < pixels; ++i) {
+    const int r8 = static_cast<int>(src[i].r) >> 8;
+    const int g8 = static_cast<int>(src[i].g) >> 8;
+    const int b8 = static_cast<int>(src[i].b) >> 8;
+    const int yv = ((66 * r8 + 129 * g8 + 25 * b8 + 128) >> 8) + 16;
+    const int uv = ((-38 * r8 - 74 * g8 + 112 * b8 + 128) >> 8) + 128;
+    const int vv = ((112 * r8 - 94 * g8 - 18 * b8 + 128) >> 8) + 128;
+    dst[i] = static_cast<unsigned char>(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+    dst[pixels + i] = static_cast<unsigned char>(uv < 0 ? 0 : (uv > 255 ? 255 : uv));
+    dst[2 * pixels + i] =
+        static_cast<unsigned char>(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+  }
+}
+
+void FloatsToYuv444Parallel(const RgbaF* src, unsigned char* dst,
+                            std::size_t pixels, int frames, int threads) {
+  if (frames <= 1 || threads <= 1) {
+    FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(frames));
+    return;
+  }
+  const int workers = std::max(1, std::min(threads, frames));
+  if (workers == 1) {
+    FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(frames));
+    return;
+  }
+  // Split by FRAME, not by byte.  A frame is three contiguous planes, so a
+  // frame-aligned partition is what gives each thread whole planes; splitting the
+  // byte range instead would hand one thread part of the Y plane and another part of
+  // the U plane, which is the same class of mistake as the one this function exists to
+  // fix.
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  const int chunk = (frames + workers - 1) / workers;
+  const int first = std::min(frames, chunk);
+  for (int w = 1; w < workers; ++w) {
+    const int f0 = w * chunk;
+    if (f0 >= frames) break;
+    const int f1 = std::min(frames, f0 + chunk);
+    const std::size_t count = static_cast<std::size_t>(f1 - f0) * pixels;
+    pool.emplace_back([=]() {
+      FloatsToYuv444(src + static_cast<std::size_t>(f0) * pixels,
+                     dst + static_cast<std::size_t>(f0) * pixels * 3, count);
+    });
+  }
+  FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(first));
+  for (std::thread& t : pool) t.join();
+}
+
 std::string Quote(const std::string& s) { return "\"" + s + "\""; }
 
 }  // namespace
@@ -2785,8 +2856,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // `out16` itself, so this would be pure waste -- and it would overwrite correct
     // bytes with a float4 buffer that no longer holds the result.
     if (!b.raw_ready) {
-      FloatsToRawParallel(b.pixels.data(), b.out(), pixels, b.frames,
-                          writer_convert_threads);
+      if (out_yuv444 && !use_gpu) {
+        // The host has to do what the device does on the GPU path.  Without this the
+        // writer would call FloatsToRaw, hand the encoder rgba64le, and the encoder
+        // would read it as planar 4:4:4 -- see FloatsToYuv444 for what that cost.
+        FloatsToYuv444Parallel(b.pixels.data(),
+                               reinterpret_cast<unsigned char*>(b.out()), pixels,
+                               b.frames, writer_convert_threads);
+      } else {
+        FloatsToRawParallel(b.pixels.data(), b.out(), pixels, b.frames,
+                            writer_convert_threads);
+      }
     }
     const double e1 = NowMs();
     // A batch that straddles the segment boundary is written in part: the frames past

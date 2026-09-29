@@ -144,4 +144,22 @@ if (Test-Path $unv) {
     default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
+
+# And a fifth: the image determinism probe again, pointed at VIDEO.  The image one
+# is a self-comparison across time rather than an engine-against-engine comparison,
+# which is the only shape of check that sees a fault both engines share -- and two
+# separate bugs lived there.  The video pipeline had no such check at all, so a
+# reintroduction of the -shortest frame-deleting class in the palette or read stage
+# would not have been caught by anything: probe-video-exact compares the engines
+# against each other, and both would drop the same frames.
+$vdet = Join-Path $PSScriptRoot 'tools\probe-video-determinism.ps1'
+if (Test-Path $vdet) {
+  Write-Host ""
+  & pwsh -NoProfile -File $vdet
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "video determinism: SKIPPED (no tests\clip1920_audio.mkv)" -ForegroundColor Yellow }
+    default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
 exit 0
