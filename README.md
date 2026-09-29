@@ -28,7 +28,20 @@ images and video.
 
 ## Licence
 
-**GPL-3.0-or-later.** Full text in [LICENSE](LICENSE).
+**GPL-3.0-or-later.** Full text in [LICENSE](LICENSE), verbatim as published by the
+Free Software Foundation.
+
+    Copyright (c) 2026 Gittanley, prompt operator
+    SPDX-License-Identifier: GPL-3.0-or-later
+
+All source code here was written by an AI assistant operating under the name
+**"Space Bunny"**, directed by the prompt operator — see the note at the top of this
+file, and the SPDX identifier in the header of every source file. The copyright is the
+prompt operator's because a purely AI-generated work has no copyright owner in most
+jurisdictions, and the human here supplied the goals, the bug diagnoses, the rejected
+approaches and the decisions about what ships. `LICENSE` itself is kept exactly as
+gnu.org publishes it, unaltered, because that is the form licence-detection tooling
+expects.
 
 You may use, study, modify and redistribute this freely, and **anything you build on
 it must also be free and open source** — that is what copyleft means here, and it is
