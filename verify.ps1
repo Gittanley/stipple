@@ -1,0 +1,129 @@
+<#
+  verify.ps1 -- bit-exactness sweep against ImageMagick's own Riemersma dither.
+
+  Every case is checked twice:
+    1. rdither --verify, which runs IM's full pipeline internally and diffs
+       pixel-for-pixel;
+    2. `magick compare -metric AE`, an independent path through the CLI.
+
+  Exit code 0 means every case reported AE=0 on both engines.
+#>
+param(
+  [string]$Rdither   = ".\build\Release\rdither.exe",
+  [string]$Magick    = "magick",
+  [int[]] $Colors    = @(2, 4, 16, 64, 256),
+  [string]$ImageDir  = "tests"
+)
+
+# `magick compare -metric AE` reports its metric on stderr, which PowerShell
+# would otherwise promote to a terminating error under Stop.
+$ErrorActionPreference = "Continue"
+$env:MAGICK_HOME = if ($env:MAGICK_HOME) { $env:MAGICK_HOME } else { "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI" }
+
+if (-not (Test-Path $Rdither)) { throw "rdither not found at $Rdither (run build.bat first)" }
+
+# ---- fixtures ---------------------------------------------------------------
+$fixtures = @{
+  "t_1x1"     = @("-size", "1x1",   "xc:red")
+  "t_3x5"     = @("-size", "3x5",   "plasma:fractal")
+  "t_17x13"   = @("-size", "17x13", "gradient:red-blue")
+  "t_wide"    = @("-size", "640x64", "plasma:fractal")
+  "in_grad"   = @("-size", "64x64", "gradient:black-white", "-colorspace", "sRGB")
+  "in_plasma" = @("-size", "96x64", "plasma:fractal", "-colorspace", "sRGB")
+  "in_shapes" = @("-size", "64x64", "xc:gray50", "-fill", "red", "-draw", "circle 32,32 32,8")
+}
+
+New-Item -ItemType Directory -Force $ImageDir | Out-Null
+foreach ($name in $fixtures.Keys) {
+  $path = Join-Path $ImageDir "$name.png"
+  if (-not (Test-Path $path)) {
+    & $Magick @($fixtures[$name]) $path
+  }
+}
+# Alpha and noise cases are derived from a base image.
+if (-not (Test-Path "$ImageDir\in_alpha.png")) {
+  & $Magick "$ImageDir\in_plasma.png" -alpha set -channel A -evaluate set 60% +channel "$ImageDir\in_alpha.png"
+}
+if (-not (Test-Path "$ImageDir\noisy.png")) {
+  & $Magick -size 512x384 plasma:fractal -attenuate 0.4 +noise Gaussian -colorspace sRGB "$ImageDir\noisy.png"
+}
+
+$images = @("t_1x1", "t_3x5", "t_17x13", "t_wide", "in_grad", "in_plasma",
+            "in_shapes", "in_alpha", "noisy")
+
+$engines = @(
+  @{ name = "cpu";        args = @("--engine", "cpu") },
+  @{ name = "cuda";       args = @("--engine", "cuda") },
+  @{ name = "cpu/disk";   args = @("--engine", "cpu", "--max-ram-mb", "1") }
+)
+
+$pass = 0; $fail = 0
+foreach ($img in $images) {
+  $src = Join-Path $ImageDir "$img.png"
+  foreach ($c in $Colors) {
+    $ref = Join-Path $ImageDir "$($img)_$($c)_ref.png"
+    & $Magick $src -dither Riemersma -colors $c $ref | Out-Null
+    foreach ($e in $engines) {
+      $out = Join-Path $ImageDir "$($img)_$($c)_$($e.name -replace '/','_').png"
+      $text = (& $Rdither @($e.args) --colors $c --verify --quiet $src $out 2>&1 | Out-String)
+      $internal = $text -match "BIT-EXACT"
+      # Independent confirmation through the ImageMagick CLI.  `compare -metric`
+      # prints to stderr, so it is funnelled through cmd to keep the number
+      # clean instead of wrapped in a PowerShell ErrorRecord.
+      $aeText = (& cmd /c "`"$Magick`" compare -metric AE `"$out`" `"$ref`" null: 2>&1" | Out-String).Trim()
+      $ae = ($aeText -split '\s+')[0]
+      $ok = $internal -and ($ae -eq "0")
+      if ($ok) { $pass++ } else {
+        $fail++
+        Write-Host ("FAIL {0,-10} colors={1,-4} {2,-9} internal={3} compare_AE={4}" -f `
+                    $img, $c, $e.name, $internal, $ae) -ForegroundColor Red
+        if ($text.Trim()) { Write-Host "     $($text.Trim())" }
+      }
+    }
+  }
+}
+
+Write-Host ""
+Write-Host "bit-exact cases: $pass passed, $fail failed"
+if ($fail -gt 0) { exit 1 }
+
+# Bit-exactness against ImageMagick is a comparison between two implementations, so
+# it is structurally unable to see a fault that BOTH have.  The unfilled-pixel-channel
+# bug in the image writer was exactly that: it made the encoder pick a different PNG
+# type from stale heap memory, and it was invisible here for as long as both paths
+# were wrong in the same way at the same time.
+#
+# So this also runs each engine against ITSELF, repeatedly.  It needs fixtures that
+# only tools\probe-opencl-exact.ps1 generates, hence the wrapper: if those are absent
+# the determinism probe exits 2 ("cannot run"), and that is reported as skipped
+# rather than as a pass and not as a failure.  A check that cannot run and says so is
+# the difference between a missing fixture and a silent hole in the suite.
+$det = Join-Path $PSScriptRoot 'tools\probe-determinism.ps1'
+if (Test-Path $det) {
+  Write-Host ""
+  & pwsh -NoProfile -File $det
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "determinism: SKIPPED (fixtures missing -- run tools\probe-opencl-exact.ps1)" -ForegroundColor Yellow }
+    default { Write-Host "determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
+# The video pipeline is a third comparison, and neither of the two above can stand
+# in for it: the image probes never build a batch, never run the reader, and never
+# touch the uint16 data path, which is the part that differs most between an image
+# and a video frame.  It also decodes ~450 MB, so it is kept out of the way rather
+# than run by default -- but it is wired in, because a check nothing invokes is a
+# check that rots.  Exit 2 from the probe means "cannot run" (no clip), and that is
+# reported as skipped, never as a pass and never as a failure.
+$vid = Join-Path $PSScriptRoot 'tools\probe-video-exact.ps1'
+if (Test-Path $vid) {
+  Write-Host ""
+  & pwsh -NoProfile -File $vid
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "video: SKIPPED (no tests\clip1920.mp4)" -ForegroundColor Yellow }
+    default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+exit 0

@@ -1,0 +1,160 @@
+# Is the OpenCL engine bit-identical to the CUDA blocks engine?
+#
+# The comparison has to be per-pixel, not a whole-file string compare.  Two traps
+# already paid for in this project:
+#
+#   * `magick x.png -depth 8 txt:` and the same on y.png produce strings that can
+#     differ in trailing whitespace while every pixel matches, so a plain -eq
+#     reports "different" for identical images.  Count differing LINES instead.
+#
+#   * A run that fails still leaves a stale output file behind, and a stale file
+#     compares as "different" with no indication that the engine never ran.  So
+#     the output is deleted first and the exit code is captured and reported.
+#
+# Anything that is not bit-exact here is a real defect: the two engines are
+# specified to have the same partition and the same arithmetic, so "close" is not
+# an acceptable outcome, and a small scattered difference is the signature of an
+# arithmetic disagreement rather than of a structural one.
+
+param(
+  [string]$Dir = "$env:TEMP\rdocl",
+  [int]$Cols = 2
+)
+
+# NOT 'Stop'.  rdither writes diagnostics to stderr, and a native command's stderr
+# surfaces as a non-terminating error record; under 'Stop' the first "[blocks]"
+# notice aborts the whole sweep before it starts.  Failures are detected from the
+# exit codes below, which is the thing that actually means failure.
+$ErrorActionPreference = 'Continue'
+$rd = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Release\rdither.exe'
+if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
+
+# Images chosen to separate the failure modes: a flat field (no error queue
+# activity at all), a pure ramp (error queue active, two colours), noise (deep
+# tree, 16 colours), plasma (worst case for the octree search), and -- added
+# after a round-1 finding -- two ALPHA cases, because associate_alpha changes the
+# error queue, the octave fan-out (8 children vs 16) and the scatter, and was
+# therefore the one branch of the port with no coverage at all.
+& magick -size 64x48 xc:'#4080C0' "$Dir\c_flat.png" 2>&1 | Out-Null
+& magick -size 64x48 gradient:black-white "$Dir\c_ramp.png" 2>&1 | Out-Null
+& magick -size 96x64 plasma:fractal -seed 7 "$Dir\c_plasma.png" 2>&1 | Out-Null
+& magick -size 96x64 xc:gray +noise Random "$Dir\c_noise.png" 2>&1 | Out-Null
+# Uniform alpha: exercises the association without a discontinuity.
+& magick -size 96x64 gradient:red-blue "$Dir\c_astuff.png" 2>&1 | Out-Null
+cmd /c "magick ""$Dir\c_astuff.png"" -alpha set -channel A -evaluate set 50%% +channel ""$Dir\c_alpha50.png""" 2>&1 | Out-Null
+# Hard alpha edge on a transparent field: the worst case for the alpha error
+# queue, and it also trips the greyscale detection path (ImageMagick reduces this
+# to graya, so the tree is built with a different child count again).
+cmd /c "magick -size 96x64 xc:none -fill ""rgba(200,40,120,0.35)"" -draw ""circle 48,32 48,10"" ""$Dir\c_ashape.png""" 2>&1 | Out-Null
+
+function Pixels($path) {
+  if (-not (Test-Path $path)) { return @() }
+  $lines = & magick $path -depth 8 "txt:" 2>$null
+  # Drop the header line; keep the pixel lines only.
+  $lines | Select-Object -Skip 1
+}
+
+function Compare-Pair($img, $colors, $block, $tag) {
+  # A UNIQUE output path per cell.  This is not tidiness, it is a bug fix: the
+  # earlier version reused one filename for all 54 cells and deleted it with
+  # -EA SilentlyContinue, which hides a failed delete.  On this machine roughly
+  # two cells per run then compared a *stale* file from an earlier cell against
+  # the current one -- a different palette, so ~100% of pixels differ, first
+  # difference at pixel 0 -- and the failing cells MOVED between runs.  A
+  # nondeterministic comparison cannot distinguish a real defect from its own
+  # debris, and it is worse than no test because it looks like a finding.
+  $cu = "$Dir\cell_${tag}_cu.png"
+  $cl = "$Dir\cell_${tag}_cl.png"
+
+  # Capture the output, do NOT discard it.  These were originally piped to
+  # Out-Null, which assigned $e1/$e2 the value of Out-Null -- that is, $null --
+  # so the documented-refusal check below could never match and the failure
+  # messages were empty.  The variable being named suggests otherwise, which is
+  # how it survived review.
+  $e1 = (& $rd --engine blocks --blocks $block --colors $colors $img $cu 2>&1) -join "`n"
+  $rc1 = $LASTEXITCODE
+  $e2 = (& $rd --engine opencl --blocks $block --colors $colors $img $cl 2>&1) -join "`n"
+  $rc2 = $LASTEXITCODE
+
+  if ($rc1 -ne 0 -or $rc2 -ne 0) {
+    # There is exactly one refusal left in this engine, and it has nothing to do
+    # with alpha: a palette too large for the 4-bit nibble packing is declined
+    # rather than silently computed some other way, because that would redefine
+    # what --engine means.  The sweep uses palettes that fit, so any refusal here
+    # is a real failure and is reported as one.
+    #
+    # The alpha cells used to land in this branch and be waved through as "refused
+    # (alpha: known nondeterministic, by design)".  That was 18 of 54 cells
+    # permanently exempted from comparison, on the strength of a fault that was
+    # never in this engine -- it was unfilled channels in the image writer, now
+    # fixed.  They are compared for real below, like every other cell.
+    Remove-Item -EA SilentlyContinue $cu, $cl
+    return "FAIL rc=$rc1/$rc2  $($e2 | Select-Object -First 1)"
+  }
+  # Existence and non-trivial size are checked BEFORE the pixel read, because a
+  # missing or empty file otherwise reads as "every pixel differs" (each line
+  # compared against $null).  That produced a false bug report on the alpha path
+  # in this same round.
+  foreach ($f in @($cu, $cl)) {
+    if (-not (Test-Path $f)) {
+      Remove-Item -EA SilentlyContinue $cu, $cl
+      return "FAIL missing output $f"
+    }
+    if ((Get-Item $f).Length -lt 64) {
+      Remove-Item -EA SilentlyContinue $cu, $cl
+      return "FAIL truncated output $f ($((Get-Item $f).Length) bytes)"
+    }
+  }
+
+  $a = Pixels $cu
+  $b = Pixels $cl
+  if ($a.Count -eq 0 -or $b.Count -eq 0) {
+    Remove-Item -EA SilentlyContinue $cu, $cl
+    return "FAIL unreadable output (cuda $($a.Count) px, opencl $($b.Count) px)"
+  }
+  $result = ''
+  if ($a.Count -ne $b.Count) {
+    $result = "FAIL size mismatch (cuda $($a.Count) px, opencl $($b.Count) px)"
+  } else {
+    $n = $a.Count
+    $d = 0
+    $first = -1
+    for ($i = 0; $i -lt $n; $i++) {
+      if ($a[$i] -ne $b[$i]) {
+        if ($first -lt 0) { $first = $i }
+        $d++
+      }
+    }
+    if ($d -eq 0) {
+      $result = "identical ($n px)"
+    } else {
+      $result = ("DIFFER {0}/{1} ({2:N2}%), first at px {3}" -f $d, $n, (100.0 * $d / $n), $first)
+    }
+  }
+  Remove-Item -EA SilentlyContinue $cu, $cl
+  return $result
+}
+
+$imgs = @('c_flat', 'c_ramp', 'c_noise', 'c_plasma', 'c_alpha50', 'c_ashape')
+$blocks = @(16, 64, 512)
+$fail = 0
+$total = 0
+''
+'OpenCL vs CUDA blocks, per-pixel'
+''
+foreach ($img in $imgs) {
+  foreach ($c in @(2, 4, $Cols)) {
+    foreach ($b in $blocks) {
+      $tag = "{0}_{1}_{2}" -f $img, $c, $b
+      $r = Compare-Pair "$Dir\$img.png" $c $b $tag
+      $total++
+      # Every cell is compared for real, alpha included.  There is no outcome
+      # that counts as a pass without being a comparison.
+      if ($r -notlike 'identical*') { $fail++ }
+      '  {0,-10} colors={1,-3} B={2,-4} {3}' -f $img, $c, $b, $r
+    }
+  }
+}
+''
+'{0} of {1} comparisons identical; {2} not.' -f ($total - $fail), $total, $fail
+if ($fail -gt 0) { exit 1 }

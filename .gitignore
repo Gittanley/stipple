@@ -1,0 +1,71 @@
+# Build output
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ---------------------------------------------------------------------------
+# Vendored dependencies -- NOT part of rdither, and enormous
+# ---------------------------------------------------------------------------
+# FFmpeg-master/ is 10,772 files and 88 MB of someone else's project, unpacked
+# alongside the source for reference.  OpenCL-SDK-* is the Khronos SDK, which
+# CMakeLists.txt auto-detects beside the tree.  Both are third-party, both are
+# re-obtainable from their own projects, and committing either would bury this
+# repository's own history under theirs.
+#
+# The README says where each comes from and that the build expects them beside
+# the source rather than inside it.
+/FFmpeg-master/
+/OpenCL-SDK-*/
+
+# Probe binaries.  tools\probe_swscale_matrix.cpp is tracked; its .exe is not,
+# because a 220 KB binary in a source tree is the kind of thing that gets
+# committed by accident and then conflicts on every branch.  Rebuild it from
+# the .cpp.  The scripts under tools\ are tracked -- they are the record of how
+# the measurements were taken, which is the part worth keeping.
+*.exe
+
+# Rendered clips and scratch frames
+*.mkv
+*.mp4
+*.nut
+n.mkv
+o.mkv
+
+# ---------------------------------------------------------------------------
+# Test fixtures
+# ---------------------------------------------------------------------------
+# tests/ splits into three kinds of file, and only one of them belongs in git.
+#
+#   INPUTS      in_*.png, noisy.png, t_*.png, c*.png, g*.png  -- the images
+#               verify.ps1 builds its cases from.  Tracked, because the test
+#               suite is the thing worth reproducing.
+#
+#   OUTPUTS     *_ref.png, *_cpu.png, *_cuda.png, *_cpu_disk.png -- regenerated
+#               by every verify.ps1 run and by probe-opencl-exact.ps1.  180
+#               files, ~5 MB, and they are stale the moment anything changes.
+#               Tracked, they turn every measurement into a spurious diff.
+#
+#   LEFTOVERS   fhd.png, fhd_photo.png, big.png, smooth.png -- 23 MB of large
+#               images that no test, script or source file references at all
+#               (checked: zero hits across verify.ps1, tools\*.ps1 and src\).
+#               Not committed, and regenerable from the same ImageMagick calls
+#               the fixtures use.
+*_ref.png
+*_cpu.png
+*_cuda.png
+*_cpu_disk.png
+tests/fhd.png
+tests/fhd_photo.png
+tests/big.png
+tests/smooth.png
+
+# Editor and OS noise
+.vscode/
+.vs/
+Thumbs.db
+.DS_Store
+*.swp
