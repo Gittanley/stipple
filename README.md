@@ -26,6 +26,28 @@ images and video.
 > You are welcome to use it, audit it, or throw it away. If you find a fault, the
 > useful thing to say is *what you measured*, not *what you expected*.
 
+## Licence
+
+**GPL-3.0-or-later.** Full text in [LICENSE](LICENSE).
+
+You may use, study, modify and redistribute this freely, and **anything you build on
+it must also be free and open source** — that is what copyleft means here, and it is
+the part most worth having. There is no fee, no registration, and no requirement that
+you credit me.
+
+Two things it deliberately does *not* do, because a licence that did would not be open
+source:
+
+- **It does not stop you using the finished tool commercially.** If you need to forbid
+  that, you need a proprietary licence, and you lose the open-source status. The GPL
+  trades that off on purpose.
+- **It does not stop proprietary *tools* from touching the code.** Compiling it with
+  NVIDIA's CUDA toolkit, or linking against ImageMagick, does not make your build a
+  derivative. Only redistributing the result would.
+
+The patent grant in GPL-3.0 is why I chose it over GPL-2.0: you cannot be sued for
+using this.
+
 If you point it at an image and ask for 16 colours, you get back the same 16 colours
 ImageMagick would have produced, the same pixels, byte for byte — not "similar", not
 "close enough to pass". That is the design goal, and it is checked on every build.

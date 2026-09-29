@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_checkpoint.h -- crash-safe progress record, so a render interrupted by a
 // power cut can be finished instead of restarted.
 //

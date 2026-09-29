@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_progress.cpp -- the implementation.  See rd_progress.h for the why.
 #include "rd_progress.h"
 

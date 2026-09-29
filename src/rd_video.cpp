@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_video.cpp -- ffmpeg-driven decode/encode around the GPU block engine.
 #include "rd_video.h"
 

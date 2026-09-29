@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_cli.cpp -- rdither, the Phase 1 command line front end.
 #include <algorithm>
 #include <chrono>

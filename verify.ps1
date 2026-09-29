@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 <#
   verify.ps1 -- bit-exactness sweep against ImageMagick's own Riemersma dither.
 

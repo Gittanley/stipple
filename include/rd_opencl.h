@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_opencl.h -- an OpenCL engine for the block walk.
 //
 // WHY THIS EXISTS.  The CUDA engine is the fast path on NVIDIA hardware.  On an

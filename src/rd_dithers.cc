@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_dithers.cc -- the error-diffusion dither algorithms.
 //
 // This file, plus examples\bayer_dither.cc and the void-and-cluster generator in

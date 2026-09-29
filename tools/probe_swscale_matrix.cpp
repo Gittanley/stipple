@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // probe_swscale_matrix.cpp -- determine the exact structure of swscale's 8-bit
 // YUV -> 16-bit RGB conversion, empirically.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_dither_common.h -- pieces shared by the non-Riemersma dither algorithms.
 //
 // NOT a public header.  It lives in src/ rather than include/ because the plugin

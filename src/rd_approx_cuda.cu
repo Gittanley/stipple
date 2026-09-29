@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_approx_cuda.cu -- GPU approximation of the Riemersma walk.
 //
 // ---------------------------------------------------------------------------

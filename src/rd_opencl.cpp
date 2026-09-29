@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_opencl.cpp -- OpenCL engine for the block walk.  See rd_opencl.h for scope
 // and the reason the blocks partition is the one being ported.
 #include "rd_opencl.h"

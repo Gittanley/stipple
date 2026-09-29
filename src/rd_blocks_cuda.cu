@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_blocks_cuda.cu -- single-pass block-parallel Riemersma, for when the goal
 // is the *look* rather than bit-exactness.
 //

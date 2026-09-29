@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_im.h -- ImageMagick bridge: decode, palette generation, encode.
 //
 // The palette is produced by ImageMagick's own QuantizeImage() with

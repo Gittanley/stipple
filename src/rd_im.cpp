@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_im.cpp -- ImageMagick bridge implementation (MagickCore C API).
 #include "rd_im.h"
 

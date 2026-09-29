@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_riemersma_cuda.cu -- CUDA engine for the bit-exact Riemersma walk.
 //
 // Bit-exactness notes (these are the whole ballgame here):

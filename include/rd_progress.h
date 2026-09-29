@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_progress.h -- one-line progress with an ETA.
 #ifndef RD_PROGRESS_H_
 #define RD_PROGRESS_H_

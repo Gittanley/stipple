@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_source.h -- RAM-first pixel store with a memory-mapped disk fallback.
 //
 // The dither walk touches every pixel exactly once but in Hilbert order, so the

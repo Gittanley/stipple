@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_octree.h -- faithful port of ImageMagick 7.1.2-31's quantize.c colour
 // octree, to the depth the Riemersma dither actually depends on.
 //

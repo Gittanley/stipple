@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_riemersma.h -- bit-exact reimplementation of ImageMagick 7.1.2-31
 // Riemersma dithering for Q16-HDRI, plus the engine entry points.
 //

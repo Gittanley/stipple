@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_video.h -- Phase 2: video decode -> GPU dither -> encode, driven by ffmpeg.
 //
 // Why ffmpeg owns decode and encode

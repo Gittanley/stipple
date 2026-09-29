@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_riemersma_cpu.cpp -- bit-exact CPU implementation and the shared curve
 // builder.  This file is the correctness oracle for the CUDA engine.
 #include "rd_riemersma.h"

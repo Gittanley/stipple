@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // bayer_dither.cc -- a complete, working second dither algorithm.
 //
 // This file exists to prove the plugin seam works end to end.  It is not there to be

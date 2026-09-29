@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_octree.cpp -- transliteration of the parts of ImageMagick 7.1.2-31
 // MagickCore/quantize.c that the Riemersma dither depends on.
 #include "rd_octree.h"

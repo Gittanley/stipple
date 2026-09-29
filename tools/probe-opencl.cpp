@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Does OpenCL actually work on this machine?
 //
 // Three things can each be present while OpenCL is still unusable, and they fail

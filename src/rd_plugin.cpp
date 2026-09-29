@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_plugin.cpp -- the dither registry.  See include/rd_plugin.h for the rationale.
 
 #include "rd_plugin.h"

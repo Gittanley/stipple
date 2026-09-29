@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "rd_checkpoint.h"
 
 #include <windows.h>

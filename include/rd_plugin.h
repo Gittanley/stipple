@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_plugin.h -- the seam for adding your own dither or filter.
 //
 // WHY THIS EXISTS

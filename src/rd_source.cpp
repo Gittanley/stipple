@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rd_source.cpp -- RAM-first allocation with a memory-mapped disk fallback.
 #include "rd_source.h"
 
