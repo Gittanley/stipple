@@ -60,43 +60,66 @@ if (-not (Test-Path $AudioClip)) {
   exit 2
 }
 
-# The OpenCL video path carries the rgba64le data path only, so both engines are run
-# with the settings that select it.  Running them with different settings would
-# compare a different question than the one being asked here.
+# BOTH data paths, because the engine now has two and only one of them was being
+# checked.
+#
+# The planar 4:4:4 path is CUDA's default and is the one that matters: it is 3 bytes
+# per pixel against rgba64le's 8, and being unable to use it is what made this engine
+# look 2.2x slower than CUDA when it is within about 8% on the same path.  It is also
+# a DIFFERENT code path -- its gather and scatter are different kernels with their own
+# constants -- so a pass on rgba64le says nothing about it.
+#
+# Both engines are always run with the settings that select the path under test.
+# Running them with different settings would compare a different question than the one
+# being asked here, which is exactly the mistake that produced the 2.2x figure.
 $env:RD_YUV444_OUT = '0'
 $tmp = Join-Path $env:TEMP 'rdvid_exact'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
-'OpenCL vs CUDA blocks, video pipeline, decoded frames'
-''
+# 'rgba64' keeps the pre-existing route (RD_YUV444_OUT=0, --input-mode rgba64).
+# 'yuv444'  drops RD_YUV444_OUT so the planar output kernel is used, and asks for
+#           the planar input mode.
+$paths = @(
+  @{ name = 'rgba64le (8 B/px)'; mode = 'rgba64'; yuv = '0' },
+  @{ name = 'yuv444p  (3 B/px)'; mode = 'yuv444'; yuv = $null }
+)
+
 $fail = 0
-foreach ($eng in @('blocks', 'opencl')) {
-  $out = Join-Path $tmp "clip_$eng.mkv"
-  Remove-Item -EA SilentlyContinue $out
-  $text = & $rd --video --engine $eng --colors $Colors --input-mode rgba64 `
-                 --video-lossless --no-audio $Clip $out 2>&1 | Out-String
-  $rc = $LASTEXITCODE
-  if ($rc -ne 0 -or -not (Test-Path $out)) {
-    $fail++
-    "  $eng  FAILED to run (exit $rc)"
-    ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3) |
-      ForEach-Object { "        $($_)" }
-    continue
+$compared = 0
+foreach ($p in $paths) {
+  if ($null -eq $p.yuv) { Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue }
+  else { $env:RD_YUV444_OUT = $p.yuv }
+
+  "data path: $($p.name)"
+  ''
+  $ran = @()
+  foreach ($eng in @('blocks', 'opencl')) {
+    $out = Join-Path $tmp "clip_$eng.mkv"
+    Remove-Item -EA SilentlyContinue $out
+    $text = & $rd --video --engine $eng --colors $Colors --input-mode $p.mode `
+                   --video-lossless --no-audio $Clip $out 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0 -or -not (Test-Path $out)) {
+      $fail++
+      "  $eng  FAILED to run (exit $rc)"
+      ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3) |
+        ForEach-Object { "        $($_)" }
+      continue
+    }
+    $ran += $eng
+    $fps = if ($text -match 'frames\s+:\s+(\d+) in [\d.]+ s \(([\d.]+) fps\)') {
+      "  $($Matches[1]) frames, $($Matches[2]) fps"
+    } else { "" }
+    "  $eng  ran ok$fps"
   }
-  $fps = if ($text -match 'frames\s+:\s+(\d+) in [\d.]+ s \(([\d.]+) fps\)') {
-    "  $($Matches[1]) frames, $($Matches[2]) fps"
-  } else { "" }
-  "  $eng  ran ok$fps"
-}
+  if ($ran.Count -ne 2) { ''; continue }
 
-if ($fail -gt 0) { "`n$fail engine(s) failed to run."; exit 1 }
-
-# Decode both to raw RGBA and compare hashes.  Decoding goes through cmd /c, not the
-# PowerShell pipeline: a native command's stdout piped through PowerShell is
-# re-encoded, which turns binary into text and destroys the thing being hashed.
-$hashes = @{}
-foreach ($eng in @('blocks', 'opencl')) {
-  $mkv = Join-Path $tmp "clip_$eng.mkv"
+  # Decode both to raw RGBA and compare hashes.  Decoding goes through cmd /c, not
+  # the PowerShell pipeline: a native command's stdout piped through PowerShell is
+  # re-encoded, which turns binary into text and destroys the thing being hashed.
+  $hashes = @{}
+  foreach ($eng in $ran) {
+    $mkv = Join-Path $tmp "clip_$eng.mkv"
   $raw = Join-Path $tmp "clip_$eng.raw"
   Remove-Item -EA SilentlyContinue $raw
   cmd /c "magick ""$mkv"" -depth 8 ""rgba:$raw""" 2>$null | Out-Null
@@ -110,9 +133,29 @@ foreach ($eng in @('blocks', 'opencl')) {
   "  $eng  decoded $([math]::Round((Get-Item $raw).Length / 1MB, 1)) MB  sha256 $h"
 }
 
-Remove-Item -EA SilentlyContinue (Join-Path $tmp 'clip_*.raw')
+  Remove-Item -EA SilentlyContinue (Join-Path $tmp 'clip_*.raw')
 
-if ($fail -gt 0) { "`n$fail engine(s) failed."; exit 1 }
+  if ($hashes['blocks'] -ne $hashes['opencl']) {
+    $fail++
+    "  DIFFER on $($p.name):"
+    "    the two engines are defined to have the same partition and the same"
+    "    arithmetic, so any difference is a defect, not a tolerance to negotiate."
+    "    A difference in the swscale constants or the plane stride shows up as a hue"
+    "    shift that looks like a dither bug."
+  } else {
+    $compared++
+    '  IDENTICAL: every decoded frame matches.'
+  }
+  ''
+}
+Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue
+
+if ($fail -gt 0) { "`n$fail check(s) failed."; exit 1 }
+if ($compared -eq 0) {
+  "`ncannot run: no data path produced two comparable engines."
+  exit 2
+}
+"$compared of $($paths.Count) data paths identical."
 
 # FRAME ACCOUNTING, on the clip that carries audio.  This is the check that would
 # have caught the -shortest bug, and it is separate from the hash comparison above
@@ -148,11 +191,7 @@ if ($srcFrames -lt 0 -or $outFrames -lt 0) {
 } else {
   "  ok  source $srcFrames frames, output $srcFrames frames -- none lost"
 }
-if ($hashes['blocks'] -ne $hashes['opencl']) {
-  ''
-  'DIFFER: the two engines did not produce the same frames.'
-  exit 1
-}
+if ($fail -gt 0) { ''; exit 1 }
 ''
-'IDENTICAL: every decoded frame matches.'
+"Frame accounting ok.  $compared of $($paths.Count) data paths bit-identical."
 exit 0

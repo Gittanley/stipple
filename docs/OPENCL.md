@@ -10,7 +10,7 @@ is bit-identical to `--engine blocks` (CUDA) everywhere this project can measure
 | images, 54 cells | `tools\probe-opencl-exact.ps1` | 54/54 identical |
 | images, 135 cases vs ImageMagick | `verify.ps1` | 135/135 |
 | run-to-run stability | `tools\probe-determinism.ps1` | 6/6, 12 runs each |
-| video, 60 frames of 1080p lossless | `tools\probe-video-exact.ps1` | identical, 447.8 MB of decoded RGBA |
+| video, 60 frames of 1080p lossless, **both** data paths | `tools\probe-video-exact.ps1` | 2/2 identical — `rgba64le` and `yuv444p` |
 | the `rgba64le` data path | `RD_OCL_CHECK_U16=1` | 36/36 exact against the float path |
 
 This was not true a few hours ago, and an earlier version of this file said
@@ -242,17 +242,66 @@ toward correctness — deserves its own before/after measurement. It is a one-li
 `cudaMemsetAsync` or a `cudaMemcpyAsync` from the input, and it should be a
 deliberate decision rather than a drive-by.
 
-## Not ported: the planar-YUV gathers
+## Planar 4:4:4: ported. Planar 4:2:0 and the prepass: still refused.
 
-`--input-mode yuv420`, `yuv444` and `yuv444-prepass`, and the planar 4:4:4 output
-kernel, are **refused with a message**. Each is a bit-exact transliteration of a
-specific libswscale routine on the CUDA side; quietly reading rgba64le instead would
-produce a plausible picture that came from a different decoder, and the difference
-would be blamed on the dither.
+`--input-mode yuv444` and the planar 4:4:4 **output** kernel are now ported, and are
+bit-identical to CUDA -- verified per pixel on 60 frames of 1080p, alongside the
+`rgba64le` path, in `tools\probe-video-exact.ps1`, which now sweeps both.
 
-The refusal is checked at parse time, in the CLI, before the palette stage runs —
-an error the user waits for and pays for, to be told something the command line
-already said. The engine also refuses, as a backstop for a direct caller.
+They are `gather_yuv444` and `scatter_yuv444` in `rd_opencl.cpp`, transliterations of
+`BlkGatherYuv444Kernel` and `BlkScatterYuv444Kernel` plus `d_rgb_to_yuv444` in
+`rd_blocks_cuda.cu`. The swscale constants were **copied, not derived** -- see the note
+on `sws_yuv_to_rgb16`, and `tools/probe_swscale_matrix.cpp`, which pins them against
+ffmpeg's own output. They compiled and matched bit for bit on the first run, which is
+what copying buys and what deriving would not have.
+
+Two things that are easy to get wrong and are commented at the definitions:
+
+  * **Three planes per frame, so frame f's luma starts at f * 3 * npix.** Using
+    f * npix reads frame f-1's U and V as if they were frame f's luma -- correct for
+    frame 0, nonsense for every frame after, and invisible because frame 0 is all
+    anyone looked at.
+  * **The output is pre-filled from the input** with a straight device-to-device copy
+    before the scatter runs, so the pixel the curve never visits keeps its source
+    value. On this path that is free: a planar 4:4:4 source and a planar 4:4:4
+    output have the same layout, so the source's own three bytes are the right
+    answer. This is the same fault the CUDA engine had and fixed separately -- see
+    `BlkFillUnvisitedKernel`.
+
+`--input-mode yuv420` and `yuv444-prepass` are **still refused with a message**, for
+the original reason: each is a bit-exact transliteration of a specific libswscale
+routine, and quietly reading rgba64le instead would produce a plausible picture that
+came from a different decoder, with the difference attributed to the dither. The
+refusal is checked at parse time, before the palette stage runs, and again in the
+engine as a backstop for a direct caller.
+
+### What porting 4:4:4 was worth
+
+This was the whole of the OpenCL video gap, and getting the number right mattered more
+than the code, because the gap had been attributed to the engine. 600 frames of 1080p60,
+3 interleaved runs each, on the machine this was written on (Xeon E5-2620 v3, GTX 1650
+SUPER):
+
+| | CUDA | OpenCL | ratio |
+|---|---|---|---|
+| **before** -- CUDA on yuv444p, OpenCL confined to rgba64le | 14.2 s | 31.3 s | **2.20x** |
+| both forced onto `rgba64le`, to isolate the engine | 32.8 s | 35.5 s | **1.08x** |
+| **after** -- both on yuv444p, 3 B/px | 15.6 s | 19.6 s | **1.26x** |
+
+The middle row is the one that matters: with the data path held equal, the engines were
+already within 8% of each other. The entire 2.2x was bytes on the wire -- 8 per pixel
+against 3. Per stage, from `RD_OCL_TIMING=1` over 38 batches, OpenCL's three kernels
+*plus* its readback came to 6410 ms against CUDA's 6124 ms of whole-batch dither+IO, so
+the walk was never the problem.
+
+The `1.26x` rather than `1.08x` is real, and is the price of the new path: the planar
+kernels do the YCbCr<->RGB conversion on the device and OpenCL's is a little less
+efficient than CUDA's. Run-to-run spread on this machine is around 15%, so read that as
+1.2-1.3x rather than a precise figure.
+
+Reach remains the stronger argument for OpenCL anyway: on a part with weak
+double-precision, the walk -- which is where essentially all the work is -- is the
+operation the silicon is worst at.
 
 
 ## Rotation: the bug that was not VFR either

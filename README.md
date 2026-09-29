@@ -163,7 +163,14 @@ is identical to `blocks` on the same frame:
 rdither --colors 16 --engine opencl photo.png out.png
 ```
 
-Currently single-image only; the video path still uses CUDA. See
+It runs **video** as well as images, on the same input modes, and is within about
+**1.2–1.3×** of CUDA's wall clock on 1080p60 — measured, 3 interleaved runs of 600
+frames. It was long documented as "2.7× slower than CUDA", which was an artefact of
+comparing the two engines on *different data paths*: OpenCL could only take rgba64le
+at 8 bytes per pixel while CUDA defaults to planar yuv444p at 3, and the 2.67× of extra
+traffic was the entire apparent gap. On the same path the engines were within 8% even
+before the planar kernels were ported. Only `--input-mode yuv420` and the
+`yuv444-prepass` are still refused, with a message. See
 [docs/OPENCL.md](docs/OPENCL.md), which is also where the verification is described.
 
 ### Video
@@ -575,5 +582,5 @@ measurements, and a table of everything that was tried and did not work.
 
 [docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 54 image cells
 and 60 video frames that verify it against CUDA, the four bugs the port actually had
-(including one that turned out not to be in OpenCL at all), and why it is currently
-2.7× slower than CUDA.
+(including one that turned out not to be in OpenCL at all), and where its remaining
+cost is — which turned out **not** to be the engine.

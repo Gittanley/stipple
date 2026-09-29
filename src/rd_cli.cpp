@@ -71,9 +71,11 @@ void PrintUsage() {
       "                             blocks, reached through OpenCL, so AMD and\n"
       "                             Intel GPUs get a GPU engine.  Output is\n"
       "                             identical to blocks on the same frame.\n"
-      "                             With --video it needs --input-mode rgba64\n"
-      "                             and RD_YUV444_OUT=0; the planar-YUV gathers\n"
-      "                             and the 4:4:4 output kernel are not ported.\n"
+      "                             With --video it takes the same input modes as\n"
+      "                             blocks (yuv444 is the default) and is within\n"
+      "                             about 1.2-1.3x of it; rgba64le is still there\n"
+      "                             and still bit-identical.  4:2:0 and the\n"
+      "                             yuv444-prepass are not ported.\n"
       "  --blocks N        curve positions per walk block, --engine blocks (default\n"
       "                     512).  A block restarts its error queue, so this trades\n"
       "                     speed against fidelity to ImageMagick.  32 is 11%% faster\n"
@@ -970,26 +972,23 @@ int main(int argc, char** argv) {
     // than quietly swapped for a different dither.
     if (opt.engine == rd::Engine::kOpenCL) {
       opt.video_opt.gpu_engine = rd::VideoOptions::GpuEngine::kOpenCL;
-      // The OpenCL video path carries the rgba64le data path only.  Checked HERE,
-      // at parse time, rather than leaving the engine to refuse after the palette
-      // stage has already run and a partial output file exists: an error the user
-      // waits a second for, and pays for, to be told something the command line
-      // already said.
+      // The OpenCL video path now carries planar 4:4:4 in both directions, which is
+      // what CUDA uses by default.  Checked HERE, at parse time, rather than leaving
+      // the engine to refuse after the palette stage has already run and a partial
+      // output file exists: an error the user waits a second for, and pays for, to be
+      // told something the command line already said.
+      //
+      // What is still refused is 4:2:0 and the yuv444-prepass.  rgba64le remains
+      // legal and remains bit-identical to CUDA, so nothing that worked before is
+      // taken away -- but it is no longer required, and that is the difference
+      // between 8 bytes per pixel and 3.
       const std::string& mode = opt.video_opt.input_mode;
-      if (mode != "rgba64") {
+      if (mode != "rgba64" && mode != "yuv444") {
         std::fprintf(stderr,
-                     "error: --engine opencl with --video supports only "
-                     "--input-mode rgba64; got '%s'.  The planar-YUV gathers are "
-                     "not ported to OpenCL.  Use --engine blocks for this input, "
-                     "or --input-mode rgba64.\n", mode.c_str());
-        return 2;
-      }
-      const char* yuv_out = std::getenv("RD_YUV444_OUT");
-      if (yuv_out == nullptr || yuv_out[0] != '0') {
-        std::fprintf(stderr,
-                     "error: --engine opencl with --video supports only rgba64le "
-                     "output, so RD_YUV444_OUT=0 is required; the planar 4:4:4 "
-                     "output kernel is not ported to OpenCL.\n");
+                     "error: --engine opencl with --video supports --input-mode "
+                     "rgba64 and yuv444; got '%s'.  Planar 4:2:0 and the "
+                     "yuv444-prepass are not ported to OpenCL.  Use --engine blocks "
+                     "for that input.\n", mode.c_str());
         return 2;
       }
     } else if (opt.engine == rd::Engine::kApprox) {

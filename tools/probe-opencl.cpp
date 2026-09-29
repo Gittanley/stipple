@@ -148,15 +148,35 @@ int main() {
       // worst at.
       //
       // Measured on the machine this was written on, an NVIDIA GTX 1650 SUPER --
-      // not a weak-FP64 part by consumer standards -- the OpenCL engine spends
-      // 2213 ms on the dither stage where CUDA spends 810 ms and the CPU 820 ms.
-      // It is 2.7x SLOWER than CUDA, and bit-identical to it. On a GPU with weaker
-      // double-precision than that, the gap widens rather than closes.
+      // not a weak-FP64 part by consumer standards -- the two engines are at
+      // PARITY, and the "2.7x slower" figure this file used to carry was measuring
+      // the wrong thing.  Re-measured, 5 interleaved runs each:
       //
-      // So the honest reading of this report is: OpenCL here buys REACH, on a
-      // machine with no CUDA, and not speed. A device reporting a preferred double
-      // vector width of 1 and one or two compute units is an integrated part doing
-      // double-precision in software, and the CPU will beat it.
+      //   single image, tests\big.png    CUDA 902 ms   OpenCL 923 ms   CPU 698 ms
+      //
+      // so 1.02x, not 2.7x.  The old numbers compared end-to-end wall clock, and
+      // on the image path the dither is 10.8 ms of a 923 ms run -- the rest is PNG
+      // decode, palette build and PNG encode, none of which is the engine.  With
+      // RD_OCL_TIMING=1 the OpenCL stages are gather 4.5 / walk 6.2 / scatter 0.1 ms.
+      //
+      // The video figure was wrong for a different reason, and it is worth stating
+      // because it is easy to repeat: on 600 frames of 1080p60, CUDA 14.2 s against
+      // OpenCL 31.3 s looks like 2.2x, but OpenCL can only take the rgba64le input
+      // path (8 B/px) while CUDA defaults to planar yuv444p (3 B/px) -- a 2.67x
+      // fatter pipe, which accounts for the entire gap.  Forced onto the SAME path,
+      // both engines: CUDA 32.8 s, OpenCL 35.5 s, i.e. **1.08x**.
+      //
+      // So the honest reading of this report is: OpenCL here is competitive with
+      // CUDA, within about 8%, and bit-identical to it.  What it does not yet have
+      // is the planar-YUV gather and the 4:4:4 output kernel, and *that* -- not the
+      // engine -- is why it is slower end to end on video today.  It is bounded,
+      // known work.
+      //
+      // Reach is still the main argument for OpenCL, and on a weak-FP64 part it is
+      // the whole argument: a device reporting a preferred double vector width of 1
+      // and one or two compute units is an integrated part doing double-precision
+      // in software, and the CPU will beat it.  But that is a statement about the
+      // device, not about OpenCL, and the two should not be conflated.
       {
         // Numeric fields, printed as numbers.  PrintDeviceInfo reads every field
         // into a char buffer because the spec defines most of them as strings; a

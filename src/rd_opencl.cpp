@@ -407,6 +407,137 @@ __kernel void walk(__global const float* cx, __global const double* palette,
 }
 )CLC";
 
+// A SECOND source string, passed to clCreateProgramWithSource as a separate
+// argument rather than concatenated onto kSource.
+//
+// That is not stylistic.  MSVC rejects a string literal over 16380 bytes, and
+// kSource is already 14 KB of OpenCL C; the first attempt to add the two kernels
+// below to it failed to compile with "string too big, closing truncated" partway
+// through cl_select_index.  Concatenating adjacent literals would have worked and
+// been more fragile, since every future kernel added to this file would have to
+// respect an invisible character budget.  Two arguments is what the API is for, and
+// the program text is identical either way.
+//
+// Leading newline so the two sources do not run together at the join.
+const char* kSourceYuv = R"CLC(
+
+// swscale's 8-bit YUV -> 16-bit RGB, bit-exact.
+//
+// PORTED, NOT DERIVED, and a transliteration of d_sws_yuv_to_rgb16 and
+// d_sws_clip16 in rd_blocks_cuda.cu -- read the long note there before changing
+// any of these numbers.  They come from yuv2rgba64_full_X_c_template with a 1:1
+// plane ratio, and two of the six were got wrong by hand before they were printed
+// by tools/probe_swscale_matrix.cpp and checked against ffmpeg's own rgba64le
+// output: 0 mismatches over the whole 220x225 (Y,V) grid, 0 over a real 1920x1080
+// frame.  The CUDA kernels are the reference these must match bit for bit -- if
+// the two ever disagree, the disagreement presents as a hue shift and gets blamed
+// on the dither.
+//
+// The one apparent difference from the CUDA source is signedness: there the first
+// line is (y - 128u) * 512u in unsigned arithmetic, cast to int after.  That is
+// mod 2^32, and since |y - 128| <= 128 the wrapped value cast back to int is
+// exactly (y - 128) * 512, so the plain int form below is bit-identical.
+inline int sws_clip16(int x) {
+  const int v = x + (1 << 15);
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return v;
+}
+
+inline void sws_yuv_to_rgb16(int y, int u, int v, __private int* rgb) {
+  int yy = (y - 128) * 512;
+  const int uu = (u - 128) * 512;
+  const int vv = (v - 128) * 512;
+  yy += 0x10000;
+  yy -= 8192;    // yuv2rgb_y_offset
+  yy *= 9539;    // yuv2rgb_y_coeff
+  yy += (1 << 13) - (1 << 29);
+
+  const int ri = vv * 13075;               // yuv2rgb_v2r_coeff
+  const int gi = vv * -6660 + uu * -3209;  // v2g, u2g
+  const int bi = uu * 16525;               // yuv2rgb_u2b_coeff
+
+  rgb[0] = sws_clip16((ri + yy) >> 14);
+  rgb[1] = sws_clip16((gi + yy) >> 14);
+  rgb[2] = sws_clip16((bi + yy) >> 14);
+}
+
+// Raster order -> curve order, reading planar 8-bit 4:4:4 and converting
+// YCbCr -> RGB on the device.  Transliteration of BlkGatherYuv444Kernel.
+//
+// The win is bytes, not arithmetic: 4:4:4 is 3 bytes per pixel where rgba64le is 8,
+// so the pipe and the H2D both move 2.67x less.  The reader is the pipeline's
+// floor, so that is where the time was.  For OpenCL this is also the whole of the
+// remaining video gap: without it the engine is confined to the rgba64le path
+// while CUDA defaults to this one, and the engine itself is within 8% of CUDA's.
+//
+// Three planes per frame, so frame f's luma starts at f * 3 * pixels_per_frame
+// and NOT f * pixels_per_frame.  The CUDA original's comment records that the
+// latter reads frame f-1's U and V as if they were frame f's luma: correct for
+// frame 0, nonsense for every frame after, and invisible because frame 0 is all
+// anyone looked at.
+__kernel void gather_yuv444(__global const uchar* planes, __global const int* curve,
+                            int n, int frames, int pixels_per_frame,
+                            __global float* cx) {
+  const int slot = get_global_id(0);
+  if (slot >= n * frames) return;
+  const int frame = slot / n;
+  const int i = slot - frame * n;
+  const int p = curve[i];
+  const size_t base = (ulong)frame * 3 * pixels_per_frame + p;
+  __private int rgb[3];
+  sws_yuv_to_rgb16((int)planes[base], (int)planes[base + pixels_per_frame],
+                   (int)planes[base + 2 * (ulong)pixels_per_frame], rgb);
+  __global float* dst = cx + (ulong)frame * n * 4;
+  dst[i * 4 + 0] = (float)rgb[0];
+  dst[i * 4 + 1] = (float)rgb[1];
+  dst[i * 4 + 2] = (float)rgb[2];
+  dst[i * 4 + 3] = 65535.0f;
+}
+
+// The scatter, writing planar 8-bit 4:4:4.  Transliteration of
+// BlkScatterYuv444Kernel plus d_rgb_to_yuv444.
+//
+// This exists for the same reason on the other side of the pipe: the encoder
+// consumes raw frames, so 3 bytes per pixel against rgba64le's 8 takes the
+// RGB->YUV conversion off the CPU entirely.  Measured on the CUDA side that
+// conversion was 298 GB of host reads for an 18001-frame 1080p clip, after
+// which the encode stage became 94% of the wall with the writer blocked at
+// 597 MB/s -- below the pipe's own 0.86 GB/s.  Shrinking the pipe without moving
+// the conversion would only have moved the same CPU work onto the writer thread.
+//
+// The rounding is BT.601 with 8-bit inputs, matching d_rgb_to_yuv444.  It is a
+// different rounding from swscale's, and deliberately so: this decides WHO rounds,
+// not what the picture is.  ffmpeg round-trips these frames through YUV on the way
+// into the file either way.
+__kernel void scatter_yuv444(__global const int* curve, __global const int* owner,
+                             __global const uchar* index, __global const double* palette,
+                             int n, int frames, int pixels_per_frame, int assoc,
+                             __global uchar* yuv) {
+  const int slot = get_global_id(0);
+  if (slot >= n * frames) return;
+  const int frame = slot / n;
+  const int i = slot - frame * n;
+  const int pixel = curve[i];
+  if (owner[pixel] != i) return;
+  const __global double* p = palette + 4 * (int)index[slot];
+  // Truncate to int before the shift, as the CUDA original does.  p[] is a double
+  // holding an exact 16-bit value so the truncation is exact; shifting in double
+  // and converting afterwards would not be, and would round differently.
+  const int r8 = ((int)p[0]) >> 8;
+  const int g8 = ((int)p[1]) >> 8;
+  const int b8 = ((int)p[2]) >> 8;
+  const int yv = ((66 * r8 + 129 * g8 + 25 * b8 + 128) >> 8) + 16;
+  const int uv = ((-38 * r8 - 74 * g8 + 112 * b8 + 128) >> 8) + 128;
+  const int vv = ((112 * r8 - 94 * g8 - 18 * b8 + 128) >> 8) + 128;
+  const size_t base = (ulong)frame * 3 * pixels_per_frame + pixel;
+  yuv[base] = (uchar)(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+  yuv[base + pixels_per_frame] = (uchar)(uv < 0 ? 0 : (uv > 255 ? 255 : uv));
+  yuv[base + 2 * (ulong)pixels_per_frame] =
+      (uchar)(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+}
+)CLC";
+
 // ---------------------------------------------------------------------------
 // Host mirrors of the kernel's structs.
 //
@@ -559,6 +690,12 @@ struct Ctx {
   cl_program program = nullptr;
   cl_kernel k_gather = nullptr;
   cl_kernel k_gather_u16 = nullptr;
+  // Planar 4:4:4, the CUDA default's data path.  Null on a device whose compiler
+  // rejects the source, which the engine reports rather than silently falling back
+  // to rgba64le -- a silent fallback would produce a plausible picture from a
+  // different decoder, and the difference would be blamed on the dither.
+  cl_kernel k_gather_yuv444 = nullptr;
+  cl_kernel k_scatter_yuv444 = nullptr;
   cl_kernel k_walk = nullptr;
   cl_kernel k_scatter = nullptr;
   cl_kernel k_scatter_u16 = nullptr;
@@ -656,9 +793,16 @@ bool BuildSlotLocked(int n) {
     return false;
   }
 
-  const char* src = kSource;
-  const std::size_t len = std::strlen(src);
-  cl_program prog = clCreateProgramWithSource(g_context, 1, &src, &len, &e);
+  // Two sources, not one.  kSourceYuv holds the planar 4:4:4 gather and scatter,
+  // kept separate because MSVC refuses a string literal over 16380 bytes and
+  // kSource is already most of that.  The driver concatenates them exactly as given,
+  // so the program text is identical to a single literal -- and unlike splicing the
+  // literal, this does not impose a character budget on every kernel added later.
+  const char* srcs[2] = {kSource, kSourceYuv};
+  // size_t, not cl_int: the 1.2 headers take `const size_t*` for the lengths even
+  // though the 1.0 prototype said cl_int, and a cl_int array here does not convert.
+  const std::size_t lens[2] = {std::strlen(kSource), std::strlen(kSourceYuv)};
+  cl_program prog = clCreateProgramWithSource(g_context, 2, srcs, lens, &e);
   if (e != CL_SUCCESS || prog == nullptr) {
     g_detail = std::string("clCreateProgramWithSource: ") + ClErrorName(e);
     s.detail = g_detail;
@@ -709,10 +853,14 @@ bool BuildSlotLocked(int n) {
     return false;
   }
 
-  struct { const char* name; cl_kernel* out; } kernels[5] = {
+  struct { const char* name; cl_kernel* out; } kernels[7] = {
       {"gather", &s.k_gather}, {"gather_u16", &s.k_gather_u16},
       {"walk", &s.k_walk},
       {"scatter", &s.k_scatter}, {"scatter_u16", &s.k_scatter_u16},
+      // Planar 4:4:4, 3 bytes per pixel both ways.  These are what let the engine
+      // use CUDA's default data path instead of being confined to rgba64le.
+      {"gather_yuv444", &s.k_gather_yuv444},
+      {"scatter_yuv444", &s.k_scatter_yuv444},
   };
   for (auto& kn : kernels) {
     cl_kernel k = clCreateKernel(prog, kn.name, &e);
@@ -793,21 +941,22 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   const int block_size = std::max(kErrorQueueLength, options.block);
   const int assoc = palette.associate_alpha ? 1 : 0;
 
-  // The planar-YUV input modes are NOT ported yet, and saying so is the point.
-  // Each of them is a bit-exact transliteration of a specific libswscale routine
-  // in the CUDA original; quietly reading rgba64le instead would produce a
-  // perfectly plausible picture that came from a different decoder, and the
-  // difference would be attributed to the dither.  Refusing names the
-  // difference instead.
-  if (options.upload_u16 && options.in_mode != BlockOptions::InMode::Interleaved16) {
-    return "opencl: planar-YUV input is not ported; only --input-mode rgba64le "
-           "(interleaved 16-bit) is supported by this engine.  Use --engine blocks "
-           "or --engine cpu for the YUV paths.";
-  }
-  if (options.emit_yuv444) {
-    return "opencl: planar 4:4:4 output is not ported; only rgba64le output is "
-           "supported by this engine.  Use --engine blocks or --engine cpu, or "
-           "clear the yuv444 output option.";
+  // Planar 4:4:4 is now ported, on both sides.  What is still refused is planar
+  // 4:2:0 and the yuv444-prepass, and the refusal is for the same reason it
+  // originally applied to all of them: each is a bit-exact transliteration of a
+  // specific libswscale routine, and quietly reading rgba64le instead would
+  // produce a perfectly plausible picture that came from a different decoder --
+  // with the difference attributed to the dither.  Refusing names the difference.
+  //
+  // 4:4:4 is ported because it is CUDA's DEFAULT path, and being confined to
+  // rgba64le is what made this engine look 2.2x slower than CUDA: 8 bytes per
+  // pixel against 3, for a data-path difference rather than an engine one.  On the
+  // same path the two engines are within 8%.  See docs/OPENCL.md.
+  if (options.upload_u16 && options.in_mode != BlockOptions::InMode::Interleaved16 &&
+      options.in_mode != BlockOptions::InMode::PlanarYuv444) {
+    return "opencl: planar 4:2:0 input and the yuv444-prepass are not ported; this "
+           "engine supports --input-mode rgba64le and yuv444.  Use --engine blocks "
+           "or --engine cpu for 4:2:0.";
   }
   if (options.in_channels != 3 && options.in_channels != 4) {
     return "opencl: in_channels must be 3 (rgb48le) or 4 (rgba64le), not " +
@@ -916,6 +1065,12 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // rgba64le is 8 bytes per pixel against float4's 16, so the batch and the
   // result both cross the bus at half the width.
   const std::size_t u16_bytes = npix * static_cast<std::size_t>(frames) * 4 * sizeof(std::uint16_t);
+  // Planar 4:4:4 is 3 bytes per pixel -- a third of rgba64le's 8 -- and that byte
+  // count is the entire reason the engine was 2.2x slower on video: not the walk,
+  // the pipe.  Three planes per frame, so a batch of F frames is 3 * npix * F
+  // bytes, with the SAME stride for all three planes.  That stride is not a detail;
+  // using npix*F for the chroma planes reads frame f-1's chroma as frame f's luma.
+  const std::size_t yuv_bytes = npix * static_cast<std::size_t>(frames) * 3;
 
   // The video pipe asks for the uint16 data path in both directions at once, and
   // the single-image path asks for neither.  Each is honoured only if the caller
@@ -923,12 +1078,31 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // pointer gets the float path rather than a null dereference.
   const bool want_in_u16 = options.upload_u16 && in_u16 != nullptr;
   const bool want_u16 = options.emit_u16 && out_u16 != nullptr;
+  // Planar 4:4:4 in and out.  Both are 3 bytes per pixel, and both use the same
+  // layout, so the scatter's output can be pre-filled from the input with a plain
+  // device-to-device copy -- which is how the pixel the curve never visits keeps
+  // its source value on this path, exactly as the float path gets it for free.
+  const bool in_yuv444 =
+      want_in_u16 && options.in_mode == BlockOptions::InMode::PlanarYuv444;
+  const bool out_yuv444 = want_u16 && options.emit_yuv444;
+  if (in_yuv444 && ctx->k_gather_yuv444 == nullptr) {
+    return "opencl: this device did not build the planar 4:4:4 gather kernel";
+  }
+  if (out_yuv444 && ctx->k_scatter_yuv444 == nullptr) {
+    return "opencl: this device did not build the planar 4:4:4 scatter kernel";
+  }
 
-  cl_mem b_pix = nullptr;  // float4, gather source and/or scatter destination
-  cl_mem b_in16 = nullptr;  // rgba64le in
+  cl_mem b_pix = nullptr;    // float4, gather source and/or scatter destination
+  cl_mem b_in16 = nullptr;   // rgba64le in
   cl_mem b_out16 = nullptr;  // rgba64le out
+  cl_mem b_in_yuv = nullptr;  // planar 4:4:4 in
+  cl_mem b_out_yuv = nullptr;  // planar 4:4:4 out
 
-  if (want_in_u16) {
+  if (in_yuv444) {
+    b_in_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                              yuv_bytes, const_cast<std::uint16_t*>(in_u16), &e);
+    if (e != CL_SUCCESS || b_in_yuv == nullptr) return "clCreateBuffer(in yuv444)";
+  } else if (want_in_u16) {
     // READ_WRITE, not READ_ONLY: the source is copied into the output buffer
     // below, so that the pixel the curve never visits keeps its SOURCE value
     // rather than uninitialised memory.  See the fill below.
@@ -938,7 +1112,10 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     b_pix = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                            pix_bytes, batch, &e);
   }
-  if (want_u16) {
+  if (out_yuv444) {
+    b_out_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE, yuv_bytes, nullptr, &e);
+    if (e != CL_SUCCESS || b_out_yuv == nullptr) return "clCreateBuffer(out yuv444)";
+  } else if (want_u16) {
     b_out16 = clCreateBuffer(g_context, CL_MEM_READ_WRITE, u16_bytes, nullptr, &e);
   } else if (b_pix == nullptr) {
     // Nothing to scatter into except the float buffer, so one is needed either
@@ -970,7 +1147,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   cl_mem b_w = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                               sizeof(hweights), hweights, &e);
 
-  cl_mem all[11] = {b_pix, b_in16, b_out16, b_cx, b_idx, b_curve, b_owner,
+  cl_mem all[13] = {b_pix, b_in16, b_out16, b_in_yuv, b_out_yuv,
+                    b_cx, b_idx, b_curve, b_owner,
                     b_nodes, b_search, b_pal, b_w};
   // Releases every buffer, then says what went wrong.  Split from the reporting so
   // it can run on the success path too, and so the pipeline lambda below can report
@@ -987,9 +1165,9 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // b_in16 and b_out16 are legitimately absent -- they exist only on the paths
   // that asked for them -- so only the buffers that were supposed to be created
   // are checked for null.
-  if (b_pix == nullptr && !want_in_u16) return fail("clCreateBuffer");
-  if (b_in16 == nullptr && want_in_u16) return fail("clCreateBuffer(in16)");
-  if (b_out16 == nullptr && want_u16) return fail("clCreateBuffer(out16)");
+  if (b_pix == nullptr && !want_in_u16 && !in_yuv444) return fail("clCreateBuffer");
+  if (b_in16 == nullptr && want_in_u16 && !in_yuv444) return fail("clCreateBuffer(in16)");
+  if (b_out16 == nullptr && want_u16 && !out_yuv444) return fail("clCreateBuffer(out16)");
   for (cl_mem b : {b_cx, b_idx, b_curve, b_owner, b_nodes, b_search, b_pal, b_w}) {
     if (b == nullptr) return fail("clCreateBuffer");
   }
@@ -1034,7 +1212,11 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     clSetKernelArg(k_gather, 2, sizeof(int), &n);
     clSetKernelArg(k_gather, 3, sizeof(int), &frames);
     clSetKernelArg(k_gather, 4, sizeof(int), &np);
-    if (src_is_u16) {
+    if (k_gather == ctx->k_gather_yuv444) {
+      // gather_yuv444 has no in_channels: planar 4:4:4 is always three planes and
+      // alpha never exists in it, so the 65535 is written unconditionally below.
+      clSetKernelArg(k_gather, 5, sizeof(cl_mem), &b_cx);
+    } else if (src_is_u16) {
       clSetKernelArg(k_gather, 5, sizeof(int), &in_channels);
       clSetKernelArg(k_gather, 6, sizeof(cl_mem), &b_cx);
     } else {
@@ -1135,9 +1317,25 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     }
   }
 
-  if (want_u16) {
-    // FILL THE OUTPUT BEFORE THE SCATTER RUNS.
-    //
+  if (out_yuv444) {
+    // Same reason as below, and easier here: a planar 4:4:4 source and a planar
+    // 4:4:4 output have the SAME layout -- Y, then U, then V, each npix bytes per
+    // frame -- so the unvisited pixel can keep the source's own three bytes with a
+    // straight device-to-device copy, no conversion and no rounding.  That is also
+    // what the CUDA fill does on this path, so the two engines agree on it.
+    if (in_yuv444) {
+      e = clEnqueueCopyBuffer(ctx->queue, b_in_yuv, b_out_yuv, 0, 0, yuv_bytes, 0,
+                              nullptr, nullptr);
+    } else {
+      // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so fill
+      // with neutral black (Y=0, and 128 for the chroma centre) rather than leave
+      // the buffer undefined.
+      const cl_uchar zero[3] = {0, 128, 128};
+      e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, zero, 3, 0, yuv_bytes, 0,
+                              nullptr, nullptr);
+    }
+    if (e != CL_SUCCESS) return fail("fill(yuv444 out)");
+  } else if (want_u16) {
     // Riemersma() visits 4^L - 1 cells and the trailing ForgetGravity visit lands
     // on the first one again, so the grid's LAST cell is never dithered at all --
     // which is why a 1920x1080 frame at level 11 leaves exactly one pixel at its
@@ -1177,10 +1375,17 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     if (e != CL_SUCCESS) return fail("fill(u16 out)");
   }
 
-  std::string msg = run_pipeline(want_in_u16 ? ctx->k_gather_u16 : ctx->k_gather,
-                                 want_in_u16 ? b_in16 : b_pix, want_in_u16,
-                                 want_u16 ? ctx->k_scatter_u16 : ctx->k_scatter,
-                                 want_u16 ? b_out16 : b_pix);
+  // Kernel and buffer selection.  The planar-4:4:4 pair is the CUDA default's path
+  // and is independent in each direction: planar in with rgba64le out, and vice
+  // versa, are both legal, because the video pipe chooses them separately.
+  const cl_kernel k_g = in_yuv444 ? ctx->k_gather_yuv444
+                                  : (want_in_u16 ? ctx->k_gather_u16 : ctx->k_gather);
+  const cl_mem b_g = in_yuv444 ? b_in_yuv : (want_in_u16 ? b_in16 : b_pix);
+  const cl_kernel k_s = out_yuv444 ? ctx->k_scatter_yuv444
+                                    : (want_u16 ? ctx->k_scatter_u16 : ctx->k_scatter);
+  const cl_mem b_s = out_yuv444 ? b_out_yuv : (want_u16 ? b_out16 : b_pix);
+
+  std::string msg = run_pipeline(k_g, b_g, want_in_u16 && !in_yuv444, k_s, b_s);
   if (!msg.empty()) return fail(msg.c_str());
 
   if (check_u16) {
@@ -1258,14 +1463,21 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // a diagnostic switch and not something the test suite turns on.
   }
 
-  if (want_u16) {
+  if (out_yuv444) {
+    // 3 bytes per pixel, not 8.  The caller's buffer is the encoder's input and is
+    // sized for this format, so reading u16_bytes here would run four times past
+    // the end of it.
+    e = clEnqueueReadBuffer(ctx->queue, b_out_yuv, CL_TRUE, 0, yuv_bytes,
+                            out_u16, 0, nullptr, nullptr);
+    if (e != CL_SUCCESS) return fail("readback(yuv444)");
+  } else if (want_u16) {
     // The uint16 result has to come back to the host: the encoder pipe consumes
     // it directly, so unlike the float path there is no COPY_HOST_PTR allocation
     // the scatter could have written into.
     e = clEnqueueReadBuffer(ctx->queue, b_out16, CL_TRUE, 0, u16_bytes, out_u16, 0,
                             nullptr, nullptr);
     if (e != CL_SUCCESS) return fail("readback(u16)");
-  } else if (!want_in_u16) {
+  } else if (!want_in_u16 && !in_yuv444) {
     // The pixel buffer was created with COPY_HOST_PTR and is read-write, so the
     // three kernels have already left the dithered frames in `batch`.  No
     // download is needed: the same allocation the reader filled is the one the
