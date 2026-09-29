@@ -1,7 +1,8 @@
 # rdither
 
-Bit-exact GPU reimplementation of ImageMagick's Riemersma error-diffusion dither, for
-images and video.
+GPU-accelerated reimplementation of ImageMagick's Riemersma error-diffusion dither,
+for images and video. Bit-exact with ImageMagick where that is possible, and
+deliberately approximate where it is not — [see exactly which is which](#where-bit-exactness-holds).
 
 > ### Made by an AI — "Space Bunny"
 >
@@ -61,16 +62,26 @@ source:
 The patent grant in GPL-3.0 is why I chose it over GPL-2.0: you cannot be sued for
 using this.
 
-If you point it at an image and ask for 16 colours, you get back the same 16 colours
-ImageMagick would have produced, the same pixels, byte for byte — not "similar", not
-"close enough to pass". That is the design goal, and it is checked on every build.
+If you point it at an image with the sequential walk and ask for 16 colours, you get
+back the same 16 colours ImageMagick would have produced, the same pixels, byte for
+byte — not "similar", not "close enough to pass". That is the design goal, and it is
+checked on every build.
 
 ```
 rdither --colors 16 photo.png out.png
 ```
 
-For a 3-hour video it runs about 56 frames per second on a modest 6-core machine, with
-decode, dither and encode all happening at once.
+**That guarantee is narrower than it sounds, and the rest of this file is where it
+gets precise.** The fast GPU engines and the video pipeline are *not* bit-exact with
+ImageMagick, by construction. See [Where bit-exactness holds](#where-bit-exactness-holds)
+before you judge any output.
+
+Decode, dither and encode all run at once, at about 51 fps on a 2014-era 6-core Xeon
+with a GTX 1650 SUPER. So 5 minutes of **60 fps** footage took 5 minutes 53 seconds —
+about 1.17x its own duration, while 30 fps footage would come out faster than real
+time. What that number does *not* measure is the GPU —
+[two thirds of it is decode and encode](#what-the-fps-number-means-in-practice), so a
+faster CPU, RAM or disk makes it faster with the same GPU.
 
 ---
 
@@ -165,17 +176,105 @@ Decode, dither and encode run concurrently, so the reported fps is the whole pip
 throughput rather than one stage's. Audio from the source is carried across untouched
 (`--no-audio` to drop it).
 
-A 18001-frame 1080p60 clip, 16 colours, on 6 physical cores:
+### What the fps number means in practice
+
+The measurement below is on a real clip, not a synthetic one:
 
 ```
-frames     : 18001 in 349.97 s (51.4 fps)
-busy time  : palette 27719 | decode 257150 | dither 226332 | encode 161856 | wall 349973 ms
+rdither --video --engine blocks --colors 16 input.mp4 out.mkv
 ```
 
-The reported wall **includes the palette stage**. It did not for a while — the
-denominator was measured from inside the pipeline, which starts after the palette is
-already built, so two runs whose palettes differed by 25 s reported the same fps. If
-a number here looks worse than one you remember, this is why.
+`input.mp4` is 18001 frames, 1920x1080, 60 fps, 300.032 s — h264 yuv420p, bt709,
+tv range, 10.2 Mbps, 373 MB, with stereo AAC. Machine: **Xeon E5-2620 v3 @ 2.40 GHz**,
+6 physical cores / 12 threads, 15.8 GB RAM, **GTX 1650 SUPER**. Input mode, pixel format,
+preset, queue depth, workers and batch size were all left at their defaults.
+
+```
+palette    : 16 colours from 256 sampled frame(s), 128x128 montage, 64.0 MiB, 28676.7 ms, mean saturation 22.1%, 9 near-neutral
+frames     : 18001 in 352.51 s (51.1 fps)
+busy time  : palette 28677 | decode 270944 | dither 222857 | encode 153089 | wall 352507 ms
+```
+
+**Read that as elapsed time, not as a benchmark.** 18000 frames at 60 fps is 5 minutes
+of footage, and it finished in 352 seconds. So:
+
+> **5 minutes of 60 fps video takes about 5 minutes 53 seconds to render.** You wait
+> roughly six minutes, and the file is complete, seekable and openable in an editor
+> when the command returns. Nothing is queued up behind it.
+
+The same ratio holds wherever you point it — roughly **1.17x the footage's own
+duration**. That means:
+
+- **60 fps footage takes about 17% longer than it plays.** A 3-hour 60 fps clip is
+  about 3 hours 31 minutes. A 30-second insert takes 35 seconds.
+- **30 fps footage comes out well ahead of real time** — 30 frames per second of
+  footage against a ~51 fps pipeline, so roughly **0.59x**, and a 3-hour 30 fps clip
+  lands in about 1 hour 46 minutes. Same machine, same numbers, opposite conclusion.
+
+So whether this is faster or slower than real time depends entirely on your source
+frame rate, and it is worth checking rather than assuming.
+
+#### This clip is not a real-world benchmark, and here is the measurement that says so
+
+Do not quote the 51 fps at anyone. That clip is a **DaVinci Resolve render using the
+YouTube 1080p preset** — a low-bitrate, already-compressed, heavily re-encoded file —
+and the content is a **grey, low-saturation extreme hyperlapse at 2000% speed**, so
+almost nothing in it resembles real footage. It is the longest clip this project was
+measured on, and it is unrepresentative in ways the tool can partly quantify.
+
+The palette line is the tell: **mean saturation 22.1%, and 9 of the 16 palette entries
+near-neutral.** Nine greys in a 16-colour palette is not what most video looks like. A
+palette sampled from saturated, colourful material would spend that budget on hues
+instead, and hue transitions are more expensive to encode than flat greys — so the
+encode half of this measurement is flattered by the content in a way yours would not be.
+
+What survives the criticism is the part that does not depend on the picture, and that
+is the number worth having:
+
+#### The dither cost is fixed, and it is not close to being the bottleneck
+
+The walk kernel does identical work on every pixel of every frame — a fixed 16-deep
+error-queue shift and a palette search whose length is the palette size. There is no
+data-dependent branch and no early exit, so **content does not change the dither's
+cost.** Measured here:
+
+| | |
+|---|---|
+| per frame, 1920x1080, 16 colours, B=512 | **~10 ms** |
+| pixels dithered | 2,073,600 x 18,001 = **37.3 gigapixel** |
+| implied rate | ~207 Mpixel/s, **100 fps of dithering** |
+| against 60 fps footage | **1.7x real time, on its own** |
+
+A synthetic `testsrc2` clip measured 9.6-10.9 ms/frame on the same machine — the same
+number as the grey hyperlapse, which is the point. Your content will give you the same
+dither time. What your content *will* change is decode and encode.
+
+#### Which is why the machine matters more than the GPU
+
+The `busy time` line is *thread*-time summed across all six cores, so the stages total
+647 s against a 352 s wall and you cannot divide them to get each stage's share of it.
+As a rough split of that thread-time, though, decode is 271 s, dither 223 s, encode
+153 s — **two thirds of the work is not GPU work at all.**
+
+So the same GPU on a better machine finishes faster without the dither doing a single
+extra FLOP. Decode and encode are bound by memory bandwidth, storage throughput and
+single-thread CPU — and this machine has a **2014-era server Xeon at 2.4 GHz**, which
+is very likely the single biggest thing making it slow. A machine with the identical
+GPU but a modern CPU, NVMe storage and more memory bandwidth will render this
+materially faster. The converse also holds: if you are already faster than real time,
+a better GPU will not meaningfully change your edit session. Look at which stage is
+largest for your content before buying anything.
+
+**On a segment you can work before the whole thing lands:** `--segment-frames N` writes
+separate muxed segment files as it goes, so for a long job the early ones are already
+on disk and playable while the later ones render. The default single-file mode writes
+one complete file on return; if you interrupt it, that file holds the frames completed
+so far and `--resume` continues from there.
+
+The reported wall **includes the palette stage** — 28.7 s of it here, about 8%. It did
+not for a while: the denominator was measured from inside the pipeline, which starts
+after the palette is already built, so two runs whose palettes differed by 25 s
+reported the same fps. If a number here looks worse than one you remember, this is why.
 
 ### Rotated video
 
@@ -244,6 +343,71 @@ total, 29.803 fps average (the container declares 29.833333333).
 [video]   re-emitted at the true average, 29.803 fps.  Duration and A/V sync match
 the source; per-frame motion cadence is flattened.
 ```
+
+## Where bit-exactness holds
+
+This is the most important section in the file, because "bit-exact" is true of some
+engines here and false of others, and the difference is not a detail.
+
+| What you run | Engine it uses | vs ImageMagick | Tested by |
+|---|---|---|---|
+| `--engine cpu` | sequential walk, on the CPU | **bit-exact** | 135 cases, `verify.ps1` |
+| `--engine cuda` | sequential walk, on the GPU | **bit-exact** | 135 cases, `verify.ps1` |
+| `--engine blocks` | block-parallel walk, CUDA | **not exact** — 1.7% of pixels differ | determinism only |
+| `--engine opencl` | block-parallel walk, OpenCL | **not exact** — 1.7% too, being identical to `blocks` | `blocks` on 54 cells + determinism |
+| `--engine approx` | iterative solver | **not exact**, by design | not covered |
+| `--video` (any engine) | block-parallel, always | **not exact** | frame accounting, cross-engine |
+| `--dither bayer\|atkinson\|jarvis\|floyd-steinberg\|clustered-dot` | their own kernels | **not exact**, and not trying to be | determinism only |
+
+**So: images on `cpu` or `cuda` are bit-exact. GPU *block* engines and all of video
+are not.** One design decision causes that, and it is not a bug:
+
+**The block walk is an approximation, on purpose.** Riemersma diffusion is a strictly
+sequential walk: one 16-entry error queue, one cursor, each step consuming the last
+step's residual. To parallelise it, a block of N positions restarts its queue from
+zero, so only the first 16 positions of each block can be perturbed. That is a bounded,
+*localised* defect — a slightly different speckle at block seams, not banding and not
+drift — and it is measured against ImageMagick on a 200x150 gradient:
+
+| `--blocks` | pixels differing from ImageMagick | RMSE |
+|---|---|---|
+| 32 | 1819 of 30001 (6.1%) | 0.0239 |
+| **512** (default) | **501 of 30001 (1.7%)** | **0.0107** |
+
+Larger blocks carry error further before restarting, so they land nearer the reference.
+512 is the default because it is the faithful one: `--blocks 32` is 11% quicker on the
+dither but carries 3.4× the deviation (RMSE 0.0239 against 0.0107). Since the dither is
+roughly a third to a half of the pipeline depending on content, that 11% is a few
+percent end to end — which is a deliberate trade, and `--blocks 32` is there if you
+want the other end of it. **No block size makes the walk exact — only cutting it does.**
+
+**Video always uses the block walk.** The pipeline is built around the block partition:
+each work item is a batch of frames dithered as independent blocks, which is what gives
+it its parallelism. A sequential walk cannot be batched, so the video path is the
+approximation by necessity, and that is the honest answer to "is video bit-exact?" —
+**no**.
+
+There is no bit-exact video mode, and `--no-gpu` is not one. `--no-gpu` runs the *same*
+block walk on host workers: same partition, same approximation, just off the GPU. It is
+the way to check the GPU is not lying to you, not the way to get a different answer.
+If per-pixel agreement with ImageMagick matters more than throughput, the dither has to
+be cut rather than parallelised, and that is an architectural change to the video
+pipeline — not a flag. It is not built.
+
+**And video is not bit-exact with its own input either**, which is a separate point
+worth making plainly. Beyond the dither, the default encoder is lossy `libx264`, and
+`--video-pix-fmt yuv420p` subsamples chroma over 2×2 blocks, averaging away the dither
+itself. Measured on 1080p at 16 colours: `ffv1 yuv444p` → 56 unique colours in the
+output, `libx264 yuv444p crf 12` → 15191, `libx264 yuv420p` → 36031. Use
+`--video-lossless` when you care what the encoder did to the palette; it costs about
+28× the bitrate.
+
+**What *is* verified for the GPU engines**: that `blocks` and `opencl` agree with each
+other byte-for-byte, per pixel, on 54 cases including alpha input, and on 60 frames of
+1080p video — and that both are deterministic across repeated runs. The OpenCL port
+was built against that bar specifically, because `rd_riemersma.h` defines the two
+engines as having the same partition and the same arithmetic, which makes "identical or
+wrong" the only available outcome. Neither claim is that they match ImageMagick.
 
 ### Progress and ETA
 
@@ -361,6 +525,21 @@ and the last thing to run before committing.
 bit-exact cases: 135 passed, 0 failed
 ```
 
+**Read that number for what it is.** Those 135 cases run on `cpu`, `cuda` and
+`cpu --max-ram-mb 1` — the *sequential* walk, the one that is supposed to be exact. The
+suite is the reason the exactness claim is trustworthy, and it is also the reason the
+inexactness claims are not in any way tentative: those come from a separate measurement
+against ImageMagick's output, not from this suite, because this suite does not touch
+those engines at all. See [Where bit-exactness holds](#where-bit-exactness-holds).
+
+Beyond that suite, `verify.ps1` also runs:
+
+| Check | What it proves | Result |
+|---|---|---|
+| `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
+| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
+| `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, and no frames lost | identical |
+
 ---
 
 ## Further reading
@@ -369,6 +548,7 @@ bit-exact cases: 135 passed, 0 failed
 optimisation rounds, the two real bugs found in this codebase's own new code, the
 measurements, and a table of everything that was tried and did not work.
 
-[docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 36 bit-exact
-comparisons that verify it, the four bugs the port actually had, and what is left
-(video, and palettes above 16).
+[docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 54 image cells
+and 60 video frames that verify it against CUDA, the four bugs the port actually had
+(including one that turned out not to be in OpenCL at all), and why it is currently
+2.7× slower than CUDA.
