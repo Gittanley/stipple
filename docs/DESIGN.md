@@ -613,6 +613,45 @@ Practical notes:
   palette (17 unique instead of 16) because the never-visited last cell keeps its
   source value. 1 pixel in 65536 on a square image; the bit-exact engines
   reproduce ImageMagick exactly here (AE=0) and are unaffected.
+- **That artifact was benign on the float path and was not benign on the uint16
+  path — a bug this file helped hide.** The note above is correct *for the float
+  output*, where `batch` arrives pre-filled with the source frame and the scatter
+  only overwrites visited pixels, so the unvisited cell keeps its source value and
+  the result matches ImageMagick. The uint16 and planar-4:4:4 outputs do not have
+  that pre-fill: their buffer is a bare `cudaMalloc` with no `COPY_HOST_PTR`, so
+  the same cell was **uninitialised device memory** in the encoded file. OpenCL had
+  already been fixed for this by pre-filling its whole output buffer; CUDA had not.
+  The fix is `BlkFillUnvisitedKernel` in `rd_blocks_cuda.cu` — one thread per
+  frame, taking the value from the upload buffer (which the scatter never wrote,
+  since the cell has no owner). For planar 4:4:4 it copies the source Y/U/V
+  **verbatim**, because converting would round-trip the pixel through RGB and
+  ImageMagick never dithers that cell at all, so it never round-trips it either.
+  Verified: the cell reads YUV 170,166,16 in the output against 170,166,16 in the
+  source, while its dithered neighbour reads 169,165,17.
+  - **Why every existing check missed it.** `1920x1080` — the geometry of every
+    long clip measured in this project, including the five-minute benchmark — has
+    **no** unvisited cell. `verify.ps1` covers the sequential walk, which never
+    consults the owner map. And `probe-opencl-exact` / `probe-video-exact` compare
+    CUDA against OpenCL, which is *structurally blind* to a fault both engines
+    share: both were reading their own uninitialised memory and could still agree.
+  - **Why it was invisible by eye.** A fresh `cudaMalloc` returns zeroed pages, so
+    the cell reads as YUV 0,0,0 against a source of 170,166,16 — a slightly dark
+    pixel, not an obvious artefact. The corruption only becomes visible once the
+    buffer is reused across batches and the cell carries the previous batch's data.
+    It was a reproducibility bug wearing a cosmetic bug's clothes.
+  - **The condition was never characterised, and one wrong guess is worth
+    recording.** It is *not* "square with power-of-two sides", which is what the
+    geometry suggested. Measured across ten geometries:
+    `1920x1080 1280x720 768x1024 720x1280 640x360 854x480` have none;
+    `1024x768 1024x1024` have one at `(w-1, 0)`; `2048x2048` at `(2047, 0)`;
+    and `33x17` at `(31, 0)`. The code now counts the cell and prints its index
+    rather than predicting it.
+  - `tools\probe-unvisited-pixel.ps1` covers this, and it is the one check in the
+    suite that compares the output against the **source** instead of against
+    another engine — which is the only shape of check that could have caught it.
+    It carries a negative control: the unvisited cell must match the source *and*
+    its neighbour must not, or a renderer that dithered nothing would pass.
+    Validated by disabling the fill and confirming 3 of 9 cases go red.
 
 ## 10. Phase 2 — video (ffmpeg pipeline)
 

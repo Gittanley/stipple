@@ -127,4 +127,21 @@ if (Test-Path $vid) {
     default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
+
+# And a fourth, which is the odd one out: it does not compare two engines, it
+# compares the output against the SOURCE.  That is deliberate, and it is the only
+# shape of check that could have caught the unvisited-pixel bug -- both engines
+# were reading their own uninitialised memory, so the two comparisons above
+# agreed with each other while both were wrong.  It also builds its own fixtures
+# from lavfi, so it needs nothing from tests\ except ffmpeg on PATH.
+$unv = Join-Path $PSScriptRoot 'tools\probe-unvisited-pixel.ps1'
+if (Test-Path $unv) {
+  Write-Host ""
+  & pwsh -NoProfile -File $unv
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "unvisited pixel: SKIPPED (needs ffmpeg on PATH)" -ForegroundColor Yellow }
+    default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
 exit 0

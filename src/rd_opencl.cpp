@@ -1152,10 +1152,12 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // output is not reproducible, and the determinism test added for the writer
     // bug would flag it the moment it was pointed at video.
     //
-    // NOTE: the CUDA engine has the same exposure -- d_u16_buf is a bare
-    // cudaMalloc and its scatter writes only owned pixels.  Not fixed there as
-    // part of this change, because that engine is verified bit-exact and changing
-    // its output, even for one pixel, deserves its own before/after measurement.
+    // NOTE: the CUDA engine had the same exposure -- d_u16_buf is a bare
+    // cudaMalloc and its scatter writes only owned pixels.  Fixed there since, by
+    // BlkFillUnvisitedKernel in rd_blocks_cuda.cu, which writes the same pixel from
+    // the source with one thread per frame.  It copies the source Y/U/V verbatim in
+    // the planar-4:4:4 case rather than round-tripping them through RGB, so it
+    // matches what this pre-fill produces on the same input.
     if (want_in_u16) {
       // The production combination: the source is the caller's rgba64le, so copy
       // it and let the scatter overwrite the visited pixels.  This makes the

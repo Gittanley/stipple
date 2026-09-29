@@ -228,15 +228,14 @@ palette sampled from saturated, colourful material would spend that budget on hu
 instead, and hue transitions are more expensive to encode than flat greys — so the
 encode half of this measurement is flattered by the content in a way yours would not be.
 
-What survives the criticism is the part that does not depend on the picture, and that
-is the number worth having:
+What survives the criticism is the part that is not merely a property of this one
+clip — with one important qualification, which is worth stating rather than glossing:
 
-#### The dither cost is fixed, and it is not close to being the bottleneck
+#### The dither cost depends on the palette, not on the pixels
 
-The walk kernel does identical work on every pixel of every frame — a fixed 16-deep
-error-queue shift and a palette search whose length is the palette size. There is no
-data-dependent branch and no early exit, so **content does not change the dither's
-cost.** Measured here:
+The walk kernel has no data-dependent branch and no early exit: given a palette, every
+pixel of every frame costs the same — a fixed 16-deep error-queue shift plus a palette
+search. So the *pixel values* cannot change the dither's cost. Measured here:
 
 | | |
 |---|---|
@@ -245,9 +244,20 @@ cost.** Measured here:
 | implied rate | ~207 Mpixel/s, **100 fps of dithering** |
 | against 60 fps footage | **1.7x real time, on its own** |
 
-A synthetic `testsrc2` clip measured 9.6-10.9 ms/frame on the same machine — the same
-number as the grey hyperlapse, which is the point. Your content will give you the same
-dither time. What your content *will* change is decode and encode.
+**But the palette is built from your frames, and its shape changes the search.** A
+palette of 16 entries where most are near-neutral greys is very lopsided, and a lopsided
+tree makes each lookup descend further. Measured on this project at identical geometry
+and identical tree *size*: **387 ms** on the grey clip against **166-181 ms** on
+`tests/L605.mp4`, with nodes-visited-per-pixel at **3.71 against 2.63** — a 2.2×
+difference caused entirely by what the sampler picked. See
+[docs/DESIGN.md](docs/DESIGN.md) §12.
+
+So do not carry the 10 ms/frame figure to your own footage as a promise. It is a number
+*for this palette* — 9 of 16 entries near-neutral, mean saturation 22.1% — and a
+saturated, evenly-spread palette will search less deep. It could be faster or slower.
+The honest summary is that the dither is the stage a GPU accelerates, and on this
+machine with this palette it is not the bottleneck; how much of the wall it takes on
+your content is measurable from the same `busy time` line.
 
 #### Which is why the machine matters more than the GPU
 
@@ -539,13 +549,28 @@ Beyond that suite, `verify.ps1` also runs:
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
 | `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, and no frames lost | identical |
+| `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
+
+That last one is the odd one out and earns its place. The other three all compare
+two engines against each other, which makes them **structurally blind to a bug both
+engines share** — and that is not hypothetical. ImageMagick's Riemersma walk skips one
+in-bounds cell for some geometries; the GPU scatters write only visited pixels; and the
+uint16/4:4:4 output buffer is a bare `cudaMalloc`. So that pixel was uninitialised device
+memory, in *both* engines, and the cross-engine tests passed. `1920×1080` has no such
+pixel, so the five-minute benchmark never saw it either.
+
+It is invisible by eye too: a fresh `cudaMalloc` returns zeroed pages, so the pixel reads
+as a slightly dark value until the buffer is reused across batches. So the check compares
+against the **source** rather than against another engine, and carries a negative control —
+the unvisited pixel must match the source *and* its neighbour must **not**, or a renderer
+that dithered nothing would pass.
 
 ---
 
 ## Further reading
 
 [docs/DESIGN.md](docs/DESIGN.md) — the engineering record: the mathematics, the twenty-odd
-optimisation rounds, the two real bugs found in this codebase's own new code, the
+optimisation rounds, the real bugs found in this codebase's own new code, the
 measurements, and a table of everything that was tried and did not work.
 
 [docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 54 image cells

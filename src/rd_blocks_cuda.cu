@@ -257,6 +257,7 @@ __global__ void BlkScatterKernel(float4* __restrict__ pixels,
   }
 }
 
+
 // The same scatter, writing planar 8-bit 4:4:4 instead of rgba64le.
 //
 // This exists to take the RGB->YUV conversion off the CPU.  The encoder is fed raw
@@ -308,6 +309,78 @@ __global__ void BlkScatterYuv444Kernel(const int* __restrict__ curve,
                   static_cast<unsigned>(p[2]), yuv + base,
                   yuv + base + static_cast<std::size_t>(pixel_pitch),
                   yuv + base + 2 * static_cast<std::size_t>(pixel_pitch));
+}
+
+// One thread per frame: write the single pixel the walk never visits, taking it from
+// the source rather than from the palette.  This is the whole of the uint16 fix, and
+// it is cheap precisely because the unvisited set is at most one pixel per frame.
+//
+// Why the source is still intact at that pixel: the scatter only writes where
+// `owner[pixel] == i`, and this pixel has no owner, so neither BlkScatterKernel nor
+// BlkScatterYuv444Kernel has touched it.  `src16` (the rgba64le upload) and `srcf`
+// (the float4 upload) still hold the original frame at that offset, so the correct
+// value is simply still there.  ImageMagick leaves that same pixel at its source
+// value -- the recursion genuinely does not visit it -- so this makes the uint16 and
+// yuv444 paths agree with ImageMagick and with the float path, rather than merely
+// agreeing with each other.
+//
+// Without it the pixel is whatever cudaMalloc returned: not wrong-looking, just
+// unreproducible, because it is uninitialised device memory, and it would differ
+// between runs, between drivers, and between CUDA and OpenCL.
+__global__ void BlkFillUnvisitedKernel(const float4* __restrict__ srcf,
+                                       const std::uint16_t* __restrict__ src16,
+                                       const unsigned char* __restrict__ srcyuv,
+                                       int pixel, int frames, int pixel_pitch,
+                                       int assoc, bool as_yuv444,
+                                       std::uint16_t* __restrict__ u16) {
+  const int frame = blockIdx.x * blockDim.x + threadIdx.x;
+  if (frame >= frames) return;
+  const std::size_t off =
+      static_cast<std::size_t>(frame) * pixel_pitch + static_cast<std::size_t>(pixel);
+  if (as_yuv444) {
+    unsigned char* planes = reinterpret_cast<unsigned char*>(u16);
+    const std::size_t base = static_cast<std::size_t>(frame) * 3 *
+                                 static_cast<std::size_t>(pixel_pitch) +
+                             static_cast<std::size_t>(pixel);
+    if (srcyuv != nullptr) {
+      // The production case: a planar 4:4:4 source into a planar 4:4:4 output.  The
+      // layouts are identical -- Y, then U, then V, each pixel_pitch bytes -- so the
+      // faithful value is the source's own three bytes, with no conversion at all.
+      // Converting would be *less* accurate, not more: it would put the source
+      // through YCbCr->RGB and back, and ImageMagick never dithers this pixel at all,
+      // so it never round-trips it either.
+      planes[base] = srcyuv[base];
+      planes[base + pixel_pitch] = srcyuv[base + pixel_pitch];
+      planes[base + 2 * static_cast<std::size_t>(pixel_pitch)] =
+          srcyuv[base + 2 * static_cast<std::size_t>(pixel_pitch)];
+    } else {
+      // No usable source plane -- a 4:2:0 source, whose chroma is subsampled and so
+      // has no single correct value for one pixel.  Write a defined neutral rather
+      // than nothing: reproducible, and black is the honest answer for a pixel the
+      // walk never looked at.
+      planes[base] = 0;
+      planes[base + pixel_pitch] = 128;
+      planes[base + 2 * static_cast<std::size_t>(pixel_pitch)] = 128;
+    }
+    return;
+  }
+  if (src16 != nullptr) {
+    const std::uint16_t* p = src16 + off * 4;
+    u16[off * 4 + 0] = p[0];
+    u16[off * 4 + 1] = p[1];
+    u16[off * 4 + 2] = p[2];
+    u16[off * 4 + 3] = p[3];
+  } else if (srcf != nullptr) {
+    const float4 f = srcf[off];
+    u16[off * 4 + 0] = static_cast<std::uint16_t>(f.x);
+    u16[off * 4 + 1] = static_cast<std::uint16_t>(f.y);
+    u16[off * 4 + 2] = static_cast<std::uint16_t>(f.z);
+    u16[off * 4 + 3] =
+        static_cast<std::uint16_t>(assoc ? f.w : 65535.0f);
+  } else {
+    u16[off * 4 + 0] = 0; u16[off * 4 + 1] = 0; u16[off * 4 + 2] = 0;
+    u16[off * 4 + 3] = 65535;
+  }
 }
 
 
@@ -667,6 +740,15 @@ struct DeviceState {
   // for, not two buffers on one thread.  The array form is kept because it makes
   // the per-stream buffers explicit and costs nothing when the count is 1.
   float4* d_pixels_buf[kStreams] = {nullptr};
+  // Pixels the curve never reaches, and the first of them.  Part of the state
+  // because it is a property of the geometry: every batch of this shape has the
+  // same unvisited pixel, and the uint16/yuv444 output has to write it every time.
+  std::size_t unvisited = 0;
+  int unvisited_pixel = -1;
+  // The note about it is per-process, not per-batch.  It fires from the setup path,
+  // which runs once per geometry but is re-entered for every batch, and a
+  // 18001-frame job would otherwise print the same line a thousand times.
+  bool warned_unvisited = false;
   float* d_cx_buf[kStreams] = {nullptr};
   unsigned char* d_index_buf[kStreams] = {nullptr};
   std::uint16_t* d_u16_buf[kStreams] = {nullptr};
@@ -825,6 +907,7 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   const auto t_setup0 = std::chrono::steady_clock::now();
   double curve_ms = 0.0;
   std::size_t unvisited = 0;
+  int unvisited_pixel = -1;
   int n = 0, nblocks_total = 0;
   // Capacity (allocated) versus this call's extent (used).
   std::size_t pixel_capacity = 0, curve_capacity = 0;
@@ -835,6 +918,12 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     nblocks_total = st.nblocks_total;
     pixel_capacity = st.pixel_total;
     curve_capacity = st.curve_total;
+    // The unvisited pixel belongs to the geometry, not to the batch, so it has to
+    // come back with the reused state.  Without this the fill would run for the
+    // first batch and silently stop for every batch after it -- which is the kind of
+    // bug that only shows up as a slowly drifting output nobody can reproduce.
+    unvisited = st.unvisited;
+    unvisited_pixel = st.unvisited_pixel;
   } else {
     st.Release();
     std::vector<int> owner;
@@ -848,15 +937,31 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     if (n < static_cast<int>(width * height)) {
       return "compacted curve is shorter than the image";
     }
-    // How many pixels the curve never reaches.  This is not necessarily zero:
-    // ImageMagick's Riemersma recursion is a finite walk over the 2^level grid,
-    // and whether it covers every cell depends on the recursion, so report it
-    // rather than assume it.
-    for (int owner_value : owner) {
-      if (owner_value < 0) ++unvisited;
+    // Which pixels the curve never reaches, and how many.  This is not always
+    // zero, and it is not a simple function of the shape: BuildCurveIndex
+    // enumerates the closed-form Hilbert path over [0, 4^level - 1) and keeps only
+    // the cells inside the image, and which in-bounds cell that leaves unvisited
+    // was measured across ten geometries rather than derived --
+    //
+    //     1920x1080  1280x720  768x1024  720x1280  640x360  854x480   ->  0
+    //     1024x768   1024x1024                                        ->  1 at (w-1, 0)
+    //     2048x2048                                                    ->  1 at (w-1, 0)
+    //     33x17                                                         ->  1 at (31, 0)
+    //
+    // So FHD is clean and 1024x768 is not, which is why this went unnoticed: the
+    // five-minute benchmark clip has none.  One cell is excluded, so the unvisited
+    // set is at most one pixel, but it is counted rather than assumed, and the index
+    // is kept so the uint16 and yuv444 outputs can write it from the source.
+    for (std::size_t p = 0; p < owner.size(); ++p) {
+      if (owner[p] < 0) {
+        if (unvisited == 0) unvisited_pixel = static_cast<int>(p);
+        ++unvisited;
+      }
     }
 
     const std::size_t curve_pitch = static_cast<std::size_t>(n);
+    st.unvisited = unvisited;
+    st.unvisited_pixel = unvisited_pixel;
     // Allocate for `frames`, which is the capacity the cache is keyed on.
     st.frames = frames;
     pixel_capacity = pixel_pitch * static_cast<std::size_t>(frames);
@@ -1014,11 +1119,24 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   curve_used = static_cast<std::size_t>(n) * static_cast<std::size_t>(frames);
   (void)curve_used;
 
-  if (unvisited != 0) {
+  if (unvisited != 0 && !st.warned_unvisited) {
+    st.warned_unvisited = true;
+    // Reported, not fatal.  The float path is correct as it stands -- `batch` arrives
+    // pre-filled with the source frame and the scatter only overwrites owned pixels,
+    // so an unvisited pixel keeps its source value, which is what ImageMagick's own
+    // recursion leaves there too.  The uint16 and yuv444 paths needed the explicit
+    // fill, because their buffer has no pre-fill; that is handled above, so this is a
+    // note rather than a warning.  The pixel is named because the condition is not
+    // something the code can currently predict, and a number nobody can act on is
+    // only half an answer.
     std::fprintf(stderr,
-                 "[blocks] curve reaches %zu of %zu pixels; %zu keep their "
-                 "source value (matches ImageMagick's own behaviour)\n",
-                 width * height - unvisited, width * height, unvisited);
+                 "[blocks] curve reaches %zu of %zu pixels; the %zu it does not "
+                 "reach keep their source value, which is what ImageMagick's own "
+                 "recursion leaves there.  First at index %d (%zu,%zu).  The "
+                 "uint16/yuv444 output path writes these explicitly.\n",
+                 width * height - unvisited, width * height, unvisited,
+                 unvisited_pixel, static_cast<std::size_t>(unvisited_pixel) % width,
+                 static_cast<std::size_t>(unvisited_pixel) / width);
   }
 
   const int assoc = palette.associate_alpha ? 1 : 0;
@@ -1153,6 +1271,32 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
         static_cast<int>(pixel_pitch), assoc, d_u16);
   }
   if (cudaGetLastError() != cudaSuccess) return "scatter launch failed";
+  // The uint16 and yuv444 outputs are a bare cudaMalloc with no COPY_HOST_PTR, so the
+  // one pixel the walk never visits has to be written from the source or it encodes
+  // uninitialised device memory.  One thread per frame; the scatter left that pixel
+  // alone, so the upload buffers still hold the original value there.  This is what
+  // OpenCL does with a whole-buffer copy, done here for a single pixel because there
+  // is only ever one -- and unlike OpenCL's fill-with-zeros branch, it lands on the
+  // value ImageMagick itself would leave, so all three paths agree.
+  if (d_u16 != nullptr && unvisited != 0) {
+    const int fill_threads = 64;
+    const int fill_blocks = (frames + fill_threads - 1) / fill_threads;
+    // Exactly one of these is the live source, and which one depends on the input
+    // mode -- `d_pixels_buf` is not even allocated on the uint16 path, so passing it
+    // unconditionally is a null dereference, not a harmless extra argument.  The
+    // planar source only serves the yuv444 output, where the layouts already match;
+    // for rgba64le output out of a planar source the kernel writes a defined
+    // neutral instead, because a 4:4:4 plane has no single source value per pixel
+    // once it is being written as interleaved RGBA.
+    const float4* fill_srcf = want_in_u16 ? nullptr : d_pixels;
+    const std::uint16_t* fill_src16 = (want_in_u16 && !in_yuv_any) ? d_in16 : nullptr;
+    const unsigned char* fill_srcyuv =
+        (options.emit_yuv444 && in_yuv_any && !in_yuv420) ? d_in_yuv : nullptr;
+    BlkFillUnvisitedKernel<<<fill_blocks, fill_threads, 0, stream>>>(
+        fill_srcf, fill_src16, fill_srcyuv, unvisited_pixel, frames,
+        static_cast<int>(pixel_pitch), assoc, options.emit_yuv444, d_u16);
+    if (cudaGetLastError() != cudaSuccess) return "unvisited-pixel fill launch failed";
+  }
   if (kt.on) cudaEventRecord(kt.end[2], stream);
   // Download the uint16 result when asked for: half the bytes, and the host then
   // has nothing to convert.
@@ -1188,7 +1332,13 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   }
   // One sync for the whole chain instead of two mid-pipeline ones, and only on the
   // stream this launch used.
-  if (cudaStreamSynchronize(stream) != cudaSuccess) return "dither failed";
+  // Report the driver's own words, not "dither failed".  A sync failure is almost
+  // always a sticky error from an earlier launch -- an illegal access in some kernel
+  // three launches back -- and a bare "dither failed" sends you looking at the wrong
+  // place.  cudaGetErrorString on the value the sync actually returned names it.
+  if (const cudaError_t sync_err = cudaStreamSynchronize(stream)) {
+    return std::string("dither failed: ") + cudaGetErrorString(sync_err);
+  }
   if (kt.on) {
     // Read after the sync, so these are the kernels' own durations and not the copy
     // time folded in.
