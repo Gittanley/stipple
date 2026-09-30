@@ -9,7 +9,23 @@ deliberately approximate where it is not — [see exactly which is which](#where
 If you point it at an image with the sequential walk and ask for 16 colours, you get
 back the same 16 colours ImageMagick would have produced, the same pixels, byte for
 byte — not "similar", not "close enough to pass". That is the design goal, and it is
-checked on every build.
+checked on every push, on a machine that is not the one this was written on.
+
+[Continuous integration](.github/workflows/ci.yml) builds a clean clone and runs the
+suite against a GPU-less runner — which is deliberate, because that is the
+configuration five separate defects survived in, each of them a build path nobody had
+ever run. What it covers and what it cannot:
+
+| | in CI |
+|---|---|
+| CPU-only build, 90 bit-exact cases vs ImageMagick | ✓ every push |
+| CUDA build compiles and links | ✓ every push |
+| OpenCL-vs-CUDA, 54 cells | ✗ no GPU on the runner — manual |
+| video probes | ✗ no GPU, and no clip is committed — manual |
+| clean clone builds at all | ✓ every push |
+
+The last row is the one that matters. Everything else in this file was true while a
+fresh `git clone` **failed to link**, because no check had ever built one.
 
 ```
 rdither --colors 16 photo.png out.png
