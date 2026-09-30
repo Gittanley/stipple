@@ -87,15 +87,28 @@ jobs:
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
 
           Write-Host "starting the installer with a 180s bound"
-          # /D must be LAST and unquoted: quoting it makes a directory whose name
-          # includes the quote character.  That is an NSIS rule, not a shell one.
-          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -PassThru
+          # THIS IS THE FIX, and it took four CI runs to find.  /S and /D are passed
+          # through `cmd /c` rather than as a Start-Process argument array.
+          #
+          # Start-Process -ArgumentList re-quotes each array element, so "/D=C:\im"
+          # can reach NSIS quoted or split.  NSIS requires /D to be the LAST argument
+          # and UNQUOTED; when it is not, the installer does not fail -- it opens a
+          # directory prompt and waits for a human, which is why every earlier attempt
+          # appeared to "ignore /S".  The symptom was a job killed at its 30-minute
+          # timeout with `im-setup` named as an orphaned process.
+          #
+          # Verified on this machine before it was pushed here: the same installer
+          # with `/c` completes in 23.9s and exit 0.  Through -ArgumentList it ran
+          # past 240s.  It installs to its default C:\Program Files location, which is
+          # also build.cmd's first guess, and the search below finds either.
+          $p = Start-Process -FilePath 'cmd.exe' `
+                -ArgumentList "/c `"im-setup.exe`" /S /D=$dest" -PassThru -NoNewWindow
           if (-not $p.WaitForExit(180000)) {
             Write-Host "installer still running after 180s; killing it"
             try { $p.Kill() } catch { }
-            throw "the ImageMagick installer did not exit.  If /S is being ignored, the"
+            throw 'the ImageMagick installer did not exit. /S and /D go through cmd /c,'
           }
-          Write-Host "installer exited with $($p.ExitCode)"
+          Write-Host "installer exit code: $($p.ExitCode)"
 
           # Find the root by CONTENT, not by assuming /D was honoured.  The first
           # version of this built a candidate list as @(String, DirectoryInfo) and read
@@ -206,7 +219,11 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im-setup.exe -UseBasicParsing -TimeoutSec 900
           $dest = 'C:\im'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -PassThru
+          # Through cmd /c, not a Start-Process argument array -- see the long note on the
+          # same step in the nocuda job.  NSIS needs /D last and unquoted, and
+          # -ArgumentList re-quotes array elements, which turns a silent install into a
+          # GUI prompt that waits for a human until the job times out.
+          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"im-setup.exe`" /S /D=$dest" -PassThru -NoNewWindow
           if (-not $p.WaitForExit(180000)) {
             try { $p.Kill() } catch { }
             throw 'the ImageMagick installer did not exit within 180s'
