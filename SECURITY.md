@@ -2,13 +2,21 @@
 
 ## Reporting a vulnerability
 
-**Do not open a public issue for a security problem.** Use GitHub's private reporting on
-this repository — the "Security" tab → "Report a vulnerability" — so a fix can be
-prepared before the details are public.
+**Do not open a public issue for a security problem.** Contact the maintainer through
+their GitHub profile instead, so a fix can be prepared before the details are public.
 
 Please include: what you built it from, the exact command, what you expected, and what
 happened. If a crash is involved, the command line and the ImageMagick and CUDA versions
 are worth more than a description of the symptom.
+
+This is deliberately not a link to a form. GitHub's *Report a vulnerability* channel was
+the obvious choice and it is the wrong one here, for two reasons worth recording so the
+next person does not have to re-derive them: private vulnerability reporting is only
+available to **public** repositories, so the button this file used to point at did not
+exist and never would while the repository is private; and even once public it delivers
+to a security-advisories queue, which is the right venue for a malformed decoder and the
+wrong one for anything else. A profile contact works in every state the repository can be
+in, and needs no setting turned on for it to be true.
 
 There is no bug bounty and no SLA. This is one machine's worth of work on a spare-time
 project, and a slow honest reply beats a fast non-reply.
