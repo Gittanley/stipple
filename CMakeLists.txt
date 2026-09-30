@@ -143,6 +143,13 @@ set(RD_SOURCES
 # examples\bayer_dither.cc if you do not want it -- nothing else depends on it.
 list(APPEND RD_SOURCES examples/bayer_dither.cc)
 
+# Always compiled, and its entire body sits inside #ifndef RD_WITH_CUDA, so it
+# contributes nothing to a CUDA build.  It is here because the seven CUDA entry points
+# that rd_video.cpp and rd_cli.cpp call are defined in .cu files this build omits, and
+# a declared-but-undefined symbol is a link error.  Same reason the #else half of
+# src/rd_opencl.cpp exists.
+list(APPEND RD_SOURCES src/rd_cuda_stub.cpp)
+
 if(RD_WITH_CUDA)
   list(APPEND RD_SOURCES src/rd_riemersma_cuda.cu src/rd_approx_cuda.cu
                          src/rd_blocks_cuda.cu)

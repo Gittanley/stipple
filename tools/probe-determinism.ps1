@@ -94,6 +94,33 @@ function Get-StrippedHash([string]$png) {
   return $h
 }
 
+# An engine that cannot run at all makes determinism unaskable, not failed.  Two
+# different reasons, both environmental rather than a defect:
+#
+#   "this build has no OpenCL"  -- src/rd_opencl.cpp's #else stub, because the SDK is
+#                                  gitignored and absent from a fresh clone
+#   "no CUDA device"            -- compiled in, but this machine has no NVIDIA GPU
+#
+# Both used to report as "12 of 12 runs produced no output" and then FAIL, so a fresh
+# clone with no OpenCL SDK exited 1 on a suite whose other 12 cases were green.  A
+# stranger's first impression of the project was a broken test suite.
+#
+# The matching lives in tools\rd-engine-probe.ps1, shared with verify.ps1.  It is one
+# file because it is a list of exact diagnostic strings, and an unrecognised error
+# deliberately counts as RUNNABLE -- a broken engine also produces no output, and a
+# looser rule would let a real defect hide behind a skip.
+. "$PSScriptRoot\rd-engine-probe.ps1"
+$avail = Get-RdEngineAvailability -Rdither $rd -Engines $engines -Fixture "$Dir\$($imgs[0]).png"
+Write-RdEngineSkipReport -Availability $avail | Out-Null
+$skipEngines = @{}
+foreach ($k in $avail.Keys) { if ($avail[$k]) { $skipEngines[$k] = $avail[$k] } }
+$anyUsable = @($engines | Where-Object { -not $skipEngines.ContainsKey($_) }).Count -gt 0
+if (-not $anyUsable) {
+  ''
+  'No engine in this build can run, so there is nothing to test.  Exit 2.'
+  exit 2
+}
+
 $fail = 0
 $total = 0
 ''
@@ -103,6 +130,7 @@ $total = 0
 foreach ($img in $imgs) {
   $src = "$Dir\$img.png"
   foreach ($eng in $engines) {
+    if ($skipEngines.ContainsKey($eng)) { continue }
     $total++
     $pixelHashes = @{}
     $strippedHashes = @{}
@@ -190,8 +218,17 @@ foreach ($algo in $algos) {
 
 ''
 if ($fail -eq 0) {
-  "{0} of {1} cases deterministic." -f ($total - $fail), $total
+  "{0} of {1} cases deterministic." -f $total, $total
   exit 0
 }
-"{0} of {1} cases FAILED." -f ($total - $fail), $total
+# $fail, NOT ($total - $fail).  This said "($total - $fail) of $total cases FAILED",
+# so a run with 2 of 14 cases failing printed "12 of 14 cases FAILED" -- it counted
+# every PASSING case as a failure, directly above a table showing 12 ok lines and
+# 2 FAIL lines.  The output contradicted itself and the error ran in the direction
+# that makes a mostly-healthy suite look broken.
+#
+# Line 193 above had the same expression and was only ever correct by accident:
+# it is reached solely when $fail -eq 0, where $total - 0 happens to equal $total.
+# Writing $fail in both places removes the coincidence.
+"{0} of {1} cases FAILED." -f $fail, $total
 exit 1

@@ -87,6 +87,30 @@ if (-not $Ffmpeg -or -not (Test-Path $Ffmpeg)) {
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("rd-unvisited-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
+# This test hardcodes --engine blocks (the fault it is looking for is a cudaMalloc
+# with no fill), so on a build without CUDA every one of the 9 geometries failed with
+# "rdither exited 1" and verify.ps1 reported "0 of 9 cases ok, 0 skipped" and exited 1.
+# Zero ok AND zero skipped is the shape that is hardest to read correctly: it is not a
+# pass, not a skip, and not a clean failure either.  The engine has to be established
+# BEFORE the loop, once, and reported as this probe's own "cannot run" (exit 2), which
+# verify.ps1 already maps to SKIPPED.
+#
+# The availability check needs one readable image.  ffmpeg is already a hard
+# requirement of this probe, so a single-frame PNG is made here rather than adding a
+# dependency on ImageMagick, which this probe does not otherwise use.
+$availPng = Join-Path $tmp 'avail.png'
+& $Ffmpeg -v error -y -f lavfi -i 'testsrc=size=64x64:rate=1' -frames:v 1 $availPng 2>$null
+if (-not (Test-Path $availPng)) {
+  Write-Host "cannot run: could not make a probe image for the engine check"
+  exit 2
+}
+. "$PSScriptRoot\rd-engine-probe.ps1"
+$avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('blocks') -Fixture $availPng
+if ($avail['blocks']) {
+  Write-Host "cannot run: this test needs the blocks engine -- $($avail['blocks'])"
+  exit 2
+}
+
 # Read one pixel as planar YUV444.
 #
 # The `format=yuv444p` in front of the crop is not optional.  Cropping a 4:2:0

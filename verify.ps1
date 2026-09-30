@@ -58,13 +58,25 @@ $engines = @(
   @{ name = "cpu/disk";   args = @("--engine", "cpu", "--max-ram-mb", "1") }
 )
 
-$pass = 0; $fail = 0
+# An engine this build cannot run makes its cases unaskable, not failed.  Without
+# this, `build.cmd --no-cuda` produced "90 passed, 45 failed" and exited 1: the 45
+# were exactly the cuda engine's share (9 images x 5 colour counts), every one of them
+# a refusal to start rather than a wrong pixel.  A build configuration the project
+# documents as supported was reporting a failing suite.
+. "$PSScriptRoot\tools\rd-engine-probe.ps1"
+$avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('cuda') -Fixture (Join-Path $ImageDir "in_grad.png")
+Write-RdEngineSkipReport -Availability $avail | Out-Null
+$skipEngines = @($avail.Keys | Where-Object { $avail[$_] })
+$activeEngines = @($engines | Where-Object { $skipEngines -notcontains $_.name })
+
+$pass = 0; $fail = 0; $skipped = 0
 foreach ($img in $images) {
   $src = Join-Path $ImageDir "$img.png"
   foreach ($c in $Colors) {
     $ref = Join-Path $ImageDir "$($img)_$($c)_ref.png"
     & $Magick $src -dither Riemersma -colors $c $ref | Out-Null
     foreach ($e in $engines) {
+      if ($skipEngines -contains $e.name) { $skipped++; continue }
       $out = Join-Path $ImageDir "$($img)_$($c)_$($e.name -replace '/','_').png"
       $text = (& $Rdither @($e.args) --colors $c --verify --quiet $src $out 2>&1 | Out-String)
       $internal = $text -match "BIT-EXACT"
@@ -85,7 +97,12 @@ foreach ($img in $images) {
 }
 
 Write-Host ""
-Write-Host "bit-exact cases: $pass passed, $fail failed"
+if ($skipped -gt 0) {
+  Write-Host "bit-exact cases: $pass passed, $fail failed, $skipped SKIPPED (engine not in this build)" -ForegroundColor Yellow
+  Write-Host "  The $skipped skipped cases are NOT passes. On a build with that engine they run." -ForegroundColor Yellow
+} else {
+  Write-Host "bit-exact cases: $pass passed, $fail failed"
+}
 if ($fail -gt 0) { exit 1 }
 
 # Bit-exactness against ImageMagick is a comparison between two implementations, so
@@ -140,7 +157,7 @@ if (Test-Path $unv) {
   & pwsh -NoProfile -File $unv
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "unvisited pixel: SKIPPED (needs ffmpeg on PATH)" -ForegroundColor Yellow }
+    2 { Write-Host "unvisited pixel: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }

@@ -8,7 +8,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// No CUDA API is called from this file -- rd_video.cpp asks CudaAvailable() whether
+// to request NVDEC and CudaAllocPinned() for staging, and both live in the .cu files,
+// with no-CUDA definitions in rd_cuda_stub.cpp.  So this header was never needed here,
+// and including it unconditionally meant `build.cmd --no-cuda` failed to COMPILE with
+// C1083, before it could even reach the link stage.
+#ifdef RD_WITH_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <algorithm>
