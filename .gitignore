@@ -69,3 +69,6 @@ tests/smooth.png
 Thumbs.db
 .DS_Store
 *.swp
+
+# Personal working notes, not part of the project.  Kept on disk, never committed.
+docs/AGENT-NOTES.md
