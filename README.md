@@ -216,6 +216,88 @@ Decode, dither and encode run concurrently, so the reported fps is the whole pip
 throughput rather than one stage's. Audio from the source is carried across untouched
 (`--no-audio` to drop it).
 
+### What it reads, what it does to the pixels, what it writes
+
+Not only a dither: the video path also does its own colour conversion, in both
+directions, on the device.
+
+**Input.** Anything ffmpeg decodes, at the pixel formats ffmpeg produces. The decoder
+hands over planar YUV, and `--input-mode` chooses what happens next:
+
+| `--input-mode` | bytes/px | what it does |
+|---|---|---|
+| `yuv444` (default) | 3 | swscale's own YCbCr→RGB matrix, on the device |
+| `yuv444-prepass` | 3 | same result via a coalesced pass; measured **AE 0** against `yuv444` |
+| `yuv420` | 1.5 | the decoder's own format, no swscale at all; chroma reconstructed 2× bilinear on the device |
+| `rgba64` | 8 | the reference path: ffmpeg converts, rdither receives RGBA |
+
+`yuv420` is the cheapest and `rgba64` the most faithful, and on 4:2:0 source that
+difference is large. Measured on a 4:2:0 clip, comparing modes to each other so the
+dithering is held constant:
+
+| | vs `yuv444` | vs `rgba64` |
+|---|---|---|
+| `yuv444` | — | 28.0 dB |
+| `yuv420` | **5.8 dB** | 5.8 dB |
+
+**5.8 dB is not a colourimetric nuance, it is a different picture.** If you have 4:2:0
+footage and care about fidelity, use `yuv444` or `rgba64`. On a true 4:4:4 source every
+mode agrees exactly (`yuv444` vs `rgba64` is AE 0), so the choice only bites for 4:2:0
+input — which is most real footage.
+
+**Output.** `--video-pix-fmt` defaults to `yuv444p` and that default is load-bearing:
+`yuv420p` output subsamples chroma over 2×2 blocks, averaging away the dither pattern
+entirely. It is also far smaller — 15,191 bytes against 36,031 for the same 600 frames
+— so the small file is the one where the dither is gone. `--video-lossless` gives
+ffv1 yuv444p, which keeps the palette exactly, at roughly 28× the bitrate of yuv420p
+H.264.
+
+### Concurrency, and the RAM it uses
+
+Decode, dither and encode all run at once, and the tool will use the machine you give
+it. On the benchmark machine, thread-time totals 647 s against a 352 s wall, so every
+core is busy — and roughly two thirds of that is decode and encode rather than GPU
+work. The GPU is not usually the constraint; see
+[what the fps number means](#what-the-fps-number-means-in-practice).
+
+**`--cpu-threads` is not a scheduling knob, and this is the part worth reading.** With
+`auto` and a GPU present, the host worker pool is **off** (`0`), and the GPU walk is the
+only walk. That is measured, not incidental: the host block walk costs ~937 ms/frame at
+1080p against the GPU's 63.5, and on a deep queue ten host workers make the whole
+pipeline *slower* (219–244 ms/frame with them, 115 without) because they saturate the
+memory bandwidth the GPU's data path needs.
+
+So **any explicit value ≥ 1 turns the host walk on**, and the host walk is not
+bit-identical to the GPU walk — the program says so on every run that does it:
+
+```
+[video] note: the 10 host worker(s) use the host block walk, which is NOT bit-identical to ...
+```
+
+Consequences, all measured on a 2-second clip with the palette pinned:
+
+| | what runs | vs `auto` |
+|---|---|---|
+| `auto`, GPU present | GPU walk only | — |
+| `--cpu-threads 2` | host walk | **AE 0** with `--no-gpu` auto |
+| `--cpu-threads 1` | host walk, one worker's partition | differs |
+
+Even among host-only runs the count matters: fewer workers means a different block
+partition, and each block restarts its error queue, so `--cpu-threads 1` and `auto`
+differ by about 4,200 pixels. **If you need reproducible output, leave it on `auto`.**
+
+Other knobs, briefly: `--reader-threads`, `--decode-threads` and `--encode-threads`
+cap ffmpeg's own threads; `--gpu-workers N` runs N GPU walks at once (2 measured no
+faster, the dither being saturated rather than stalled); `--frames`, `--batch-frames`
+and `--queue-depth` set the work granularity.
+
+**RAM.** The queue is sized first and the worker count trimmed to fit it, because a
+deep queue with fewer workers beats a shallow one with more. `[ram]` on every run
+reports the real figure — 42 slots + a 782 MiB reserve ≈ 824 MiB peak at 1080p, with
+the reserve dominating. `--mem-fraction` sets the share of physical RAM the queue may
+use (default about a third) and `--max-ram-mb` caps it absolutely; frames beyond the
+budget spill to disk rather than failing.
+
 ### What the fps number means in practice
 
 The measurement below is on a real clip, not a synthetic one:

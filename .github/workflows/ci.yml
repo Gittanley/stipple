@@ -52,34 +52,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI (portable)
         shell: pwsh
+        # The PORTABLE 7z, not the .exe installer.  This is not a preference: the
+        # installer form was tried first and hung.  `im-setup` ignored the NSIS /S flag
+        # and sat there for the full 30-minute job timeout, with the runner reporting
+        #   Terminate orphan process: pid (4444) (im-setup)
+        # at cleanup, so the build was never reached and nothing was verified.  A
+        # portable archive has no process to wait on and nothing to mis-quote.
+        #
         # Pinned to the EXACT version every bit-exactness number in this repository was
-        # measured against, deliberately rather than to "latest".  A Q8 or Q16-non-HDRI
-        # build compiles and then fails every comparison, and "latest" would let a new
-        # ImageMagick release turn a green build red with nothing in the repository
-        # having changed.  Bump this deliberately, as its own commit.
+        # measured against, deliberately rather than to "latest".  A Q8 or
+        # non-HDRI build compiles and then fails every comparison, and "latest" would
+        # let a new release turn a green build red with nothing in the repository
+        # having changed.  Bump it deliberately, as its own commit.
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
+          $asset = "ImageMagick-$tag-portable-Q16-HDRI-x64.7z"
           $url = "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset"
           Write-Host "fetching $url"
-          Invoke-WebRequest -Uri $url -OutFile im-setup.exe -UseBasicParsing
-          # The NSIS installer. /S is silent, /D must be LAST and unquoted, which is an
-          # NSIS rule rather than a shell one -- quoting /D produces a directory whose
-          # name includes a quote character.
+          Invoke-WebRequest -Uri $url -OutFile im.7z -UseBasicParsing -TimeoutSec 900
           $dest = 'C:\im'
-          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "ImageMagick installer exited $($p.ExitCode)" }
-          if (-not (Test-Path "$dest\include\MagickCore\MagickCore.h")) {
-            throw "installed, but $dest\include\MagickCore\MagickCore.h is missing"
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          # 7z is on the windows-2022 image.  `x` extracts, `-o` sets the output dir with
+          # no space after it, which 7z requires.
+          & 7z.exe x im.7z "-o$dest" -y | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
+          # The archive may or may not wrap everything in a single top-level directory,
+          # so the real root is found rather than assumed.  Asserting on the two files
+          # that matter turns a wrong guess into a one-line log instead of a mystery
+          # link error twenty steps later.
+          $root = $null
+          foreach ($cand in @($dest, (Get-ChildItem $dest -Directory | Select-Object -First 1))) {
+            if ($cand -and (Test-Path (Join-Path $cand.FullName 'include\MagickCore\MagickCore.h'))) { $root = $cand.FullName; break }
           }
-          if (-not (Test-Path "$dest\lib\CORE_RL_MagickCore_.lib")) {
-            throw "installed, but $dest\lib\CORE_RL_MagickCore_.lib is missing -- this is the Q8 or non-MSVC build"
+          if (-not $root) {
+            Write-Host "top level of $dest :"
+            Get-ChildItem $dest | ForEach-Object { Write-Host "  $($_.Name)" }
+            throw "no include\MagickCore\MagickCore.h anywhere under $dest"
           }
-          Write-Host "ImageMagick OK at $dest"
-          "IM_ROOT=$dest" >> $env:GITHUB_ENV
+          $lib = Join-Path $root 'lib\CORE_RL_MagickCore_.lib'
+          if (-not (Test-Path $lib)) {
+            Write-Host "lib\ under $root :"
+            Get-ChildItem (Join-Path $root 'lib') -EA SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+            throw "no CORE_RL_MagickCore_.lib at $lib -- this is the Q8 or non-MSVC build"
+          }
+          Write-Host "ImageMagick root: $root"
+          "IM_ROOT=$root" >> $env:GITHUB_ENV
+          # build.cmd reads IMAGEMAGICK_ROOT, and this is the only step that knows
+          # where the archive actually landed.  Without it the nocuda job falls back to
+          # build.cmd's hardcoded C:\Program Files\ImageMagick-7.1.2-Q16-HDRI and fails
+          # "ImageMagick not found" on a runner where that path never exists.
+          "IMAGEMAGICK_ROOT=$root" >> $env:GITHUB_ENV
 
       - name: Report the toolchain actually used
         shell: pwsh
@@ -148,18 +175,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI (portable)
         shell: pwsh
+        # Portable 7z, not the installer -- the .exe hung for the full 30-minute
+        # timeout in the nocuda job and the build was never reached.  See the note on
+        # the same step in the job above.
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
-          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im-setup.exe -UseBasicParsing
+          $asset = "ImageMagick-$tag-portable-Q16-HDRI-x64.7z"
+          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im.7z -UseBasicParsing -TimeoutSec 900
           $dest = 'C:\im'
-          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "ImageMagick installer exited $($p.ExitCode)" }
-          if (-not (Test-Path "$dest\lib\CORE_RL_MagickCore_.lib")) { throw "no MSVC import library at $dest" }
-          "IM_ROOT=$dest" >> $env:GITHUB_ENV
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          & 7z.exe x im.7z "-o$dest" -y | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
+          $root = $null
+          foreach ($cand in @($dest, (Get-ChildItem $dest -Directory | Select-Object -First 1))) {
+            if ($cand -and (Test-Path (Join-Path $cand.FullName 'include\MagickCore\MagickCore.h'))) { $root = $cand.FullName; break }
+          }
+          if (-not $root) { throw "no include\MagickCore\MagickCore.h under $dest" }
+          if (-not (Test-Path (Join-Path $root 'lib\CORE_RL_MagickCore_.lib'))) { throw "no MSVC import library under $root" }
+          Write-Host "ImageMagick root: $root"
+          "IM_ROOT=$root" >> $env:GITHUB_ENV
+          "IMAGEMAGICK_ROOT=$root" >> $env:GITHUB_ENV
 
       - name: Install the CUDA toolkit
         shell: pwsh
@@ -213,8 +253,10 @@ jobs:
 
       - name: Build (CUDA)
         shell: cmd
-        env:
-          IMAGEMAGICK_ROOT: C:\im
+        # No env: block.  IMAGEMAGICK_ROOT is already in GITHUB_ENV from the install
+        # step, set to the root the archive actually unpacked to.  Hardcoding C:\im
+        # here was wrong the moment the portable archive was adopted, because that is
+        # the extraction target, not necessarily the root inside it.
         run: build.cmd
 
       - name: Report what this run could and could not check
