@@ -9,23 +9,49 @@ deliberately approximate where it is not — [see exactly which is which](#where
 If you point it at an image with the sequential walk and ask for 16 colours, you get
 back the same 16 colours ImageMagick would have produced, the same pixels, byte for
 byte — not "similar", not "close enough to pass". That is the design goal, and it is
-checked on every push, on a machine that is not the one this was written on.
+checked against ImageMagick on every build. [Continuous
+integration](.github/workflows/ci.yml) is set up to do that automatically; it is
+blocked on a toolchain problem and has not yet succeeded, so for now that claim rests
+on building a clean clone by hand — which was done, for every configuration, and found
+five defects.
 
-[Continuous integration](.github/workflows/ci.yml) builds a clean clone and runs the
-suite against a GPU-less runner — which is deliberate, because that is the
-configuration five separate defects survived in, each of them a build path nobody had
-ever run. What it covers and what it cannot:
+[[Continuous integration](.github/workflows/ci.yml) is set up to build a clean clone and
+run the suite on a GPU-less runner — deliberately, because that is the configuration
+five separate defects survived in, each one a build path nobody had ever run.
 
-| | in CI |
+**It has not yet built this repository.** It is blocked on ImageMagick, and the reason
+is specific enough to be worth recording so nobody repeats the search:
+
+> GitHub's hosted Windows runners ship ImageMagick 7.1.2-25 Q16-HDRI, installed by
+> chocolatey — but **runtime only**. There is no `include\MagickCore\MagickCore.h` and
+> no `lib\CORE_RL_MagickCore_.lib`, so nothing can link against it. `magick` itself
+> works, and is what `verify.ps1` uses as its reference.
+
+ImageMagick publishes four forms of its Windows x64 build, and none of them installs
+unattended on a runner:
+
+| form | result, measured on a runner |
 |---|---|
-| CPU-only build, 90 bit-exact cases vs ImageMagick | ✓ every push |
-| CUDA build compiles and links | ✓ every push |
-| OpenCL-vs-CUDA, 54 cells | ✗ no GPU on the runner — manual |
-| video probes | ✗ no GPU, and no clip is committed — manual |
-| clean clone builds at all | ✓ every push |
+| `portable-Q16-HDRI-x64.7z` | runtime only — 23 loose files, no `include/`, no `lib/` |
+| `-Q16-HDRI-x64-dll.exe` | `/S` opens a directory prompt and hangs; the runner kills it |
+| `-Q16-HDRI-x64-static.exe` | same installer, and static rather than import libs |
+| `choco install imagemagick` | already installed — it *is* the runtime-only copy |
 
-The last row is the one that matters. Everything else in this file was true while a
-fresh `git clone` **failed to link**, because no check had ever built one.
+The remaining route is building ImageMagick from source in CI, which is out of
+proportion to this project. So the table below is what CI *would* cover, and the honest
+status is that none of it is green yet:
+
+| | intended coverage | status |
+|---|---|---|
+| CPU-only build, 90 bit-exact cases vs ImageMagick | every push | blocked on the install |
+| CUDA build compiles and links | every push | blocked on the install, and on `nvcc`, which the runner also lacks |
+| OpenCL-vs-CUDA, 54 cells | manual | no GPU on the runner |
+| video probes | manual | no GPU, and no clip is committed |
+
+**The row that matters is the last one: "clean clone builds at all".** Everything else
+in this file was true while a fresh `git clone` **failed to link**, because no check had
+ever built one — and it still is not checked automatically. That verification has been
+done by hand, from a clean clone, for every configuration in the table above.
 
 ```
 rdither --colors 16 photo.png out.png

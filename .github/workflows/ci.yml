@@ -1,6 +1,57 @@
 # Continuous integration: build every configuration, verify what can be verified.
 #
-# WHY THIS EXISTS, and it is not "to be professional".
+# ############################################################################
+# THIS WORKFLOW HAS NEVER SUCCESSFULLY BUILT THIS REPOSITORY.
+#
+# It is blocked on ImageMagick, after six runs that each established one measured
+# fact.  Recorded here rather than in the commit log alone, because they cost about
+# forty minutes of CI to acquire and nobody should pay that again.
+#
+# GitHub's hosted Windows runners DO ship ImageMagick:
+#
+#   C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe
+#   Version: ImageMagick 7.1.2-25 Q16-HDRI x64
+#
+# which is the right variant and the path build.cmd looks in first.  But it is
+# RUNTIME ONLY.  Measured on a runner:
+#
+#   include\MagickCore\MagickCore.h   -> False
+#   lib\CORE_RL_MagickCore_.lib       -> False
+#
+# Nothing can link against it.  `magick` itself works, so it is usable as the compare
+# reference verify.ps1 needs; it cannot be built against.
+#
+# FIVE INSTALL ROUTES, ALL MEASURED ON A RUNNER, ALL DEAD ENDS:
+#
+#   1. the -dll.exe installer via Start-Process -ArgumentList @("/S","/D=...")
+#      hung to the full job timeout.  NSIS re-quotes array elements, so /D arrives
+#      quoted and the installer opens a directory prompt and waits for a human instead
+#      of failing.
+#   2. the same through `cmd /c`, which works on a machine that ALREADY has ImageMagick
+#      (verified locally: exit 0 in 23.9s) and still hangs on a clean runner.  The
+#      uncontrolled variable was a prior install, which is exactly why the local test
+#      passed and the real thing did not.  That is the mistake worth remembering: a
+#      local reproduction of a clean-machine failure, run on a machine that was not
+#      clean.
+#   3. the portable-Q16-HDRI-x64.7z extracts in 0.9s and is runtime only -- 23 loose
+#      files, magick.exe and XML, with no include/ and no lib/ anywhere in the tree.
+#   4. `7z x` on the installer exe yields the NSIS bootstrap only; the payload is in an
+#      embedded blob 7z does not unpack.
+#   5. `choco install imagemagick` reports "v7.1.2.2500 already installed", i.e. it IS
+#      the runtime-only copy from route 1 above.
+#
+# ImageMagick publishes four forms of the Windows x64 build -- portable 7z, dll exe,
+# static exe, and a source tarball -- and none of the binaries installs unattended on a
+# runner.  The remaining route is building ImageMagick from source inside CI, which is
+# out of proportion to this project.
+#
+# TO MAKE THIS WORK, one of:
+#   * a cached runner image with a dev install of ImageMagick (a custom
+#     actions/runner-image, or a self-hosted runner);
+#   * build ImageMagick from source as a first CI step;
+#   * accept a prebuilt rdither and run only the probes.
+#
+# WHY THIS EXISTS AT ALL, and it is not "to be professional".
 #
 # Five defects were found in one session, and every one of them had the same cause:
 # a build configuration that nobody had ever run.  A clean clone did not link.
