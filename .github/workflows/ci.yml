@@ -1,0 +1,226 @@
+# Continuous integration: build every configuration, verify what can be verified.
+#
+# WHY THIS EXISTS, and it is not "to be professional".
+#
+# Five defects were found in one session, and every one of them had the same cause:
+# a build configuration that nobody had ever run.  A clean clone did not link.
+# `build.cmd --no-cuda` did not compile.  Three separate scripts reported an absent
+# engine as a test FAILURE, so a CPU-only build exited 1 on a suite that was entirely
+# green.  The OpenCL SDK was searched for in one directory while the comment beside it
+# promised three others.  A documented .txt palette was rejected on the video path with
+# a message that blamed the file.
+#
+# Every other check passed the whole time -- 135 bit-exact cases, anchors, 56
+# documented flags, the licence byte-compare, a secrets sweep across every commit --
+# and NOT ONE of them could have caught any of those five.  Only building a clean
+# clone could.  This workflow builds a clean clone on every push, on a machine that is
+# not the one the code was written on.
+#
+# WHAT THIS RUNS ON, and why it is the right shape.  GitHub's hosted Windows runners
+# have NO GPU and NO OpenCL SDK, which is precisely the configuration that was broken
+# three separate ways.  That is not a limitation worked around; it is the reason this
+# catches things.  What it therefore CANNOT do is run the OpenCL-vs-CUDA sweep or the
+# video probes, and it does not pretend to: those report as skipped, which is a
+# distinct outcome from passing and is never counted as a pass.
+#
+# COSTS about 6-8 minutes per push.  If that is too much, delete the cuda job -- the
+# nocuda job alone catches three of the five defects, and the cuda job is the one
+# that only checks compilation.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run in progress.  Without this, a burst of
+# commits queues five six-minute builds to answer a question the newest commit already
+# answers.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nocuda:
+    # The highest-value job in this file, and the one to keep if you keep only one.
+    # No GPU on the runner, so this takes exactly the code path that failed to link.
+    name: build + verify (no CUDA, no OpenCL SDK)
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
+        shell: pwsh
+        # Pinned to the EXACT version every bit-exactness number in this repository was
+        # measured against, deliberately rather than to "latest".  A Q8 or Q16-non-HDRI
+        # build compiles and then fails every comparison, and "latest" would let a new
+        # ImageMagick release turn a green build red with nothing in the repository
+        # having changed.  Bump this deliberately, as its own commit.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '7.1.2-31'
+          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
+          $url = "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset"
+          Write-Host "fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile im-setup.exe -UseBasicParsing
+          # The NSIS installer. /S is silent, /D must be LAST and unquoted, which is an
+          # NSIS rule rather than a shell one -- quoting /D produces a directory whose
+          # name includes a quote character.
+          $dest = 'C:\im'
+          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "ImageMagick installer exited $($p.ExitCode)" }
+          if (-not (Test-Path "$dest\include\MagickCore\MagickCore.h")) {
+            throw "installed, but $dest\include\MagickCore\MagickCore.h is missing"
+          }
+          if (-not (Test-Path "$dest\lib\CORE_RL_MagickCore_.lib")) {
+            throw "installed, but $dest\lib\CORE_RL_MagickCore_.lib is missing -- this is the Q8 or non-MSVC build"
+          }
+          Write-Host "ImageMagick OK at $dest"
+          "IM_ROOT=$dest" >> $env:GITHUB_ENV
+
+      - name: Report the toolchain actually used
+        shell: pwsh
+        run: |
+          & "$env:IM_ROOT\magick.exe" --version
+          cmake --version
+          # Recorded in the log because a green run on an unexpected toolchain is not
+          # the same evidence as a green run on the expected one.
+          Write-Host "runner: $env:RUNNER_OS $env:RUNNER_ARCH"
+
+      - name: Build (CPU only)
+        shell: cmd
+        run: build.cmd --no-cuda
+
+      - name: Verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & "$env:IM_ROOT\magick.exe" --version
+          $env:MAGICK_HOME = $env:IM_ROOT
+          $env:PATH = "$env:IM_ROOT;$env:PATH"
+          & pwsh -NoProfile -File .\verify.ps1
+          $code = $LASTEXITCODE
+          Write-Host "verify.ps1 exit=$code"
+          if ($code -ne 0) { exit $code }
+
+      - name: Assert the skipped checks are the expected ones
+        shell: pwsh
+        # Guards against a silent hole.  verify.ps1 reports a check it cannot run as
+        # skipped, and a skipped check is not a pass -- but that convention also means
+        # a suite could skip EVERYTHING and exit 0, which would be a green light that
+        # means "I looked away".  So the count of real passes is asserted here, and it
+        # is asserted to be the number the no-CUDA configuration can actually produce.
+        #
+        # 90, not 135: 9 images x 5 colour counts x 3 engines is 135, and the cuda
+        # engine's 45 are skipped on a runner with no GPU.  If someone later fixes the
+        # engine reporting, this number goes UP and the assertion has to be updated --
+        # which is the intended direction to be forced into noticing.
+        run: |
+          $log = 'verify.log'
+          & pwsh -NoProfile -File .\verify.ps1 *>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { Write-Host "verify.ps1 FAILED (exit $code)"; exit $code }
+          $text = Get-Content $log -Raw
+          $m = [regex]::Match($text, 'bit-exact cases:\s*(\d+) passed,\s*(\d+) failed(?:,\s*(\d+) SKIPPED)?')
+          if (-not $m.Success) { Write-Host "could not find the bit-exact tally in the output"; exit 1 }
+          $passed = [int]$m.Groups[1].Value
+          $failed = [int]$m.Groups[2].Value
+          Write-Host "tally: $passed passed, $failed failed"
+          if ($failed -ne 0) { exit 1 }
+          if ($passed -lt 80) {
+            Write-Host "only $passed cases ran -- that is far below the 90 this configuration can do."
+            Write-Host "A suite that skips nearly everything and exits 0 is worse than a failing one."
+            exit 1
+          }
+          Write-Host "OK: $passed real bit-exact cases passed on a GPU-less runner"
+
+  cuda:
+    # Compilation only in practice: nvcc compiles and links without a device, so this
+    # verifies the CUDA build is not broken, and then verify.ps1 reports the GPU checks
+    # as skipped.  Kept separate from the job above so that a CUDA toolchain problem
+    # does not hide a plain C++ problem, and so either can be dropped independently.
+    name: build (CUDA toolkit, no GPU)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '7.1.2-31'
+          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
+          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im-setup.exe -UseBasicParsing
+          $dest = 'C:\im'
+          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "ImageMagick installer exited $($p.ExitCode)" }
+          if (-not (Test-Path "$dest\lib\CORE_RL_MagickCore_.lib")) { throw "no MSVC import library at $dest" }
+          "IM_ROOT=$dest" >> $env:GITHUB_ENV
+
+      - name: Install the CUDA toolkit
+        shell: pwsh
+        # The hosted runners have MSBuild and the VS C++ workload but NOT nvcc, and
+        # `find_package(CUDAToolkit REQUIRED)` in CMakeLists.txt makes its absence a
+        # configure error rather than a graceful skip.
+        #
+        # These are the component REDIST archives, not the 4 GB installer, so each URL
+        # was read out of NVIDIA's own manifest for 12.8.1 and then fetched to confirm
+        # it resolves:
+        #   https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.1.json
+        # A hand-written guess at this path 404s.  The version numbers are the
+        # component versions WITHIN the 12.8.1 release, which is why nvcc is 12.8.93
+        # and not 12.8.1 -- that mismatch looks like a typo and is not one.
+        #
+        # cuda_cccl is included because nvcc's own headers include thrust/cub, so a
+        # toolkit without it fails at compile time rather than at configure time.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $parts = @(
+            'cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.93-archive.zip',
+            'cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip',
+            'cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.90-archive.zip'
+          )
+          $stage = "$env:RUNNER_TEMP\cuda"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($p in $parts) {
+            $name = ($p -split '/')[-1]
+            Write-Host "fetching $name"
+            Invoke-WebRequest -Uri "$base/$p" -OutFile "$env:RUNNER_TEMP\$name" -UseBasicParsing -TimeoutSec 1800
+            # Each archive unpacks to its own versioned directory; merge them all into
+            # one root, because that is the shape find_package(CUDAToolkit) expects.
+            $dest = Join-Path $stage ([IO.Path]::GetFileNameWithoutExtension($name) -replace '-archive$','')
+            Expand-Archive -Path "$env:RUNNER_TEMP\$name" -DestinationPath $dest -Force
+          }
+          $root = Get-ChildItem $stage -Directory |
+                  Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
+                  Select-Object -First 1
+          if (-not $root) {
+            Get-ChildItem $stage -Recurse -Filter 'nvcc.exe' | ForEach-Object { Write-Host "  found nvcc at $($_.FullName)" }
+            throw 'nvcc.exe not found in any unpacked component'
+          }
+          Write-Host "CUDA root: $($root.FullName)"
+          "CUDA_PATH=$($root.FullName)" >> $env:GITHUB_ENV
+          ("{0}\bin" -f $root.FullName) >> $env:GITHUB_PATH
+          ("{0}\lib\x64" -f $root.FullName) >> $env:GITHUB_PATH
+          ("{0}\include" -f $root.FullName) >> $env:GITHUB_PATH
+          & (Join-Path $root.FullName 'bin\nvcc.exe') --version
+
+      - name: Build (CUDA)
+        shell: cmd
+        env:
+          IMAGEMAGICK_ROOT: C:\im
+        run: build.cmd
+
+      - name: Report what this run could and could not check
+        shell: pwsh
+        run: |
+          Write-Host "This job has the CUDA toolkit but NO GPU."
+          Write-Host "It proves the CUDA build compiles and links.  It cannot run the"
+          Write-Host "OpenCL-vs-CUDA sweep or the video probes, and those stay manual."
+          & .\build\Release\rdither.exe --list-dithers
