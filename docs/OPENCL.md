@@ -525,15 +525,53 @@ compile errors above were only findable because the log was there.
   zero-copy upload does not transfer, so the `rgba64le` path pays a staging memcpy
   that the CUDA path does not. It is still a net win — it deletes the host's
   uint16↔float conversions, which are the larger cost — but it is not the same win.
-- **Performance is unknown, and should not be guessed at.** A 10-frame 160x90 run
-  reported 32.5 fps for OpenCL against 21.9 for CUDA; that clip is almost entirely
-  process start-up and driver init, so the number is meaningless in both directions.
-  Nothing here has been benchmarked under steady state, and the standing note
-  applies: sub-5% differences on this machine are inside the fps noise, because a
-  browser is running video alongside.
+- **Performance is measured on one machine, and only on that machine.** The
+  before/after table in the planar 4:4:4 section above is the real figure: **1.26x**
+  of CUDA's wall clock, both engines on `yuv444p`, 600 frames of 1080p60, 3
+  interleaved runs. It is quoted as "1.2-1.3x" in the README because a single
+  machine cannot support three digits. An earlier version of this bullet said
+  performance was unknown and quoted a 10-frame 160x90 run; that clip is almost
+  entirely process start-up and driver init, so the number was meaningless in both
+  directions, and the bullet predated the steady-state measurement. What remains
+  true is the scope limit: sub-5% differences on this machine sit inside the fps
+  noise, and the figure says nothing at all about a non-NVIDIA device - see
+  "Intel and AMD" above.
 - **Multi-frame batching** (`--frames N`) is plumbed through `options.frames` and is
   exercised by the video path above (16-frame batches, 60 frames of 1080p), but
   `--frames N` on the *image* path has not been compared against CUDA.
+
+## Intel and AMD: unmeasured, and why that is the whole question
+
+Everything above was measured on **one machine, with an NVIDIA driver**. So the
+correctness result transfers — the arithmetic is the same kernels and the same
+partition on any conformant device — but the *performance* result does not
+transfer at all, and performance is the only reason to use this engine on a
+non-NVIDIA card.
+
+The cost centre is FP64. The Riemersma error queue carries the error as a double,
+so the walk is double-precision throughout, and a consumer GPU's FP64 rate is
+usually **1/32 or 1/64** of its FP32 rate. That ratio is exactly where NVIDIA,
+AMD and Intel differ most, and it is not a detail: it can turn a large win into a
+large loss. So "OpenCL is 1.2-1.3x of CUDA" is a true statement about an NVIDIA
+driver and says nothing about an iGPU.
+
+Two things make this cheap to answer rather than a research project:
+
+- The engine is **bit-identical to CUDA on every cell measured** (54/54 images, 2/2
+  video data paths). There is no porting work to do first. If your card is fast
+  enough, it is already correct.
+- `tools\probe-opencl.exe` reports your devices and their `cl_khr_fp64` support
+  with no SDK and no build, in under a second.
+
+What would decide it, and has not been done here: run `tools\probe-opencl-exact.ps1`
+on the machine in question, which reports both correctness and per-engine timings
+per cell, then time a real clip with each engine on the same data path. The
+comparison is only meaningful on the same path — see the rgba64le section above
+for the 2.67x that was pure data-path artefact.
+
+Until someone runs that, the honest statement is: **the OpenCL engine is verified
+correct and is the supported route to a non-NVIDIA GPU; it has not been shown to be
+faster than CPU on any of them.**
 
 ## Checking any machine
 

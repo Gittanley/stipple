@@ -340,21 +340,52 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   std::unique_ptr<rd::ColorTree> tree(new rd::ColorTree());
   rd::VideoResult result;
   if (!opt.palette_from.empty()) {
-    // ImageMagick built the palette, we only dither.  Its colormap is taken
-    // verbatim: re-quantizing it is precisely what would change it.
-    rd::LoadedImage loaded;
-    if (!rd::ImLoad(opt.palette_from, &loaded, &error)) {
-      std::fprintf(stderr, "error: %s\n", error.c_str());
-      return 1;
-    }
-    if (!rd::ImAdoptPaletteFromColormap(loaded, opt.colors, palette.get(),
-                                        tree.get(), &error)) {
-      std::fprintf(stderr, "error: --palette-from %s: %s\n",
-                   opt.palette_from.c_str(), error.c_str());
+    // A .txt here used to fail with "improper image header", because this branch
+    // went through ImLoad -- i.e. ImageMagick -- and a rdither Q16 palette text file
+    // is not an image.  The message named a corrupt file, and the file was fine.
+    //
+    // The fix is not a second reader, it is THE reader: ImReadPalette is what the
+    // image path uses, and routing video through it means one implementation for
+    // both paths, so the two formats and the two validation behaviours cannot drift
+    // apart again.  It also brings three things video previously lacked:
+    //
+    //   * the .txt Q16 form, which --help documents for --palette-import and which
+    //     the image path has always accepted;
+    //   * the colour-count check, so a 14-colour file asked for as 16 is REFUSED
+    //     with both numbers named, instead of quietly dithering to 14;
+    //   * the RgbaF precision reconciliation, which is import-specific -- a palette
+    //     read from a file holds doubles while the tree is built from floats, and
+    //     without it every later "colormap entry N differs" check fails on the last
+    //     digit.  A palette derived from the video's own pixels never hits this,
+    //     which is why only the import path needs it and why only the import path
+    //     had it.
+    const bool is_text =
+        (opt.palette_from.size() >= 4 &&
+         opt.palette_from.compare(opt.palette_from.size() - 4, 4, ".txt") == 0);
+    if (is_text) {
+      if (!rd::ImReadPalette(opt.palette_from, opt.colors, palette.get(),
+                             tree.get(), &error)) {
+        std::fprintf(stderr, "error: --palette-from %s\n", error.c_str());
+        return 1;
+      }
+    } else {
+      // An image colormap: ImageMagick built the palette, we only dither.  Its
+      // colormap is taken verbatim, because re-quantizing it is precisely what would
+      // change it.
+      rd::LoadedImage loaded;
+      if (!rd::ImLoad(opt.palette_from, &loaded, &error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+      }
+      if (!rd::ImAdoptPaletteFromColormap(loaded, opt.colors, palette.get(),
+                                          tree.get(), &error)) {
+        std::fprintf(stderr, "error: --palette-from %s: %s\n",
+                     opt.palette_from.c_str(), error.c_str());
+        rd::ImFree(&loaded);
+        return 1;
+      }
       rd::ImFree(&loaded);
-      return 1;
     }
-    rd::ImFree(&loaded);
     result.palette_colors = palette->count;
     result.palette_sampled = 0;
     result.palette_mosaic_w = 0;

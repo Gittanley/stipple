@@ -17,9 +17,26 @@
 # arithmetic disagreement rather than of a structural one.
 
 param(
-  [string]$Dir = "$env:TEMP\rdocl",
+  # $Dir is UNIQUE per process; $FixtureDir is stable and shared.  The fixed name
+  # this used to have for BOTH is a bug, and the same one already fixed in
+  # probe-video-determinism.ps1: two concurrent instances shared one directory, and
+  # one compared a cell against a file the other was still writing.  The symptom was
+  # 53 of 54 cells identical -- one reported "not identical" -- which reads as an
+  # arithmetic disagreement between the engines, i.e. as exactly the defect this probe
+  # exists to catch.  It was caused by two probes I started myself, minutes after the
+  # same probe reported 54 of 54.  A contaminated instrument reporting a real-looking
+  # defect is the worst outcome an instrument can produce.
+  [string]$Dir = "",
+  # STABLE and shared, unlike $Dir.  probe-determinism.ps1 reads the same fixtures
+  # from here, which is why verify.ps1 says to run this probe once before it.
+  [string]$FixtureDir = "",
   [int]$Cols = 2
 )
+
+if (-not $Dir) {
+  $Dir = Join-Path $env:TEMP ('rdocl_' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+}
+if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
 
 # NOT 'Stop'.  rdither writes diagnostics to stderr, and a native command's stderr
 # surfaces as a non-terminating error record; under 'Stop' the first "[blocks]"
@@ -35,17 +52,35 @@ if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Ou
 # after a round-1 finding -- two ALPHA cases, because associate_alpha changes the
 # error queue, the octave fan-out (8 children vs 16) and the scatter, and was
 # therefore the one branch of the port with no coverage at all.
-& magick -size 64x48 xc:'#4080C0' "$Dir\c_flat.png" 2>&1 | Out-Null
-& magick -size 64x48 gradient:black-white "$Dir\c_ramp.png" 2>&1 | Out-Null
-& magick -size 96x64 plasma:fractal -seed 7 "$Dir\c_plasma.png" 2>&1 | Out-Null
-& magick -size 96x64 xc:gray +noise Random "$Dir\c_noise.png" 2>&1 | Out-Null
+# Fixtures go to a STABLE, shared directory; the per-cell work goes to the unique $Dir.
+#
+# The sharing is deliberate and load-bearing: verify.ps1 tells you to run this probe
+# once so that probe-determinism.ps1 finds c_plasma and c_ashape, and it reports the
+# determinism check as skipped until they exist.  So the fixtures cannot simply be
+# random per run.
+#
+# What must NOT be shared is the work.  $Dir used to be one fixed name for both, so
+# two concurrent instances of this probe shared it, and one compared a cell against a
+# file the other was still writing.  The symptom was 53 of 54 identical -- one cell
+# reported "not identical" -- which reads as an arithmetic disagreement between the
+# engines, i.e. as exactly the defect this probe exists to catch.  It was caused by two
+# probes I started myself, minutes after the same probe reported 54 of 54.  A
+# contaminated instrument reporting a real-looking defect is the worst outcome an
+# instrument can produce, so the split is deliberate: shared inputs, private outputs.
+if (-not $FixtureDir) { $FixtureDir = Join-Path $env:TEMP 'rdocl_fixtures' }
+New-Item -ItemType Directory -Force -Path $FixtureDir | Out-Null
+
+& magick -size 64x48 xc:'#4080C0' "$FixtureDir\c_flat.png" 2>&1 | Out-Null
+& magick -size 64x48 gradient:black-white "$FixtureDir\c_ramp.png" 2>&1 | Out-Null
+& magick -size 96x64 plasma:fractal -seed 7 "$FixtureDir\c_plasma.png" 2>&1 | Out-Null
+& magick -size 96x64 xc:gray +noise Random "$FixtureDir\c_noise.png" 2>&1 | Out-Null
 # Uniform alpha: exercises the association without a discontinuity.
-& magick -size 96x64 gradient:red-blue "$Dir\c_astuff.png" 2>&1 | Out-Null
-cmd /c "magick ""$Dir\c_astuff.png"" -alpha set -channel A -evaluate set 50%% +channel ""$Dir\c_alpha50.png""" 2>&1 | Out-Null
+& magick -size 96x64 gradient:red-blue "$FixtureDir\c_astuff.png" 2>&1 | Out-Null
+cmd /c "magick ""$FixtureDir\c_astuff.png"" -alpha set -channel A -evaluate set 50%% +channel ""$FixtureDir\c_alpha50.png""" 2>&1 | Out-Null
 # Hard alpha edge on a transparent field: the worst case for the alpha error
 # queue, and it also trips the greyscale detection path (ImageMagick reduces this
 # to graya, so the tree is built with a different child count again).
-cmd /c "magick -size 96x64 xc:none -fill ""rgba(200,40,120,0.35)"" -draw ""circle 48,32 48,10"" ""$Dir\c_ashape.png""" 2>&1 | Out-Null
+cmd /c "magick -size 96x64 xc:none -fill ""rgba(200,40,120,0.35)"" -draw ""circle 48,32 48,10"" ""$FixtureDir\c_ashape.png""" 2>&1 | Out-Null
 
 function Pixels($path) {
   if (-not (Test-Path $path)) { return @() }
@@ -146,7 +181,7 @@ foreach ($img in $imgs) {
   foreach ($c in @(2, 4, $Cols)) {
     foreach ($b in $blocks) {
       $tag = "{0}_{1}_{2}" -f $img, $c, $b
-      $r = Compare-Pair "$Dir\$img.png" $c $b $tag
+      $r = Compare-Pair "$FixtureDir\$img.png" $c $b $tag
       $total++
       # Every cell is compared for real, alpha included.  There is no outcome
       # that counts as a pass without being a comparison.

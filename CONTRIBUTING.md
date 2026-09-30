@@ -22,13 +22,61 @@ You need:
 | **Visual Studio 2022** | any edition, with the "Desktop development with C++" workload |
 | **CUDA toolkit** | 13.x, matching your driver |
 | **ImageMagick** | 7.x, **Q16-HDRI** — the Q8 build will not match bit for bit |
-| **OpenCL** | headers and loader; the `OpenCL-SDK-*-Win-x64` tree in some working copies is a local convenience and is not part of this repository |
+| **OpenCL** | **optional** — the SDK is 1.1 MB and makes the OpenCL engine available, which is the path for non-NVIDIA GPUs. See below. The build works without it. |
 
 ```
 git clone https://github.com/Gittanley/stipple
 cd stipple
 build.cmd
 ```
+
+That is enough on a machine with an NVIDIA GPU. If you have no NVIDIA GPU, or you want
+the OpenCL engine anyway, add the SDK — one download, no install step.
+
+### The OpenCL engine
+
+Download the SDK from the Khronos project and unpack the zip. No installer and no
+redistributable, and nothing extra is needed on the machine that later *runs* the built
+binary — `OpenCL.dll` is the Windows ICD loader and is already present.
+
+```
+curl -L -o sdk.zip https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v2026.05.29/OpenCL-SDK-v2026.05.29-Win-x64.zip
+unzip sdk.zip -d ..
+build.cmd
+```
+
+Unpacked **beside** the repository — the command above puts it in the parent directory —
+`CMakeLists.txt` finds it and prints:
+
+```
+-- OpenCL SDK: C:/path/to/OpenCL-SDK-v2026.05.29-Win-x64
+-- OpenCL engine: enabled
+```
+
+Then confirm it took:
+
+```
+rdither --engine opencl --colors 16 photo.png out.png
+```
+
+It is searched for in this order, first match wins: inside the repository, beside it, one
+level above that, `C:\OpenCL-SDK*`, and `%USERPROFILE%\Downloads`. Any other location
+works too — point at it directly:
+
+```
+build.cmd -DRD_OPENCL_SDK=C:\path\to\OpenCL-SDK-v2026.05.29-Win-x64
+```
+
+A folder only counts if it contains `include\CL\cl.h` **and** `lib\OpenCL.lib` — the
+headers and the import library. A partial unzip has one without the other, and CMake says
+which one is missing rather than only reporting "not found". When it finds no SDK at all
+it lists every directory it searched, so the failure is diagnosable from the build output
+alone.
+
+**Verified:** the engine is bit-identical to the CUDA engine on 54 of 54 comparison cells
+(`tools\probe-opencl-exact.ps1` — four images × colour counts × three block sizes),
+measured from a clean clone on an NVIDIA driver. **Not verified:** Intel and AMD
+hardware. [docs/OPENCL.md](docs/OPENCL.md) covers what that gap means and what to run.
 
 If ImageMagick is installed somewhere unusual:
 

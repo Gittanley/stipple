@@ -165,6 +165,21 @@ is identical to `blocks` on the same frame:
 rdither --colors 16 --engine opencl photo.png out.png
 ```
 
+**That identity is measured, not asserted: 54 of 54 comparison cells are
+bit-identical to CUDA** — four images × colour counts × three block sizes, via
+`tools\probe-opencl-exact.ps1`. It is also the only path for a non-NVIDIA GPU, and
+it now works from a clean clone: download the 1.1 MB Khronos SDK, unpack it beside
+this repository, and `build.cmd` enables the engine. No install step and nothing
+to deploy — `OpenCL.dll` is already on Windows. Full instructions in
+[CONTRIBUTING.md](CONTRIBUTING.md#the-opencl-engine).
+
+**What is not measured:** Intel and AMD hardware. All of the above was measured on
+an NVIDIA driver, and the thing that varies most between vendors is FP64
+throughput, which is this algorithm's cost centre. So the software is ready and
+the *speed* on your GPU is not a claim anyone can make for you yet —
+`tools\probe-opencl.exe` prints your device and whether it has
+`cl_khr_fp64`, and [docs/OPENCL.md](docs/OPENCL.md) explains what to do with that.
+
 It runs **video** as well as images, on the same input modes, and is within about
 **1.2–1.3×** of CUDA's wall clock on 1080p60 — measured, 3 interleaved runs of 600
 frames. It was long documented as "2.7× slower than CUDA", which was an artefact of

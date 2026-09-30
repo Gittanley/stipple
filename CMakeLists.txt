@@ -88,15 +88,45 @@ endif()
 # --- OpenCL ----------------------------------------------------------------
 if(RD_WITH_OPENCL)
   if(NOT RD_OPENCL_SDK)
-    # Look for a Khronos SDK unpacked beside the source, and in the usual
-    # "C:/OpenCL*" and per-user download places.  No registry probing on purpose:
-    # an SDK is a build-time input, and a machine that has never downloaded one
-    # has nothing to find.
-    file(GLOB _rd_ocl_local "${CMAKE_CURRENT_SOURCE_DIR}/OpenCL-SDK*")
-    foreach(_d ${_rd_ocl_local})
-      if(IS_DIRECTORY "${_d}/include/CL")
-        set(RD_OPENCL_SDK "${_d}")
+    # Look for a Khronos SDK in the places someone actually puts one, and REMEMBER
+    # WHICH PLACES THOSE WERE so the not-found message can list them.  No registry
+    # probing on purpose: an SDK is a build-time input, and a machine that has never
+    # downloaded one has nothing to find.
+    #
+    # This list used to be a single glob of the source directory, while the comment
+    # above it promised "beside the source, and in the usual C:/OpenCL* and per-user
+    # download places".  None of those three was searched.  So the instruction in the
+    # comment was the one that did not work, and the place that did work was the one
+    # the comment never mentioned -- found by unpacking the official release zip beside
+    # a clean clone, exactly as the comment said to, and being told "not found".
+    #
+    # Every entry is a specific, narrow glob.  This never walks a user profile: the
+    # Downloads folder is checked directly and nothing above it.
+    set(_rd_ocl_roots
+      "${CMAKE_CURRENT_SOURCE_DIR}"          # inside the repository
+      "${CMAKE_CURRENT_SOURCE_DIR}/.."       # beside the repository
+      "${CMAKE_CURRENT_SOURCE_DIR}/../..")    # repository nested one level down
+    if(WIN32)
+      list(APPEND _rd_ocl_roots "C:/")       # the usual C:/OpenCL-SDK*
+      if(DEFINED ENV{USERPROFILE})
+        list(APPEND _rd_ocl_roots "$ENV{USERPROFILE}/Downloads")
       endif()
+    endif()
+    set(_rd_ocl_searched "")
+    foreach(_root ${_rd_ocl_roots})
+      list(APPEND _rd_ocl_searched "${_root}")
+      if(RD_OPENCL_SDK)
+        continue()                           # first hit wins
+      endif()
+      file(GLOB _rd_ocl_dirs "${_root}/OpenCL-SDK*")
+      foreach(_d ${_rd_ocl_dirs})
+        # Headers only.  A directory with headers but no import library is a real and
+        # common state (a partial unzip), and it gets its own specific warning below
+        # rather than being silently skipped here.
+        if(IS_DIRECTORY "${_d}/include/CL" AND EXISTS "${_d}/include/CL/cl.h")
+          set(RD_OPENCL_SDK "${_d}")
+        endif()
+      endforeach()
     endforeach()
   endif()
   if(RD_OPENCL_SDK AND EXISTS "${RD_OPENCL_SDK}/include/CL/cl.h")
@@ -115,10 +145,24 @@ if(RD_WITH_OPENCL)
         "building without the OpenCL engine.")
     endif()
   else()
+    # A "not found" that does not say where it looked is the same failure as a silent
+    # one: the reader cannot act on it.  So list every directory searched, name what a
+    # usable folder must contain, and give the download.  This is the message a
+    # contributor sees first, so it has to be enough to fix the problem without
+    # reading any documentation.
+    set(_rd_ocl_list "")
+    foreach(_p ${_rd_ocl_searched})
+      set(_rd_ocl_list "${_rd_ocl_list}      ${_p}\n")
+    endforeach()
     message(STATUS
-      "OpenCL SDK not found; building without the OpenCL engine.  Pass "
-      "-DRD_OPENCL_SDK=<path> to enable it.  The engine is a separate accelerator, "
-      "so the build is still complete and usable without it.")
+      "OpenCL SDK not found; building without the OpenCL engine.\n"
+      "  Looked for a folder named  OpenCL-SDK*  containing  include/CL/cl.h  in:\n"
+      "${_rd_ocl_list}"
+      "  Get it from https://github.com/KhronosGroup/OpenCL-SDK/releases\n"
+      "  (the OpenCL-SDK-*-Win-x64.zip asset), unpack it into any of the places\n"
+      "  above, or pass -DRD_OPENCL_SDK=<path> explicitly.\n"
+      "  The engine is a separate accelerator, so the build is still complete and\n"
+      "  usable without it -- this is a missing optional feature, not a failure.")
   endif()
 endif()
 
