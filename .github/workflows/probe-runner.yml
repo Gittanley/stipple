@@ -5,15 +5,27 @@ jobs:
   probe:
     runs-on: windows-2022
     steps:
-      - name: inspect the chocolatey package without installing it
+      - name: install via chocolatey and verify the two files
         shell: pwsh
         run: |
-          Write-Host "--- package info ---"
-          & choco info imagemagick --limit-output 2>&1 | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
-          Write-Host "--- is it the Q16-HDRI MSVC dll build? (check the nuspec/install script) ---"
-          $tmp = "$env:RUNNER_TEMP\impkg"
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-          & choco download imagemagick --internalize --output-directory $tmp --no-progress 2>&1 |
-            Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" }
-          Get-ChildItem $tmp -Recurse -EA SilentlyContinue | Select-Object -First 12 |
-            ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host "--- install (bounded, so a hang is a log line not a job timeout) ---"
+          $job = Start-Job {
+            & choco install imagemagick --version=7.1.2.2500 -y --no-progress 2>&1
+          }
+          if (Wait-Job $job -Timeout 600) {
+            Receive-Job $job | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" }
+            Remove-Job $job
+          } else {
+            Write-Host "  choco did not finish in 600s"
+            Stop-Job $job; Remove-Job $job -Force
+            exit 1
+          }
+          Write-Host "--- where did it land? ---"
+          $cands = @(Get-ChildItem "$env:ProgramFiles","${env:ProgramFiles(x86)}" -Directory -Filter 'ImageMagick*' -EA SilentlyContinue)
+          foreach ($c in $cands) {
+            $h = Test-Path (Join-Path $c.FullName 'include\MagickCore\MagickCore.h')
+            $l = Test-Path (Join-Path $c.FullName 'lib\CORE_RL_MagickCore_.lib')
+            Write-Host ("  {0,-46} header={1} lib={2}" -f $c.FullName, $h, $l)
+          }
+          Write-Host "--- version actually installed ---"
+          & magick --version 2>&1 | Select-Object -First 2 | ForEach-Object { Write-Host "  $_" }
