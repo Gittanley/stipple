@@ -52,47 +52,66 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ImageMagick 7.1.2-31 Q16-HDRI (portable)
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
         shell: pwsh
-        # The PORTABLE 7z, not the .exe installer.  This is not a preference: the
-        # installer form was tried first and hung.  `im-setup` ignored the NSIS /S flag
-        # and sat there for the full 30-minute job timeout, with the runner reporting
-        #   Terminate orphan process: pid (4444) (im-setup)
-        # at cleanup, so the build was never reached and nothing was verified.  A
-        # portable archive has no process to wait on and nothing to mis-quote.
+        # The DLL INSTALLER, run with a bounded wait.  Three other approaches were
+        # tried and measured, all recorded here because the reasons are not obvious:
         #
-        # Pinned to the EXACT version every bit-exactness number in this repository was
-        # measured against, deliberately rather than to "latest".  A Q8 or
-        # non-HDRI build compiles and then fails every comparison, and "latest" would
-        # let a new release turn a green build red with nothing in the repository
-        # having changed.  Bump it deliberately, as its own commit.
+        #   1. the installer with plain Start-Process -Wait   -> HUNG.  /S was ignored
+        #      and it sat for the full 30-minute job timeout; the runner reported
+        #      "Terminate orphan process: pid (4444) (im-setup)".  Never reached a build.
+        #   2. the portable .7z                             -> extracts cleanly in 0.9s
+        #      but is RUNTIME ONLY: 23 loose files, magick.exe and XML, with no
+        #      include/ and no lib/ at all.  It cannot build against.
+        #   3. 7z x on the installer .exe                    -> extracts the NSIS
+        #      bootstrap only; no MagickCore.h, no import library.  The payload is in
+        #      an embedded blob 7z does not unpack.
+        #
+        # So the installer is the only form that carries headers and a .lib, and the
+        # only thing that can go wrong is that it does not exit.  Hence the bounded
+        # wait: kill it after 180s and fail loudly, rather than burning the job.
+        #
+        # Pinned to the EXACT version every bit-exactness number here was measured
+        # against, deliberately rather than to "latest" -- a Q8 build compiles and then
+        # fails every comparison, and "latest" would let a new release turn a green
+        # build red with nothing in the repository having changed.
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-portable-Q16-HDRI-x64.7z"
+          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
           $url = "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset"
           Write-Host "fetching $url"
-          Invoke-WebRequest -Uri $url -OutFile im.7z -UseBasicParsing -TimeoutSec 900
+          Invoke-WebRequest -Uri $url -OutFile im-setup.exe -UseBasicParsing -TimeoutSec 900
           $dest = 'C:\im'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          # 7z is on the windows-2022 image.  `x` extracts, `-o` sets the output dir with
-          # no space after it, which 7z requires.
-          & 7z.exe x im.7z "-o$dest" -y | Write-Host
-          if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
-          # The archive may or may not wrap everything in a single top-level directory,
-          # so the real root is found rather than assumed.  Asserting on the two files
-          # that matter turns a wrong guess into a one-line log instead of a mystery
+
+          Write-Host "starting the installer with a 180s bound"
+          # /D must be LAST and unquoted: quoting it makes a directory whose name
+          # includes the quote character.  That is an NSIS rule, not a shell one.
+          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            Write-Host "installer still running after 180s; killing it"
+            try { $p.Kill() } catch { }
+            throw "the ImageMagick installer did not exit.  If /S is being ignored, the"
+          }
+          Write-Host "installer exited with $($p.ExitCode)"
+
+          # Find the root by CONTENT, not by assuming /D was honoured.  The first
+          # version of this built a candidate list as @(String, DirectoryInfo) and read
+          # .FullName off both, a Join-Path type error on the String; the second
+          # assumed a wrapper directory that a portable archive does not have.  Both
+          # files are asserted by name so a wrong pick is one line of log rather than a
           # link error twenty steps later.
+          $cands = @($dest, "${env:ProgramFiles}\ImageMagick-7.1.2-Q16-HDRI")
           $root = $null
-          foreach ($cand in @($dest, (Get-ChildItem $dest -Directory | Select-Object -First 1))) {
-            if ($cand -and (Test-Path (Join-Path $cand.FullName 'include\MagickCore\MagickCore.h'))) { $root = $cand.FullName; break }
+          foreach ($c in $cands) {
+            if (Test-Path (Join-Path $c 'include\MagickCore\MagickCore.h')) { $root = $c; break }
           }
           if (-not $root) {
-            Write-Host "top level of $dest :"
-            Get-ChildItem $dest | ForEach-Object { Write-Host "  $($_.Name)" }
-            throw "no include\MagickCore\MagickCore.h anywhere under $dest"
+            Write-Host "searching for MagickCore.h under C:\ :"
+            Get-ChildItem C:\ -Directory -EA SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "no include\MagickCore\MagickCore.h under any known location"
           }
           $lib = Join-Path $root 'lib\CORE_RL_MagickCore_.lib'
           if (-not (Test-Path $lib)) {
@@ -103,9 +122,9 @@ jobs:
           Write-Host "ImageMagick root: $root"
           "IM_ROOT=$root" >> $env:GITHUB_ENV
           # build.cmd reads IMAGEMAGICK_ROOT, and this is the only step that knows
-          # where the archive actually landed.  Without it the nocuda job falls back to
-          # build.cmd's hardcoded C:\Program Files\ImageMagick-7.1.2-Q16-HDRI and fails
-          # "ImageMagick not found" on a runner where that path never exists.
+          # where the installer actually landed.  Without it the nocuda job falls back
+          # to build.cmd's hardcoded C:\Program Files path, which does exist on a hosted
+          # runner but is a DIFFERENT and older ImageMagick -- or nothing at all.
           "IMAGEMAGICK_ROOT=$root" >> $env:GITHUB_ENV
 
       - name: Report the toolchain actually used
@@ -175,27 +194,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ImageMagick 7.1.2-31 Q16-HDRI (portable)
+      - name: Install ImageMagick 7.1.2-31 Q16-HDRI
         shell: pwsh
-        # Portable 7z, not the installer -- the .exe hung for the full 30-minute
-        # timeout in the nocuda job and the build was never reached.  See the note on
-        # the same step in the job above.
+        # Installer with a bounded wait; the three rejected alternatives and why are
+        # recorded on the same step in the nocuda job above.
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-portable-Q16-HDRI-x64.7z"
-          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im.7z -UseBasicParsing -TimeoutSec 900
+          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
+          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im-setup.exe -UseBasicParsing -TimeoutSec 900
           $dest = 'C:\im'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          & 7z.exe x im.7z "-o$dest" -y | Write-Host
-          if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
-          $root = $null
-          foreach ($cand in @($dest, (Get-ChildItem $dest -Directory | Select-Object -First 1))) {
-            if ($cand -and (Test-Path (Join-Path $cand.FullName 'include\MagickCore\MagickCore.h'))) { $root = $cand.FullName; break }
+          $p = Start-Process -FilePath .\im-setup.exe -ArgumentList "/S", "/D=$dest" -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            try { $p.Kill() } catch { }
+            throw 'the ImageMagick installer did not exit within 180s'
           }
-          if (-not $root) { throw "no include\MagickCore\MagickCore.h under $dest" }
+          Write-Host "installer exit code: $($p.ExitCode)"
+          $root = $null
+          foreach ($c in @($dest, "${env:ProgramFiles}\ImageMagick-7.1.2-Q16-HDRI")) {
+            if (Test-Path (Join-Path $c 'include\MagickCore\MagickCore.h')) { $root = $c; break }
+          }
+          if (-not $root) { throw "no include\MagickCore\MagickCore.h under any known location" }
           if (-not (Test-Path (Join-Path $root 'lib\CORE_RL_MagickCore_.lib'))) { throw "no MSVC import library under $root" }
           Write-Host "ImageMagick root: $root"
           "IM_ROOT=$root" >> $env:GITHUB_ENV
