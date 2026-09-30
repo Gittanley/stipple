@@ -5,18 +5,15 @@ jobs:
   probe:
     runs-on: windows-2022
     steps:
-      - name: what is already here
+      - name: inspect the chocolatey package without installing it
         shell: pwsh
         run: |
-          $im = "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI"
-          Write-Host "--- the two files the build needs ---"
-          Write-Host ("  header  : {0}" -f (Test-Path "$im\include\MagickCore\MagickCore.h"))
-          Write-Host ("  lib     : {0}" -f (Test-Path "$im\lib\CORE_RL_MagickCore_.lib"))
-          Get-ChildItem "$im\lib" -EA SilentlyContinue | Select-Object -First 8 | ForEach-Object { Write-Host "    $($_.Name)" }
-          Write-Host "--- is a build possible at all? ---"
-          & cmake --version | Select-Object -First 1
-          Write-Host ("  nvcc: {0}" -f $(if (Get-Command nvcc -EA SilentlyContinue) { 'present' } else { 'ABSENT' }))
-          Write-Host "--- does Riemersma output match -31? (the only question that matters) ---"
-          & magick -size 64x64 gradient:black-white "$env:TEMP\probe_src.png"
-          & magick "$env:TEMP\probe_src.png" -dither Riemersma -colors 16 "$env:TEMP\probe_ref.png"
-          Write-Host ("  reference written: {0}" -f (Test-Path "$env:TEMP\probe_ref.png"))
+          Write-Host "--- package info ---"
+          & choco info imagemagick --limit-output 2>&1 | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
+          Write-Host "--- is it the Q16-HDRI MSVC dll build? (check the nuspec/install script) ---"
+          $tmp = "$env:RUNNER_TEMP\impkg"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          & choco download imagemagick --internalize --output-directory $tmp --no-progress 2>&1 |
+            Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" }
+          Get-ChildItem $tmp -Recurse -EA SilentlyContinue | Select-Object -First 12 |
+            ForEach-Object { Write-Host "  $($_.Name)" }
