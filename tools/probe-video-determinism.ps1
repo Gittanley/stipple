@@ -78,8 +78,15 @@ if (-not $Magick) {
 }
 if (-not $Magick) { "cannot run: magick not on PATH"; exit 2 }
 
-$tmp = Join-Path $env:TEMP 'rdvid_det'
-if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -EA SilentlyContinue }
+# A UNIQUE directory, per process.  The fixed name this used to have is a bug: two
+# instances of this probe -- which happens the moment anything runs the suite twice, or
+# a suite overlaps with a manual run -- share one directory, and then one deletes
+# frames.raw while the other is hashing it.  The symptom is not a test failure, it is a
+# crash: "The process cannot access the file because it is being used by another
+# process", followed by a null index and a cascade of nonsense.  Observed exactly that,
+# and it was misread at first as CUDA and OpenCL becoming non-deterministic, which is
+# the sort of conclusion a flaky instrument invites.
+$tmp = Join-Path $env:TEMP ('rdvid_det_' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 # Decode to raw RGBA.  Through cmd /c, not the PowerShell pipeline: a native command's
@@ -90,8 +97,17 @@ function Get-DecodedHash([string]$mkv) {
   Remove-Item -EA SilentlyContinue $raw
   cmd /c "magick ""$mkv"" -depth 8 ""rgba:$raw""" 2>$null | Out-Null
   if (-not (Test-Path $raw)) { return $null }
-  $h = (Get-FileHash $raw -Algorithm SHA256).Hash
-  $n = (Get-Item $raw).Length
+  # Guarded, and the guard matters more than it looks: a hash that throws here takes
+  # the whole probe down, and a probe that dies mid-sweep reports whatever it had
+  # printed so far -- which reads as "CUDA failed, OpenCL passed" rather than "this
+  # run is void".  A return of null is counted as a bad run, which is a statement about
+  # the data instead of about the instrument.
+  try {
+    $h = (Get-FileHash $raw -Algorithm SHA256 -ErrorAction Stop).Hash
+    $n = (Get-Item $raw).Length
+  } catch {
+    return $null
+  }
   Remove-Item -EA SilentlyContinue $raw
   return @{ hash = $h; bytes = $n }
 }

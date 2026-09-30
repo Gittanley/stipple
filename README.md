@@ -375,6 +375,7 @@ engines here and false of others, and the difference is not a detail.
 | `--engine approx` | iterative solver | **not exact**, by design | not covered |
 | `--video` (any engine) | block-parallel, always | **not exact** | frame accounting, cross-engine |
 | `--dither bayer\|atkinson\|jarvis\|floyd-steinberg\|clustered-dot` | their own kernels | **not exact**, and not trying to be | determinism only |
+| `--dither bayer-ordered\|void-and-cluster` | ordered thresholds, no diffusion | **not exact**, and not trying to be | determinism only |
 
 **So: images on `cpu` or `cuda` are bit-exact. GPU *block* engines and all of video
 are not.** One design decision causes that, and it is not a bug:
@@ -511,7 +512,35 @@ rdither --dither bayer --colors 16 in.png out.png
 
 `examples/bayer_dither.cc` is a complete, working second algorithm in about 40 lines,
 built into the default binary. It exists to prove the seam works rather than to be useful
-— ordered dithering has visible 8×8 texture where Riemersma has none.
+— ordered dithering has visible 8×8 texture where Riemersma has none, and its threshold
+is applied as a brightness offset that is a no-op at this bit depth. For a dither you
+would actually choose:
+
+| `--dither` | what it is |
+|---|---|
+| `bayer-ordered` | 8×8 Bayer, no error diffusion. Crisp; the 8×8 period is visible by design. |
+| `void-and-cluster` | blue-noise thresholds, 64×64 matrix. Intended for smooth gradients, where Riemersma's worms are objectionable. |
+| `void-and-cluster-fast` | the same algorithm at 32×32, for when the matrix build is too slow. |
+
+"Blue noise" and "void-and-cluster" are the same algorithm — Ulichney's — so there is no
+separate `blue-noise` name; the two entries are two tile sizes of one method.
+
+`--diffusion` scales the threshold toward 0.5, and `--diffusion 0` reduces any of them to
+plain nearest-colour — the same meaning it has for the diffusion kernels.
+
+**None of this is bit-exact with anything, and none of it is trying to be.** They are
+dither *choices*. See [Where bit-exactness holds](#where-bit-exactness-holds).
+
+**Verified:** each emits exactly the palette's colours with no off-palette rounding, and
+each is deterministic across repeated runs (`probe-determinism.ps1` sweeps 8 algorithms
+over 4 runs each).
+
+**Not verified:** that the void-and-cluster spectrum is actually blue. A fixture that
+exposes the raw threshold matrix is still missing — with a 2-colour palette the two
+distances are equal exactly at the midpoint, so the pattern cannot appear at all — and
+the 64×64 and 32×32 outputs differ by only ~32 pixels in half a million, which is less
+than a tile-size change should produce and is not yet explained. The filters are sound
+and distinct; the quality claim is not yet earned.
 
 Writing your own is three steps: copy that file, write the kernel, add it to
 `RD_SOURCES` in `CMakeLists.txt`. [include/rd_plugin.h](include/rd_plugin.h) has the

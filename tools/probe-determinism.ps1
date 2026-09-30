@@ -146,6 +146,48 @@ foreach ($img in $imgs) {
   }
 }
 
+# The non-Riemersma algorithms, which the sweep above never touches: it varies the
+# ENGINE, and every one of these is CPU code reached by the same engine.  They differ
+# from each other in a way an engine sweep cannot see, so without this a broken
+# algorithm would be indistinguishable from a correct one.
+#
+# Fewer runs, because a defect in a closed-form threshold matrix is a type error rather
+# than a race -- it either truncates or it does not, on every run.  One such bug was
+# `unsigned char` holding ranks up to 4096, which made two supposedly different void-
+# and-cluster tile sizes byte-identical; 4 runs is ample for that, and the matrix build
+# is the slowest thing in the suite.
+''
+$algos = @('floyd-steinberg', 'atkinson', 'jarvis', 'clustered-dot',
+           'bayer', 'bayer-ordered', 'void-and-cluster', 'void-and-cluster-fast')
+$algoRuns = [Math]::Min($Runs, 4)
+"Determinism: $algoRuns runs per algorithm, non-Riemersma"
+''
+foreach ($algo in $algos) {
+  $total++
+  $hashes2 = @{}
+  $bad2 = 0
+  $src2 = "$Dir\c_plasma.png"
+  for ($i = 1; $i -le $algoRuns; $i++) {
+    $o = "$Dir\algo_${algo}_$i.png"
+    Remove-Item -EA SilentlyContinue $o
+    & $rd --dither $algo --colors 4 $src2 $o 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $o)) { $bad2++; continue }
+    $h2 = Get-PixelHash $o
+    if ($null -eq $h2) { $bad2++; continue }
+    $hashes2[$h2] = 1
+    Remove-Item -EA SilentlyContinue $o
+  }
+  if ($bad2 -gt 0) {
+    $fail++
+    "  {0,-22} FAIL  $bad2 of $algoRuns runs produced no output" -f $algo
+  } elseif ($hashes2.Count -ne 1) {
+    $fail++
+    "  {0,-22} FAIL  $($hashes2.Count) distinct pixel sets over $algoRuns runs" -f $algo
+  } else {
+    "  {0,-22} ok    1 pixel set, $algoRuns runs" -f $algo
+  }
+}
+
 ''
 if ($fail -eq 0) {
   "{0} of {1} cases deterministic." -f ($total - $fail), $total

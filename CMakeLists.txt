@@ -134,6 +134,7 @@ set(RD_SOURCES
   src/rd_checkpoint.cpp
   src/rd_plugin.cpp
   src/rd_dithers.cc
+  src/rd_dithers_ordered.cc
   src/rd_cli.cpp)
 
 # The example dither.  Registered like any other algorithm, and it is here in the
