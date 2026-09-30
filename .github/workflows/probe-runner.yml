@@ -1,0 +1,30 @@
+name: probe-runner
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - name: what is already here
+        shell: pwsh
+        run: |
+          Write-Host "--- magick on PATH ---"
+          $m = Get-Command magick -EA SilentlyContinue
+          if ($m) { Write-Host "  $($m.Source)"; & magick --version }
+          else { Write-Host "  none" }
+          Write-Host "--- candidate install dirs ---"
+          Get-ChildItem "$env:ProgramFiles","${env:ProgramFiles(x86)}" -Directory -Filter 'ImageMagick*' -EA SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "--- choco / winget ---"
+          foreach ($t in @('choco','winget','7z')) {
+            $c = Get-Command $t -EA SilentlyContinue
+            Write-Host ("  {0,-8} {1}" -f $t, $(if ($c) { $c.Source } else { 'absent' }))
+          }
+          Write-Host "--- choco package availability (no install) ---"
+          & choco search imagemagick --exact --limit-output 2>&1 | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+          Write-Host "--- nvcc already present? ---"
+          Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -EA SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "--- VS / MSVC ---"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>&1 |
+            ForEach-Object { Write-Host "  VS $_" }
