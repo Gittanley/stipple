@@ -1572,6 +1572,27 @@ bool OpenCLAvailable(std::string* device_name, std::string* detail) {
   return false;
 }
 
+// MISSING HERE UNTIL 2026-09-30, and not a cosmetic gap.
+//
+// rd_video.cpp calls rd::OpenCLStateCount() unconditionally, and this function lived
+// only inside the #if defined(RD_WITH_OPENCL) half of this file.  So every build
+// without the OpenCL SDK failed at LINK time with
+//
+//   LNK2019: unresolved external symbol "int __cdecl rd::OpenCLStateCount(void)"
+//
+// The SDK directory is gitignored, so it is absent from any fresh clone, and CMake
+// advertises the no-SDK build as "complete and usable".  The build only ever worked
+// in a working tree that happened to have the SDK unpacked beside it, which is why an
+// incremental build here stayed green for the entire life of the OpenCL engine.  It
+// was found by cloning the repository clean and building it, which is the only test
+// that distinguishes "my tree compiles" from "this compiles".
+//
+// The value is a property of the engine's design rather than of how this file was
+// compiled: the real build keeps two (kSlots), and so does the CUDA engine
+// (kGpuStateSlots).  Returning the same number keeps the header's promise that a slot
+// past the end is clamped rather than rejected, true in both builds.
+int OpenCLStateCount() { return 2; }
+
 const std::string& OpenCLBuildLog() {
   static const std::string empty;
   return empty;
