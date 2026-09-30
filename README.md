@@ -4,6 +4,29 @@ GPU-accelerated reimplementation of ImageMagick's Riemersma error-diffusion dith
 for images and video. Bit-exact with ImageMagick where that is possible, and
 deliberately approximate where it is not — [see exactly which is which](#where-bit-exactness-holds).
 
+## The guarantee
+
+If you point it at an image with the sequential walk and ask for 16 colours, you get
+back the same 16 colours ImageMagick would have produced, the same pixels, byte for
+byte — not "similar", not "close enough to pass". That is the design goal, and it is
+checked on every build.
+
+```
+rdither --colors 16 photo.png out.png
+```
+
+**That guarantee is narrower than it sounds, and the rest of this file is where it
+gets precise.** The fast GPU engines and the video pipeline are *not* bit-exact with
+ImageMagick, by construction. See [Where bit-exactness holds](#where-bit-exactness-holds)
+before you judge any output.
+
+Decode, dither and encode all run at once, at about 51 fps on a 2014-era 6-core Xeon
+with a GTX 1650 SUPER. So 5 minutes of **60 fps** footage took 5 minutes 53 seconds —
+about 1.17x its own duration, while 30 fps footage would come out faster than real
+time. What that number does *not* measure is the GPU —
+[two thirds of it is decode and encode](#what-the-fps-number-means-in-practice), so a
+faster CPU, RAM or disk makes it faster with the same GPU.
+
 > ### Made by an AI — "Space Bunny"
 >
 > This repository was written by an AI assistant operating under the name **Space
@@ -61,27 +84,6 @@ source:
 
 The patent grant in GPL-3.0 is why I chose it over GPL-2.0: you cannot be sued for
 using this.
-
-If you point it at an image with the sequential walk and ask for 16 colours, you get
-back the same 16 colours ImageMagick would have produced, the same pixels, byte for
-byte — not "similar", not "close enough to pass". That is the design goal, and it is
-checked on every build.
-
-```
-rdither --colors 16 photo.png out.png
-```
-
-**That guarantee is narrower than it sounds, and the rest of this file is where it
-gets precise.** The fast GPU engines and the video pipeline are *not* bit-exact with
-ImageMagick, by construction. See [Where bit-exactness holds](#where-bit-exactness-holds)
-before you judge any output.
-
-Decode, dither and encode all run at once, at about 51 fps on a 2014-era 6-core Xeon
-with a GTX 1650 SUPER. So 5 minutes of **60 fps** footage took 5 minutes 53 seconds —
-about 1.17x its own duration, while 30 fps footage would come out faster than real
-time. What that number does *not* measure is the GPU —
-[two thirds of it is decode and encode](#what-the-fps-number-means-in-practice), so a
-faster CPU, RAM or disk makes it faster with the same GPU.
 
 ---
 
@@ -280,7 +282,7 @@ is very likely the single biggest thing making it slow. A machine with the ident
 GPU but a modern CPU, NVMe storage and more memory bandwidth will render this
 materially faster. The converse also holds: if you are already faster than real time,
 a better GPU will not meaningfully change your edit session. Look at which stage is
-largest for your content before buying anything.
+largest for your content before spending money on a GPU.
 
 **On a segment you can work before the whole thing lands:** `--segment-frames N` writes
 separate muxed segment files as it goes, so for a long job the early ones are already
