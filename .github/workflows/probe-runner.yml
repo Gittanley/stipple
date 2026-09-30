@@ -8,23 +8,15 @@ jobs:
       - name: what is already here
         shell: pwsh
         run: |
-          Write-Host "--- magick on PATH ---"
-          $m = Get-Command magick -EA SilentlyContinue
-          if ($m) { Write-Host "  $($m.Source)"; & magick --version }
-          else { Write-Host "  none" }
-          Write-Host "--- candidate install dirs ---"
-          Get-ChildItem "$env:ProgramFiles","${env:ProgramFiles(x86)}" -Directory -Filter 'ImageMagick*' -EA SilentlyContinue |
-            ForEach-Object { Write-Host "  $($_.FullName)" }
-          Write-Host "--- choco / winget ---"
-          foreach ($t in @('choco','winget','7z')) {
-            $c = Get-Command $t -EA SilentlyContinue
-            Write-Host ("  {0,-8} {1}" -f $t, $(if ($c) { $c.Source } else { 'absent' }))
-          }
-          Write-Host "--- choco package availability (no install) ---"
-          & choco search imagemagick --exact --limit-output 2>&1 | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
-          Write-Host "--- nvcc already present? ---"
-          Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -EA SilentlyContinue |
-            ForEach-Object { Write-Host "  $($_.FullName)" }
-          Write-Host "--- VS / MSVC ---"
-          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>&1 |
-            ForEach-Object { Write-Host "  VS $_" }
+          $im = "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI"
+          Write-Host "--- the two files the build needs ---"
+          Write-Host ("  header  : {0}" -f (Test-Path "$im\include\MagickCore\MagickCore.h"))
+          Write-Host ("  lib     : {0}" -f (Test-Path "$im\lib\CORE_RL_MagickCore_.lib"))
+          Get-ChildItem "$im\lib" -EA SilentlyContinue | Select-Object -First 8 | ForEach-Object { Write-Host "    $($_.Name)" }
+          Write-Host "--- is a build possible at all? ---"
+          & cmake --version | Select-Object -First 1
+          Write-Host ("  nvcc: {0}" -f $(if (Get-Command nvcc -EA SilentlyContinue) { 'present' } else { 'ABSENT' }))
+          Write-Host "--- does Riemersma output match -31? (the only question that matters) ---"
+          & magick -size 64x64 gradient:black-white "$env:TEMP\probe_src.png"
+          & magick "$env:TEMP\probe_src.png" -dither Riemersma -colors 16 "$env:TEMP\probe_ref.png"
+          Write-Host ("  reference written: {0}" -f (Test-Path "$env:TEMP\probe_ref.png"))
