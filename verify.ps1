@@ -48,9 +48,34 @@ if (-not (Test-Path "$ImageDir\in_alpha.png")) {
 if (-not (Test-Path "$ImageDir\noisy.png")) {
   & $Magick -size 512x384 plasma:fractal -attenuate 0.4 +noise Gaussian -colorspace sRGB "$ImageDir\noisy.png"
 }
+# A JPEG fixture, and the reason it exists.
+#
+# Every other fixture here is a PNG, which is exactly why a real defect survived
+# for so long.  ImStore() cloned the INPUT image and inherited its coder, so dither
+# a JPEG to a path called .png and the file on disk was JPEG bytes (FF D8 FF) --
+# lossy re-compression of pixels that were already an exact 16-colour palette.  The
+# file came back with 93,377 distinct colours where ImageMagick's own Riemersma
+# output has 16.  A PNG input cannot reach it, because a PNG clone already names
+# the PNG coder, so no PNG-only fixture could ever have caught it.
+#
+# --verify missed it too: it compared the in-memory store rather than the file that
+# was written, and reported AE=0 on that broken file.  Both are fixed; this fixture
+# is what keeps the JPEG path covered.
+$jpg = "$ImageDir\in_jpeg.jpg"
+if (-not (Test-Path $jpg)) {
+  # Hard edges on a flat field, because ringing around an edge is what produces
+  # source colours outside the palette and makes the failure visible.
+  & $Magick -size 256x192 "xc:#204080" -fill "#e8c040" -draw "rectangle 40,40 120,120" `
+            -fill "#f0f0f0" -draw "circle 190,140 190,60" -quality 92 $jpg
+}
 
 $images = @("t_1x1", "t_3x5", "t_17x13", "t_wide", "in_grad", "in_plasma",
-            "in_shapes", "in_alpha", "noisy")
+            "in_shapes", "in_alpha", "noisy", "in_jpeg")
+
+# Source extension per fixture.  Everything is PNG except in_jpeg, which is a JPEG
+# on purpose -- see the comment where it is generated.  A non-PNG input is the only
+# thing that reaches the coder-inheritance defect.
+$ext = @{ "in_jpeg" = "jpg" }
 
 $engines = @(
   @{ name = "cpu";        args = @("--engine", "cpu") },
@@ -71,7 +96,8 @@ $activeEngines = @($engines | Where-Object { $skipEngines -notcontains $_.name }
 
 $pass = 0; $fail = 0; $skipped = 0
 foreach ($img in $images) {
-  $src = Join-Path $ImageDir "$img.png"
+  $e = if ($ext.ContainsKey($img)) { $ext[$img] } else { "png" }
+  $src = Join-Path $ImageDir "$img.$e"
   foreach ($c in $Colors) {
     $ref = Join-Path $ImageDir "$($img)_$($c)_ref.png"
     & $Magick $src -dither Riemersma -colors $c $ref | Out-Null

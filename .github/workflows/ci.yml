@@ -144,10 +144,18 @@ jobs:
         # means "I looked away".  So the count of real passes is asserted here, and it
         # is asserted to be the number the no-CUDA configuration can actually produce.
         #
-        # 90, not 135: 9 images x 5 colour counts x 3 engines is 135, and the cuda
-        # engine's 45 are skipped on a runner with no GPU.  If someone later fixes the
-        # engine reporting, this number goes UP and the assertion has to be updated --
-        # which is the intended direction to be forced into noticing.
+        # 100, not 150: 10 images x 5 colour counts x 3 engines is 150, and the cuda
+        # engine's 50 are skipped on a runner with no GPU.  Verified locally on this
+        # configuration: "100 passed, 0 failed, 50 SKIPPED", exit 0.
+        #
+        # The tenth image is the JPEG fixture.  It was added because every previous
+        # fixture was a PNG, and a PNG cannot reach the coder-inheritance defect where
+        # a .png destination received JPEG bytes.  Ten images where nine would do is
+        # the cost of that being covered automatically from now on.
+        #
+        # If someone later fixes the engine reporting, this number goes UP and the
+        # assertion has to be updated -- which is the intended direction to be forced
+        # into noticing.
         run: |
           $log = 'verify.log'
           & pwsh -NoProfile -File .\verify.ps1 *>&1 | Tee-Object -FilePath $log
@@ -160,8 +168,8 @@ jobs:
           $failed = [int]$m.Groups[2].Value
           Write-Host "tally: $passed passed, $failed failed"
           if ($failed -ne 0) { exit 1 }
-          if ($passed -lt 80) {
-            Write-Host "only $passed cases ran -- that is far below the 90 this configuration can do."
+          if ($passed -lt 90) {
+            Write-Host "only $passed cases ran -- that is far below the 100 this configuration can do."
             Write-Host "A suite that skips nearly everything and exits 0 is worse than a failing one."
             exit 1
           }

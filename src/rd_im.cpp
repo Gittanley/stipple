@@ -388,9 +388,29 @@ bool ImStore(const LoadedImage& loaded, const PixelStore& store,
     // Setting info->magick makes WriteImage pick the coder explicitly, so the
     // output does not depend on the destination file extension.
     (void)CopyMagickString(info->magick, format.c_str(), MagickPathExtent);
-  } else if (out->magick[0] != '\0') {
-    // Otherwise inherit the coder from the image we cloned.
-    (void)CopyMagickString(info->magick, out->magick, MagickPathExtent);
+  }
+  // Otherwise the CODER comes from the OUTPUT PATH.
+  //
+  // Not from the image we cloned.  `out` is a CloneImage of the input, so it
+  // carries the input's coder: dither a JPEG and out->magick still says JPEG.
+  // WriteImage then encodes JPEG even though the destination is called .png, and
+  // the file on disk starts with FF D8 FF rather than 89 50 4E 47.
+  //
+  // That is lossy re-compression of pixels that were already exactly a 16-colour
+  // palette, and it is why `--colors 16` produced a file with 93,377 distinct
+  // colours where ImageMagick's own Riemersma output has 16.  It also looks bad,
+  // which is how it was noticed.
+  //
+  // It went unnoticed for two reasons, both now closed: every committed fixture is
+  // a PNG, whose clone already names the PNG coder, and --verify compared only the
+  // in-memory store rather than the file this writes.
+  //
+  // So blank out both the image's and the info's coder and let WriteImage infer
+  // from the extension.  `format`, when given, still wins: that is a caller
+  // deliberately overriding the extension.
+  if (format.empty()) {
+    out->magick[0] = '\0';
+    info->magick[0] = '\0';
   }
   // WriteImage() clones image_info and then OVERWRITES the clone's filename
   // with image->filename (see constitute.c), so image_info->filename is only

@@ -1450,6 +1450,65 @@ int main(int argc, char** argv) {
           diff.rmse, diff.differing_pixels == 0 ? "BIT-EXACT" : "MISMATCH");
       if (diff.differing_pixels != 0) status = 3;
     }
+
+    // The comparison above proves the STORE matches ImageMagick.  It says nothing
+    // about the file on disk, and that gap hid a real defect for a long time: the
+    // writer inherited the input's coder, so dithering a JPEG to a path called
+    // .png wrote JPEG bytes (FF D8 FF) and the 16-colour store came back as 93,377
+    // colours after lossy re-compression -- with --verify still reporting AE=0.
+    //
+    // So read the written file back and compare THAT against ImageMagick.  A store
+    // that is right and a file that is wrong is precisely the case this catches,
+    // and it is the claim --verify actually makes to the user.
+    if (status == 0) {
+      rd::LoadedImage written;
+      rd::PixelStore* roundtrip = nullptr;
+      std::string rt_error;
+      if (rd::ImLoad(opt.output, &written, &rt_error)) {
+        roundtrip = rd::PixelStore::Create(written.width, written.height,
+                                           max_ram_bytes, &rt_error);
+        if (roundtrip != nullptr && !rd::ImExtract(written, roundtrip, &rt_error)) {
+          delete roundtrip;
+          roundtrip = nullptr;
+        }
+      } else {
+        std::printf("verify     : could not re-read the written file '%s': %s\n",
+                    opt.output.c_str(), rt_error.c_str());
+        status = 1;
+      }
+      if (roundtrip != nullptr) {
+        const rd::DiffResult fd = rd::CompareStores(
+            *roundtrip, *reference, written.has_alpha);
+        // Compared at 8-bit precision, which is what any PNG or JPEG codec
+        // actually guarantees, rather than exactly as the store comparison does.
+        //
+        // Exact comparison here reports a mismatch on a correct file: writing Q16
+        // and reading it back can differ by 1 in 65535 from the codec's rounding,
+        // and that is not a defect. Measured on the 64x64 smoke image: max channel
+        // delta 1, RMSE 0.00000547, 1016 of 4096 pixels. Treating that as failure
+        // would fail every run and train people to ignore the check.
+        //
+        // One 8-bit step in Q16 code values is 257, so a delta under that is
+        // invisible in any real output and cannot be an encoder picking the wrong
+        // coder -- that mistake shows up as thousands of differing pixels, which is
+        // exactly what the JPEG-as-PNG bug produced.
+        constexpr int kOne8BitStep = 257;
+        const bool file_ok = fd.max_channel_delta < kOne8BitStep;
+        std::printf(
+            "verify file: AE=%zu/%zu pixels, max channel delta=%d, RMSE=%.8f -> %s\n",
+            fd.differing_pixels, fd.total_pixels, fd.max_channel_delta, fd.rmse,
+            file_ok ? "BIT-EXACT (8-bit)" : "MISMATCH");
+        if (!file_ok) {
+          std::printf(
+              "verify     : the store was correct but the written file is not.\n"
+              "              That is an encoder problem, not a dither problem --\n"
+              "              check that the output path's extension matches the coder.\n");
+          status = 3;
+        }
+        rd::ImFree(&written);
+        delete roundtrip;
+      }
+    }
     delete reference;
   }
 

@@ -188,38 +188,51 @@ reference comes back undefined. This is a toolchain constraint, not a preference
 
 ### What the output looks like
 
-Five public-domain images, each dithered to **16 colours** and verified bit-exact
-against ImageMagick (`--verify`, AE = 0 on every one). Click any thumbnail for the
-full-size result.
+Five public-domain images. Every panel is 16 colours and every one is verified
+bit-exact against ImageMagick. Click any strip for the full-resolution version.
 
-[![Starry Night, dithered to 16 colours](docs/examples/starry.thumb.png)](docs/examples/starry.png)
-[![Blue Marble, dithered to 16 colours](docs/examples/bluemarble.thumb.png)](docs/examples/bluemarble.png)
-[![Earthrise, dithered to 16 colours](docs/examples/earthrise.thumb.png)](docs/examples/earthrise.png)
-[![Martian sunset, dithered to 16 colours](docs/examples/mars.thumb.png)](docs/examples/mars.png)
-[![Self-portrait, dithered to 16 colours](docs/examples/portrait.thumb.png)](docs/examples/portrait.png)
+[![Starry Night: original, image path with and without --im-palette, video path with and without --im-palette](docs/examples/starry-strip.png)](docs/examples/starry-strip.png)
 
-The thumbnails are dithered independently at 480 px, not downscaled from the large
-images — so each one is a real result at that size, not a shrunken approximation.
+[![Blue Marble: the same five variants](docs/examples/bluemarble-strip.png)](docs/examples/bluemarble-strip.png)
 
-**And the same thing as video.** One frame from a clip run through the video path,
-which is a different code path and gives a visibly different result:
+[![Earthrise: the same five variants](docs/examples/earthrise-strip.png)](docs/examples/earthrise-strip.png)
 
-[![A frame from a dithered video clip](docs/examples/video-frame.png)](docs/examples/video-frame.png)
+[![Martian sunset: the same five variants](docs/examples/mars-strip.png)](docs/examples/mars-strip.png)
 
-That frame holds **exactly 16 colours**, because `--video-lossless` (ffv1) preserves
-the palette exactly. The same picture through the image path has ~93,000 unique
-colours, because an image is written as 8-bit RGB and the dither's local variation
-is kept rather than flattened. It is worth noticing how *different* those two look:
-the video frame reads as flat 16-colour dither, the image reads softer. The video
-path also picks **one palette for the whole clip** by sampling frames, so its
-output is consistent frame to frame in a way a still image cannot be.
+[![Self-portrait: the same five variants](docs/examples/portrait-strip.png)](docs/examples/portrait-strip.png)
+
+**Reading the five panels, left to right.**
+
+| panel | what it is |
+|---|---|
+| **original** | the source image, untouched |
+| **image `--im-palette`** | image path, palette built by ImageMagick's own sampling |
+| **image** | image path, palette built by rdither's octree |
+| **video** | one frame of a dithered clip, via `--video-lossless` |
+| **video `--im-palette`** | the same clip, palette from ImageMagick's sampling |
+
+Two things in that table are measured facts rather than intentions.
+
+**Panels 2 and 3 are identical** — AE = 0, same colour count, same bytes. On the image
+path `--im-palette` changes nothing, because there is only one frame to sample and
+rdither's octree already reproduces ImageMagick's choice. It is not ignored:
+`colormap: tree matches ImageMagick exactly` is printed on every run. The flag only has an
+effect on video, where there are many frames to choose a palette from — panels 4 and 5
+differ by a measured AE of 1.12.
+
+**The video panels hold exactly 16 colours; the image panels do not.** A frame written
+through ffv1 keeps the palette precisely, so a 16-colour request really is 16 colours. An
+image is written as 8-bit RGB, which retains the dither's local variation and gives
+~93,000 distinct pixel values. Neither is wrong; they answer different questions — how
+many colours the dither chose, versus what is stored in this file.
 
 You will notice the pattern where it is *supposed* to appear: **Starry Night's sky**
 and the **Blue Marble's ocean** are broad smooth ramps, which is exactly where
 Riemersma's error diffusion shows its structure. Flat regions stay flat. That is the
-whole reason a dither exists — to make a 16-colour image look like a gradient
-instead of like 16 bands.
+whole reason a dither exists — to make a 16-colour image look like a gradient instead of
+like 16 bands.
 
+Sources and licences in [docs/examples/SOURCES.md](docs/examples/SOURCES.md).
 Sources and licences for all five images are in
 [docs/examples/SOURCES.md](docs/examples/SOURCES.md).
 ### Images
@@ -799,6 +812,45 @@ to be bolted on afterwards as a separate, differently-shaped check. It now also 
 the frame count from the file rather than from rdither's own report, because a pipeline
 that consistently drops frames reports a consistent number, and a self-consistent report
 is not evidence.
+
+### The same blind spot, twice more
+
+Two more faults were found by the same reasoning, recorded because the pattern recurs
+rather than because the bugs were interesting.
+
+**The writer wrote the wrong format.** `ImStore()` cloned the input image and inherited
+its coder, so dithering a JPEG to a path called `out.png` produced **JPEG bytes** — the
+file began `FF D8 FF` rather than `89 50 4E 47`. That is lossy re-compression of pixels
+which were already an exact 16-colour palette, so `--colors 16` gave a file with
+**93,377 distinct colours** where ImageMagick's own Riemersma output has 16. It is also
+why the example images above used to look poor: they were JPEG, compressed twice.
+
+Two things hid it. Every committed fixture was a **PNG**, and a PNG's clone already names
+the PNG coder, so no PNG input could reach the bug. And `--verify` compared the in-memory
+store rather than the file that was written, so it reported `AE=0` on the broken file.
+Both are closed: there is now a JPEG fixture in the suite, and `--verify` re-reads what it
+wrote and prints a second line:
+
+```
+verify     : AE=0/1297920 pixels, max channel delta=0, RMSE=0.00000000 -> BIT-EXACT
+verify file: AE=1016/4096 pixels, max channel delta=1, RMSE=0.00000547 -> BIT-EXACT (8-bit)
+```
+
+The second line is compared at 8-bit precision rather than exactly, because a Q16 codec
+round-trip can differ by 1 in 65535 from its own rounding. Requiring exactness there
+would fail every correct run and teach people to ignore the check; a genuine coder
+mix-up shows up as thousands of differing pixels, which is what this one did.
+
+**`--engine blocks` crashes the video path.** `--video --engine blocks` exits with an
+access violation (0xC0000005) on the committed `tests\clip1920.mp4`, after writing a
+583-byte file that `ffprobe` rejects as malformed. Reproduced identically on the
+committed `c3241ac` sources, so it predates the fixes above, and it is specific to
+`--no-cuda` builds: a CUDA-enabled build dithers the same clip to 2,824,846 bytes and
+exits 0. **Unfixed** — recorded rather than papered over.
+
+The suite does not catch it, for the structural reason above: `tests\clip1920.mp4` is
+**not tracked** (it is a large local file), so the video check reports SKIPPED wherever
+a clean clone is used, which is everywhere automated.
 
 ---
 
