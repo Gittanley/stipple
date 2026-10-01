@@ -1,0 +1,22 @@
+# Windows batch files must have CRLF endings.  cmd.exe parses a bare-LF .cmd
+# unreliably -- a block can abort early with no error -- and that produced a
+# build.cmd that passed review and failed on the runner.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Powershell and YAML are fine either way, but pinning them stops git from
+# rewriting line endings underneath a diff.
+*.ps1 text eol=crlf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# Binary assets: never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.mkv binary
+*.lib binary
+*.dll binary
+*.exe binary

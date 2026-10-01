@@ -133,18 +133,55 @@ shift
 goto :parse
 :parsed
 
+REM CUDA_PATH first, then the conventional install location.
+REM
+REM The comments have to live OUTSIDE the parenthesised block below.  A REM inside one
+REM is not a comment to cmd: it is parsed as a command, which aborted the block early
+REM and made the whole check silently do nothing.  That is a nasty failure because the
+REM script carries on and reports the toolkit as missing with no indication that the
+REM test itself never ran.
+REM
+REM CUDA_PATH is what NVIDIA documents, what cmake's FindCUDAToolkit reads, and what CI
+REM sets after unpacking the redist component archives into a scratch directory.  It was
+REM not consulted at all before, so the CUDA CI job could not have worked even with the
+REM archives merged correctly: the glob finds nothing on a hosted runner, and the
+REM script reported "The CUDA Toolkit was not found" while a perfectly good toolkit sat
+REM in %RUNNER_TEMP%\cuda.
+REM
+REM The install-location glob stays as the fallback because that is where a normal
+REM machine keeps it, and an explicit CUDA_PATH should win when both exist.
 set "CUDA_PATH_FOUND="
 if /i not "%WITH_CUDA%"=="OFF" (
-  for /d %%d in ("%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*") do (
-    if exist "%%d\bin\nvcc.exe" set "CUDA_PATH_FOUND=%%~d"
+  if defined CUDA_PATH (
+    if exist "%CUDA_PATH%\bin\nvcc.exe" set "CUDA_PATH_FOUND=%CUDA_PATH%"
+  )
+  REM !CUDA_PATH_FOUND! and not %CUDA_PATH_FOUND%.
+  REM
+  REM cmd expands %VAR% for a WHOLE parenthesised block when it reaches the opening
+  REM bracket, before any line inside it has run.  So the test below saw the variable
+  REM as empty even though the line above had just set it, the glob always ran, and
+  REM the install-directory copy always won.  An explicit CUDA_PATH was silently
+  REM ignored.  Delayed expansion (!) re-reads the value at execution time, and this
+  REM script already enables it on line 23.
+  REM
+  REM Verified with a standalone repro: with %FOUND% the "saw EMPTY" branch printed;
+  REM with !FOUND! it printed "saw SET".
+  if "!CUDA_PATH_FOUND!"=="" (
+    for /d %%d in ("%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*") do (
+      if exist "%%d\bin\nvcc.exe" set "CUDA_PATH_FOUND=%%~d"
+    )
   )
 )
 if /i "%WITH_CUDA%"=="ON" (
-  if "%CUDA_PATH_FOUND%"=="" (
+  if "!CUDA_PATH_FOUND!"=="" (
     echo.
     echo   [FAIL] The CUDA Toolkit was not found.
     echo.
-    echo     Looked for: "%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nvcc.exe"
+    echo     Looked for, in order:
+    echo       CUDA_PATH\bin\nvcc.exe
+    echo       "%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nvcc.exe"
+    echo.
+    echo     CUDA_PATH is currently: "%CUDA_PATH%"
     echo.
     echo     Without it, only the CPU engine can be built.  Two choices:
     echo.

@@ -203,9 +203,9 @@ jobs:
         # was read out of NVIDIA's own manifest for 12.8.1 and then fetched to confirm
         # it resolves:
         #   https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.1.json
-        # A hand-written guess at this path 404s.  The version numbers are the
-        # component versions WITHIN the 12.8.1 release, which is why nvcc is 12.8.93
-        # and not 12.8.1 -- that mismatch looks like a typo and is not one.
+        # A hand-written guess at that path 404s.  The version numbers are the component
+        # versions WITHIN the 12.8.1 release, which is why nvcc is 12.8.93 and not
+        # 12.8.1 -- that mismatch looks like a typo and is not one.
         #
         # cuda_cccl is included because nvcc's own headers include thrust/cub, so a
         # toolkit without it fails at compile time rather than at configure time.
@@ -218,30 +218,87 @@ jobs:
             'cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip',
             'cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.90-archive.zip'
           )
-          $stage = "$env:RUNNER_TEMP\cuda"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $root = "$env:RUNNER_TEMP\cuda"
+          if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
           foreach ($p in $parts) {
             $name = ($p -split '/')[-1]
+            $zip = Join-Path $env:RUNNER_TEMP $name
             Write-Host "fetching $name"
-            Invoke-WebRequest -Uri "$base/$p" -OutFile "$env:RUNNER_TEMP\$name" -UseBasicParsing -TimeoutSec 1800
-            # Each archive unpacks to its own versioned directory; merge them all into
-            # one root, because that is the shape find_package(CUDAToolkit) expects.
-            $dest = Join-Path $stage ([IO.Path]::GetFileNameWithoutExtension($name) -replace '-archive$','')
-            Expand-Archive -Path "$env:RUNNER_TEMP\$name" -DestinationPath $dest -Force
+            # Retried: these are 115 MB / 2.9 MB / 2.8 MB fetches, and a single
+            # dropped connection on a hosted runner fails the whole job.  The retry is
+            # here because that happened locally during this fix.
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri "$base/$p" -OutFile $zip -UseBasicParsing -TimeoutSec 1800
+                break
+              } catch {
+                Write-Host "  attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -eq 3) { throw "could not fetch $name after 3 attempts" }
+                Start-Sleep -Seconds (10 * $attempt)
+              }
+            }
+            # Extract into its own scratch directory FIRST, then copy the contents of
+            # the single top-level folder the archive contains into $root.
+            #
+            # Each archive nests one directory deep, so extracting straight into a
+            # shared root leaves three sibling trees instead of one, and
+            # find_package(CUDAToolkit) never finds bin/ include/ lib/x64/ together.
+            $scratch = Join-Path $env:RUNNER_TEMP ("unpack_" + [IO.Path]::GetFileNameWithoutExtension($name))
+            if (Test-Path $scratch) { Remove-Item $scratch -Recurse -Force }
+            Expand-Archive -Path $zip -DestinationPath $scratch -Force
+            $inner = Get-ChildItem $scratch -Directory | Select-Object -First 1
+            if (-not $inner) { throw "archive $name contained no top-level directory" }
+            # Copy the CONTENTS of the inner directory, not the directory itself, so
+            # bin/, include/ and lib/ land directly in $root.
+            Copy-Item (Join-Path $inner.FullName '*') $root -Recurse -Force
+            Remove-Item $scratch -Recurse -Force
           }
-          $root = Get-ChildItem $stage -Directory |
-                  Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
-                  Select-Object -First 1
-          if (-not $root) {
-            Get-ChildItem $stage -Recurse -Filter 'nvcc.exe' | ForEach-Object { Write-Host "  found nvcc at $($_.FullName)" }
+
+          # Find nvcc by RECURSION, not by assuming a fixed depth.  The previous
+          # version looked only at immediate children of the stage directory and so
+          # never matched; it then printed the path it had just found and threw
+          # "not found" anyway, which is the most confusing possible way to fail.
+          $nvcc = Get-ChildItem $root -Recurse -Filter 'nvcc.exe' -File | Select-Object -First 1
+          if (-not $nvcc) {
+            Write-Host "tree under $root :"
+            Get-ChildItem $root -Recurse -Directory | Select-Object -First 30 |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
             throw 'nvcc.exe not found in any unpacked component'
           }
-          Write-Host "CUDA root: $($root.FullName)"
-          "CUDA_PATH=$($root.FullName)" >> $env:GITHUB_ENV
-          ("{0}\bin" -f $root.FullName) >> $env:GITHUB_PATH
-          ("{0}\lib\x64" -f $root.FullName) >> $env:GITHUB_PATH
-          ("{0}\include" -f $root.FullName) >> $env:GITHUB_PATH
-          & (Join-Path $root.FullName 'bin\nvcc.exe') --version
+          # The toolkit root is nvcc's grandparent: <root>/bin/nvcc.exe.
+          $cudaRoot = $nvcc.Directory.Parent.FullName
+          Write-Host "nvcc at: $($nvcc.FullName)"
+          Write-Host "CUDA root: $cudaRoot"
+
+          # Assert the MERGED tree before handing it to CMake.  These three are what
+          # CMakeLists.txt and nvcc actually need, and each was missing in a run that
+          # got as far as a build:
+          #   include/cuda_runtime.h  from cuda_cudart
+          #   lib/x64/cudart.lib      from cuda_cudart
+          #   bin/nvcc.exe            from cuda_nvcc
+          # Checking here means a merge failure names the file instead of surfacing as
+          # an undefined-symbol link error twenty steps later.
+          $need = @(
+            @{ Path = (Join-Path $cudaRoot 'include\cuda_runtime.h'); What = 'cuda_runtime.h' },
+            @{ Path = (Join-Path $cudaRoot 'lib\x64\cudart.lib');    What = 'cudart.lib' },
+            @{ Path = (Join-Path $cudaRoot 'bin\nvcc.exe');           What = 'nvcc.exe' }
+          )
+          foreach ($n in $need) {
+            if (-not (Test-Path $n.Path)) {
+              Write-Host "MISSING: $($n.What) at $($n.Path)"
+              Write-Host "top level of ${cudaRoot}:"
+              Get-ChildItem $cudaRoot -EA SilentlyContinue |
+                ForEach-Object { Write-Host "  $($_.Name)" }
+              throw "$($n.What) missing -- the component archives did not merge"
+            }
+            Write-Host "  [ok] $($n.What)"
+          }
+          & $nvcc.FullName --version
+          "CUDA_PATH=$cudaRoot" >> $env:GITHUB_ENV
+          ("{0}\bin" -f $cudaRoot) >> $env:GITHUB_PATH
+          ("{0}\lib\x64" -f $cudaRoot) >> $env:GITHUB_PATH
+          ("{0}\include" -f $cudaRoot) >> $env:GITHUB_PATH
 
       - name: Build (CUDA)
         shell: cmd
