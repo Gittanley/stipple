@@ -1860,7 +1860,23 @@ class Pipeline {
     // host workers dither from float4, so `--cpu-threads 1` alongside a GPU still
     // dereferences this buffer.  Omitting that case leaves it empty and hands the
     // worker a null pointer.
-    float_path_ = !(opt.use_gpu && !opt.gpu_float_out) || opt.cpu_threads > 0;
+    // float4_path is needed whenever ANY host path can run.
+    //
+    // `opt.use_gpu` is what the user ASKED for; whether a GPU is actually present is
+    // resolved later, in RunVideo, and is not known here.  Reading the request instead
+    // of the resolved state is what made `--cpu-threads 0` crash on a machine with no
+    // GPU: 0 is documented as "GPU only", so with `--engine blocks` the request says
+    // use_gpu and gpu_float_out is false, the whole expression evaluated false, and the
+    // float4 buffer was never allocated -- while RunVideo, having found no device,
+    // launched a host worker that dereferences exactly that buffer.  Access violation,
+    // 0xC0000005, after a 577-byte container that ffprobe calls malformed.
+    //
+    // So: allocate whenever the host might run, which is whenever the requested GPU
+    // path is not fully on-device, and whenever a host worker was requested at all.
+    // The cost when a GPU really is present is one float4 buffer per slot, already
+    // counted in the RAM budget below; the alternative is a crash whenever the request
+    // and the hardware disagree.
+    float_path_ = true;
 
     // ---- RAM budget --------------------------------------------------------
     // The queue is the only allocation this budget governs, and it is not the only
@@ -2397,6 +2413,21 @@ bool VideoProcess(const std::string& in, const std::string& out,
     cpu_threads = std::min(cpu_threads, std::max(0, hw));
   }
 
+  // `--cpu-threads 0` means "GPU only" (see --help), and on a machine with no GPU
+  // that is an unsatisfiable request: nothing would dither anything.  It used to
+  // crash instead of saying so, and the fix was in Pipeline's float4 allocation
+  // rather than here -- see the note on float_path_.  Refusing it outright is the
+  // honest response, because silently running a host worker would give "GPU only"
+  // an answer that quietly is not bit-identical to what a GPU produces, which is the
+  // one thing that flag exists to guarantee.
+  if (cpu_threads == 0 && !use_gpu) {
+    *error =
+        "--cpu-threads 0 means \"GPU only\", but this build found no usable GPU "
+        "device.  Use --cpu-threads 1 (or leave it on auto) for a host dither; note "
+        "that the host walk is not bit-identical to the CUDA walk.";
+    return false;
+  }
+
   // A worker with no slot to work on is worth nothing, so a slot is the unit of
   // currency: 1080p at batch 16 is 759 MiB per slot, and at a 1/3-of-16 GB budget
   // only seven slots exist.  Asking for ten host workers plus the GPU therefore
@@ -2531,12 +2562,18 @@ bool VideoProcess(const std::string& in, const std::string& out,
                                                        : "");
     }
     if (cpu_threads > 0) {
+      // Only offer --cpu-threads 0 when there is a GPU to honour it.  Saying it
+      // unconditionally told users on a GPU-less build to pass a flag that means
+      // "GPU only" there, which is the request that used to crash.
       std::fprintf(stderr,
                    "[video] note: the %d host worker(s) use the host block walk, "
                    "which is NOT bit-identical to the verified CUDA walk -- "
                    "measured ~1.6%% of pixels differ (visually indistinguishable). "
-                   "For bit-exact output use --cpu-threads 0.\n",
-                   cpu_threads);
+                   "%s\n",
+                   cpu_threads,
+                   use_gpu ? "For bit-exact output use --cpu-threads 0."
+                           : "There is no GPU in this build, so --cpu-threads 0 is "
+                             "not available: it means \"GPU only\".");
     }
   }
 

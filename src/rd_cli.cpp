@@ -797,7 +797,25 @@ int main(int argc, char** argv) {
       opt.video_opt.preset = argv[++i];
     } else if (arg == "--cpu-threads") {
       if (!NeedsValue(argc, i, "--cpu-threads")) return 2;
-      opt.video_opt.cpu_threads = std::atoi(argv[++i]);
+      const char* raw = argv[++i];
+      // Parsed strictly rather than with atoi, because atoi returns 0 for anything
+      // non-numeric and 0 is a MEANINGFUL value here: "GPU only".  So
+      // `--cpu-threads auto` -- which reads like the obvious way to ask for the
+      // default -- became "GPU only", and on a machine with no GPU that reported a
+      // GPU-only error for a request the user never made.  The documented way to get
+      // the default is to omit the flag, and now a typo says so.
+      char* end = nullptr;
+      const long parsed = std::strtol(raw, &end, 10);
+      const bool numeric = end != nullptr && *end == '\0' && end != raw;
+      if (!numeric) {
+        std::fprintf(stderr,
+                     "error: --cpu-threads wants a number: -1 for auto, 0 for "
+                     "GPU only, or a positive worker count.  Got '%s'.\n"
+                     "       Omit the flag entirely for auto.\n",
+                     raw);
+        return 2;
+      }
+      opt.video_opt.cpu_threads = static_cast<int>(parsed);
     } else if (arg == "--no-gpu") {
       opt.video_opt.use_gpu = false;
     } else if (arg == "--no-hwaccel") {

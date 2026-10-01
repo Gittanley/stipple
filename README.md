@@ -850,16 +850,56 @@ round-trip can differ by 1 in 65535 from its own rounding. Requiring exactness t
 would fail every correct run and teach people to ignore the check; a genuine coder
 mix-up shows up as thousands of differing pixels, which is what this one did.
 
-**`--engine blocks` crashes the video path.** `--video --engine blocks` exits with an
-access violation (0xC0000005) on the committed `tests\clip1920.mp4`, after writing a
-583-byte file that `ffprobe` rejects as malformed. Reproduced identically on the
-committed `c3241ac` sources, so it predates the fixes above, and it is specific to
-`--no-cuda` builds: a CUDA-enabled build dithers the same clip to 2,824,846 bytes and
-exits 0. **Unfixed** — recorded rather than papered over.
+**`--cpu-threads 0` crashed the video path, whatever the engine.** The README used to
+blame `--engine blocks` for this, which was wrong — `--engine cpu` crashed identically, and
+so did a 64x64 three-frame clip. It was never the engine or the size.
 
-The suite does not catch it, for the structural reason above: `tests\clip1920.mp4` is
-**not tracked** (it is a large local file), so the video check reports SKIPPED wherever
-a clean clone is used, which is everywhere automated.
+`--cpu-threads 0` means "GPU only" (see `--help`). The float4 buffer that a host worker
+dithers from was allocated under this condition:
+
+```cpp
+float_path_ = !(opt.use_gpu && !opt.gpu_float_out) || opt.cpu_threads > 0;
+```
+
+`opt.use_gpu` is what the user **asked for**. Whether a GPU is actually present is resolved
+later, in `RunVideo`, and is not known when `Pipeline` is constructed. So on a `--no-cuda`
+build with `--cpu-threads 0` the request said "use the GPU", the whole expression evaluated
+false, and the buffer was never allocated — while `RunVideo`, having found no device,
+launched a host worker that dereferences exactly that buffer. Access violation,
+`0xC0000005`, after a stub container `ffprobe` calls malformed — 583 bytes for the 1080p
+clip, 577 for a three-frame one, the size tracking whatever the encoder flushed before
+it was killed mid-stream.
+
+The buffer is now always allocated. That costs one float4 buffer per queue slot when a GPU
+*is* present — already counted in the RAM budget — and the alternative is a crash whenever
+the request and the hardware disagree.
+
+Two smaller fixes came out of the same investigation:
+
+* `--cpu-threads 0` with no usable GPU is now **refused with an explanation** rather than
+  silently run on the host. Running it anyway would give "GPU only" an answer that quietly
+  is not bit-identical to a GPU's, which is the one thing that flag exists to guarantee.
+* The host-walk note used to end "For bit-exact output use `--cpu-threads 0`"
+  **unconditionally** — advice that crashed a GPU-less build. It now says so only when a
+  GPU is actually there.
+* `--cpu-threads` is parsed with `strtol` and validated. `atoi("auto")` is `0`, and `0` is a
+  *meaningful* value here, so `--cpu-threads auto` — which reads like the obvious way to ask
+  for the default — silently became "GPU only". Omitting the flag is how you get auto; now
+  a typo says so and exits 2. **The other 19 `atoi` call sites have the same shape and are
+  not yet audited.**
+
+Verified against the committed build, which still crashes on the 1080p clip:
+
+| | committed | fixed |
+|---|---|---|
+| `--no-cuda`, 1080p clip | crash, 583 B | **60 frames, 9,304,502 B** |
+| `--no-cuda`, `--cpu-threads 0` | crash | clear error, exit 1 |
+| CUDA build, `--cpu-threads 0` | 60 frames in 2.77 s | unchanged |
+| suite, CUDA build | 150 passed | 150 passed, 0 failed |
+
+The suite still cannot catch this automatically, for the structural reason above:
+`tests\clip1920.mp4` is **not tracked** (it is a large local file), so the video check
+reports SKIPPED wherever a clean clone is used, which is everywhere automated.
 
 ---
 
