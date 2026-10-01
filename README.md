@@ -17,14 +17,23 @@ defects survived in, each one a build path nobody had ever run.
 | | coverage | notes |
 |---|---|---|
 | clean clone builds at all | every push | the check that would have caught all five defects |
-| CPU-only build, 90 bit-exact cases vs ImageMagick | every push | 45 further cases report SKIPPED, not passed |
-| CUDA build compiles and links | every push | toolchain only; the runner has no GPU |
+| CPU-only build, 100 bit-exact cases vs ImageMagick | every push | 50 further cases report SKIPPED, not passed |
+| CUDA build compiles and links | every push | 12.8 toolkit unpacked from redist archives; no GPU on the runner |
 | OpenCL-vs-CUDA, 54 cells | manual | no GPU on the runner |
 | video probes | manual | no GPU, and no clip is committed |
 
-A skipped check is never counted as a pass, and the CPU job asserts that at least 80
+A skipped check is never counted as a pass, and the CPU job asserts that at least 90
 real cases actually ran — because a suite that skips nearly everything and exits 0 is
 worse than a failing one.
+
+Both jobs are green on every push. Getting there took three fixes in the CUDA job
+alone, and every one of them was in code I had written minutes earlier and never run:
+the toolkit search looked one level deep when the archive nests three, the component
+archives were never merged into the single root `find_package(CUDAToolkit)` needs, and
+`build.cmd` ignored `CUDA_PATH` entirely. The third one had a fault inside the fix —
+`%VAR%` inside a parenthesised batch block expands before the block runs, so the test
+always saw an empty variable. That is why the workflow's own header now says to test
+toolchain code locally before pushing it.
 
 **The toolchain took some finding.** GitHub's hosted Windows runners ship ImageMagick
 7.1.2-25 Q16-HDRI — the right variant, at the path `build.cmd` looks in first — but
