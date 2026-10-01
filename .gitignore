@@ -69,3 +69,8 @@ tests/smooth.png
 Thumbs.db
 .DS_Store
 *.swp
+
+# Hi-res source photographs for the README showcase.  Regenerate from the
+# Wikimedia Commons URLs recorded in docs/examples/SOURCES.md; the dithered
+# outputs in docs/examples/ are what gets committed.
+*.orig.jpg

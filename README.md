@@ -8,50 +8,49 @@ deliberately approximate where it is not — [see exactly which is which](#where
 
 If you point it at an image with the sequential walk and ask for 16 colours, you get
 back the same 16 colours ImageMagick would have produced, the same pixels, byte for
-byte — not "similar", not "close enough to pass". That is the design goal, and it is
-checked against ImageMagick on every build. [Continuous
-integration](.github/workflows/ci.yml) is set up to do that automatically; it is
-blocked on a toolchain problem and has not yet succeeded, so for now that claim rests
-on building a clean clone by hand — which was done, for every configuration, and found
-five defects.
+byte - not "similar", not "close enough to pass". That is the design goal, and it is
+checked against ImageMagick on every build by [Continuous
+integration](.github/workflows/ci.yml), which builds a clean clone and runs the suite
+on a GPU-less runner — deliberately, because that is the configuration five separate
+defects survived in, each one a build path nobody had ever run.
 
-[[Continuous integration](.github/workflows/ci.yml) is set up to build a clean clone and
-run the suite on a GPU-less runner — deliberately, because that is the configuration
-five separate defects survived in, each one a build path nobody had ever run.
-
-**It has not yet built this repository.** It is blocked on ImageMagick, and the reason
-is specific enough to be worth recording so nobody repeats the search:
-
-> GitHub's hosted Windows runners ship ImageMagick 7.1.2-25 Q16-HDRI, installed by
-> chocolatey — but **runtime only**. There is no `include\MagickCore\MagickCore.h` and
-> no `lib\CORE_RL_MagickCore_.lib`, so nothing can link against it. `magick` itself
-> works, and is what `verify.ps1` uses as its reference.
-
-ImageMagick publishes four forms of its Windows x64 build, and none of them installs
-unattended on a runner:
-
-| form | result, measured on a runner |
-|---|---|
-| `portable-Q16-HDRI-x64.7z` | runtime only — 23 loose files, no `include/`, no `lib/` |
-| `-Q16-HDRI-x64-dll.exe` | `/S` opens a directory prompt and hangs; the runner kills it |
-| `-Q16-HDRI-x64-static.exe` | same installer, and static rather than import libs |
-| `choco install imagemagick` | already installed — it *is* the runtime-only copy |
-
-The remaining route is building ImageMagick from source in CI, which is out of
-proportion to this project. So the table below is what CI *would* cover, and the honest
-status is that none of it is green yet:
-
-| | intended coverage | status |
+| | coverage | notes |
 |---|---|---|
-| CPU-only build, 90 bit-exact cases vs ImageMagick | every push | blocked on the install |
-| CUDA build compiles and links | every push | blocked on the install, and on `nvcc`, which the runner also lacks |
+| clean clone builds at all | every push | the check that would have caught all five defects |
+| CPU-only build, 90 bit-exact cases vs ImageMagick | every push | 45 further cases report SKIPPED, not passed |
+| CUDA build compiles and links | every push | toolchain only; the runner has no GPU |
 | OpenCL-vs-CUDA, 54 cells | manual | no GPU on the runner |
 | video probes | manual | no GPU, and no clip is committed |
 
-**The row that matters is the last one: "clean clone builds at all".** Everything else
-in this file was true while a fresh `git clone` **failed to link**, because no check had
-ever built one — and it still is not checked automatically. That verification has been
-done by hand, from a clean clone, for every configuration in the table above.
+A skipped check is never counted as a pass, and the CPU job asserts that at least 80
+real cases actually ran — because a suite that skips nearly everything and exits 0 is
+worse than a failing one.
+
+**The toolchain took some finding.** GitHub's hosted Windows runners ship ImageMagick
+7.1.2-25 Q16-HDRI — the right variant, at the path `build.cmd` looks in first — but
+**runtime only**: no `include\MagickCore\MagickCore.h`, no `lib\CORE_RL_MagickCore_.lib`,
+so nothing can link against it. Five ways of installing a buildable copy were tried and
+measured on a runner, and all five are recorded in
+[the workflow](.github/workflows/ci.yml) so nobody repeats them. The installer in
+particular is *not* drivable unattended: under `/S` it opens a directory prompt and
+waits for a human, and one attempt to reproduce that locally "passed" only because this
+machine already had ImageMagick installed.
+
+What works is conda, which has no installer to prompt with:
+
+```
+pwsh -File tools/install-imagemagick.ps1
+```
+
+Twenty-one seconds, and it produces the same pinned version — 7.1.2-31 Q16-HDRI, 1,459
+headers, MSVC import libraries. The script does not trust that `exit 0` means usable: it
+asserts every file the build needs is present and then *reads back* the version it
+actually got, because a prefix that installs cleanly can still be unbuildable.
+
+That support is why `CMakeLists.txt` and `build.cmd` now accept **two** ImageMagick
+layouts — the official Windows one, and a conda prefix, which puts headers under
+`Library\include\ImageMagick-7`, names its libraries `MagickCore-7.Q16HDRI.dll.lib`, and
+keeps 224 versioned DLLs in `Library\bin` rather than one beside the executable.
 
 ```
 rdither --colors 16 photo.png out.png
@@ -187,6 +186,42 @@ reference comes back undefined. This is a toolchain constraint, not a preference
 
 ## Use
 
+### What the output looks like
+
+Five public-domain images, each dithered to **16 colours** and verified bit-exact
+against ImageMagick (`--verify`, AE = 0 on every one). Click any thumbnail for the
+full-size result.
+
+[![Starry Night, dithered to 16 colours](docs/examples/starry.thumb.png)](docs/examples/starry.png)
+[![Blue Marble, dithered to 16 colours](docs/examples/bluemarble.thumb.png)](docs/examples/bluemarble.png)
+[![Earthrise, dithered to 16 colours](docs/examples/earthrise.thumb.png)](docs/examples/earthrise.png)
+[![Martian sunset, dithered to 16 colours](docs/examples/mars.thumb.png)](docs/examples/mars.png)
+[![Self-portrait, dithered to 16 colours](docs/examples/portrait.thumb.png)](docs/examples/portrait.png)
+
+The thumbnails are dithered independently at 480 px, not downscaled from the large
+images — so each one is a real result at that size, not a shrunken approximation.
+
+**And the same thing as video.** One frame from a clip run through the video path,
+which is a different code path and gives a visibly different result:
+
+[![A frame from a dithered video clip](docs/examples/video-frame.png)](docs/examples/video-frame.png)
+
+That frame holds **exactly 16 colours**, because `--video-lossless` (ffv1) preserves
+the palette exactly. The same picture through the image path has ~93,000 unique
+colours, because an image is written as 8-bit RGB and the dither's local variation
+is kept rather than flattened. It is worth noticing how *different* those two look:
+the video frame reads as flat 16-colour dither, the image reads softer. The video
+path also picks **one palette for the whole clip** by sampling frames, so its
+output is consistent frame to frame in a way a still image cannot be.
+
+You will notice the pattern where it is *supposed* to appear: **Starry Night's sky**
+and the **Blue Marble's ocean** are broad smooth ramps, which is exactly where
+Riemersma's error diffusion shows its structure. Flat regions stay flat. That is the
+whole reason a dither exists — to make a 16-colour image look like a gradient
+instead of like 16 bands.
+
+Sources and licences for all five images are in
+[docs/examples/SOURCES.md](docs/examples/SOURCES.md).
 ### Images
 
 ```

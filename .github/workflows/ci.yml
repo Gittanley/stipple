@@ -1,55 +1,54 @@
 # Continuous integration: build every configuration, verify what can be verified.
 #
 # ############################################################################
-# THIS WORKFLOW HAS NEVER SUCCESSFULLY BUILT THIS REPOSITORY.
+# HOW THE TOOLCHAIN IS INSTALLED, and why it is not the obvious way.
 #
-# It is blocked on ImageMagick, after six runs that each established one measured
-# fact.  Recorded here rather than in the commit log alone, because they cost about
-# forty minutes of CI to acquire and nobody should pay that again.
-#
-# GitHub's hosted Windows runners DO ship ImageMagick:
-#
-#   C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe
-#   Version: ImageMagick 7.1.2-25 Q16-HDRI x64
-#
-# which is the right variant and the path build.cmd looks in first.  But it is
-# RUNTIME ONLY.  Measured on a runner:
-#
-#   include\MagickCore\MagickCore.h   -> False
-#   lib\CORE_RL_MagickCore_.lib       -> False
-#
-# Nothing can link against it.  `magick` itself works, so it is usable as the compare
-# reference verify.ps1 needs; it cannot be built against.
-#
-# FIVE INSTALL ROUTES, ALL MEASURED ON A RUNNER, ALL DEAD ENDS:
+# Five install routes were tried and measured on a runner before this one:
 #
 #   1. the -dll.exe installer via Start-Process -ArgumentList @("/S","/D=...")
 #      hung to the full job timeout.  NSIS re-quotes array elements, so /D arrives
-#      quoted and the installer opens a directory prompt and waits for a human instead
-#      of failing.
-#   2. the same through `cmd /c`, which works on a machine that ALREADY has ImageMagick
-#      (verified locally: exit 0 in 23.9s) and still hangs on a clean runner.  The
-#      uncontrolled variable was a prior install, which is exactly why the local test
-#      passed and the real thing did not.  That is the mistake worth remembering: a
-#      local reproduction of a clean-machine failure, run on a machine that was not
-#      clean.
-#   3. the portable-Q16-HDRI-x64.7z extracts in 0.9s and is runtime only -- 23 loose
-#      files, magick.exe and XML, with no include/ and no lib/ anywhere in the tree.
-#   4. `7z x` on the installer exe yields the NSIS bootstrap only; the payload is in an
-#      embedded blob 7z does not unpack.
-#   5. `choco install imagemagick` reports "v7.1.2.2500 already installed", i.e. it IS
-#      the runtime-only copy from route 1 above.
+#      quoted and the installer opens a directory prompt and waits for a human
+#      instead of failing.
+#   2. the same through `cmd /c`, which works on a machine that ALREADY has
+#      ImageMagick (verified locally: exit 0 in 23.9s) and still hangs on a clean
+#      runner.  The uncontrolled variable was a prior install, which is exactly why
+#      the local test passed and the real thing did not.  A local reproduction of a
+#      clean-machine failure has to be run on a clean machine.
+#   3. the portable-Q16-HDRI-x64.7z extracts in 0.9s and is RUNTIME ONLY -- 23 loose
+#      files, magick.exe and XML, with no include/ and no lib/ anywhere.
+#   4. `7z x` on the installer exe yields the NSIS bootstrap only; the payload is in
+#      an embedded blob 7z does not unpack.
+#   5. `choco install imagemagick` reports "v7.1.2.2500 already installed", i.e. it
+#      IS the runtime-only copy from route 1 above.
 #
-# ImageMagick publishes four forms of the Windows x64 build -- portable 7z, dll exe,
-# static exe, and a source tarball -- and none of the binaries installs unattended on a
-# runner.  The remaining route is building ImageMagick from source inside CI, which is
-# out of proportion to this project.
+# What DOES work is conda, and the runner image is irrelevant to it:
 #
-# TO MAKE THIS WORK, one of:
-#   * a cached runner image with a dev install of ImageMagick (a custom
-#     actions/runner-image, or a self-hosted runner);
-#   * build ImageMagick from source as a first CI step;
-#   * accept a prebuilt rdither and run only the probes.
+#   pwsh -File tools/install-imagemagick.ps1
+#
+# Twenty-one seconds, exit 0, no GUI, and it carries the same version this
+# repository is pinned to (7.1.2-31 Q16-HDRI x86_64) with 1,459 headers and the
+# MSVC import libraries MagickCore-7.Q16HDRI.dll.lib and
+# MagickWand-7.Q16HDRI.dll.lib.  Its magick reports "Compiler: Visual Studio
+# 2022", which is the part that matters: a conda build could in principle be
+# MinGW-ABI, and the import libraries would then be unlinkable by MSVC.
+#
+# Verified on this machine before it was pushed here: a clean clone built against
+# that prefix, the smoke test reported AE=0/4096 RMSE=0 -- bit-exact against
+# conda's own magick -- and the full suite reported 90 passed, 0 failed, 45
+# skipped.  Those are exactly the numbers the nocuda job asserts below.
+#
+# Two differences from the official Windows layout, both handled by CMakeLists.txt
+# and build.cmd rather than patched here:
+#   * headers live under Library\include\ImageMagick-7, and the import libraries
+#     are named MagickCore-7.Q16HDRI.dll.lib rather than CORE_RL_MagickCore_.lib;
+#   * the DLLs are in Library\bin and there are 224 of them, the core one versioned
+#     (MagickCore-7.Q16HDRI-10.dll), so they go on PATH instead of being copied.
+#
+# LICENCE.  The conda-forge build is declared "AGPL-3.0-only AND ImageMagick".
+# AGPLv3 is compatible with this project's GPL-3.0-or-later, so linking against it
+# is fine, and it is a build-time dependency on a runner rather than something
+# redistributed.  Stated rather than assumed, because it is the sort of thing that
+# is easy to miss and awkward to discover later.
 #
 # WHY THIS EXISTS AT ALL, and it is not "to be professional".
 #
@@ -105,96 +104,15 @@ jobs:
 
       - name: Install ImageMagick 7.1.2-31 Q16-HDRI
         shell: pwsh
-        # The DLL INSTALLER, run with a bounded wait.  Three other approaches were
-        # tried and measured, all recorded here because the reasons are not obvious:
-        #
-        #   1. the installer with plain Start-Process -Wait   -> HUNG.  /S was ignored
-        #      and it sat for the full 30-minute job timeout; the runner reported
-        #      "Terminate orphan process: pid (4444) (im-setup)".  Never reached a build.
-        #   2. the portable .7z                             -> extracts cleanly in 0.9s
-        #      but is RUNTIME ONLY: 23 loose files, magick.exe and XML, with no
-        #      include/ and no lib/ at all.  It cannot build against.
-        #   3. 7z x on the installer .exe                    -> extracts the NSIS
-        #      bootstrap only; no MagickCore.h, no import library.  The payload is in
-        #      an embedded blob 7z does not unpack.
-        #
-        # So the installer is the only form that carries headers and a .lib, and the
-        # only thing that can go wrong is that it does not exit.  Hence the bounded
-        # wait: kill it after 180s and fail loudly, rather than burning the job.
-        #
-        # Pinned to the EXACT version every bit-exactness number here was measured
-        # against, deliberately rather than to "latest" -- a Q8 build compiles and then
-        # fails every comparison, and "latest" would let a new release turn a green
-        # build red with nothing in the repository having changed.
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
-          $url = "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset"
-          Write-Host "fetching $url"
-          Invoke-WebRequest -Uri $url -OutFile im-setup.exe -UseBasicParsing -TimeoutSec 900
-          $dest = 'C:\im'
-          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-
-          Write-Host "starting the installer with a 180s bound"
-          # THIS IS THE FIX, and it took four CI runs to find.  /S and /D are passed
-          # through `cmd /c` rather than as a Start-Process argument array.
-          #
-          # Start-Process -ArgumentList re-quotes each array element, so "/D=C:\im"
-          # can reach NSIS quoted or split.  NSIS requires /D to be the LAST argument
-          # and UNQUOTED; when it is not, the installer does not fail -- it opens a
-          # directory prompt and waits for a human, which is why every earlier attempt
-          # appeared to "ignore /S".  The symptom was a job killed at its 30-minute
-          # timeout with `im-setup` named as an orphaned process.
-          #
-          # Verified on this machine before it was pushed here: the same installer
-          # with `/c` completes in 23.9s and exit 0.  Through -ArgumentList it ran
-          # past 240s.  It installs to its default C:\Program Files location, which is
-          # also build.cmd's first guess, and the search below finds either.
-          $p = Start-Process -FilePath 'cmd.exe' `
-                -ArgumentList "/c `"im-setup.exe`" /S /D=$dest" -PassThru -NoNewWindow
-          if (-not $p.WaitForExit(180000)) {
-            Write-Host "installer still running after 180s; killing it"
-            try { $p.Kill() } catch { }
-            throw 'the ImageMagick installer did not exit. /S and /D go through cmd /c,'
-          }
-          Write-Host "installer exit code: $($p.ExitCode)"
-
-          # Find the root by CONTENT, not by assuming /D was honoured.  The first
-          # version of this built a candidate list as @(String, DirectoryInfo) and read
-          # .FullName off both, a Join-Path type error on the String; the second
-          # assumed a wrapper directory that a portable archive does not have.  Both
-          # files are asserted by name so a wrong pick is one line of log rather than a
-          # link error twenty steps later.
-          $cands = @($dest, "${env:ProgramFiles}\ImageMagick-7.1.2-Q16-HDRI")
-          $root = $null
-          foreach ($c in $cands) {
-            if (Test-Path (Join-Path $c 'include\MagickCore\MagickCore.h')) { $root = $c; break }
-          }
-          if (-not $root) {
-            Write-Host "searching for MagickCore.h under C:\ :"
-            Get-ChildItem C:\ -Directory -EA SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
-            throw "no include\MagickCore\MagickCore.h under any known location"
-          }
-          $lib = Join-Path $root 'lib\CORE_RL_MagickCore_.lib'
-          if (-not (Test-Path $lib)) {
-            Write-Host "lib\ under $root :"
-            Get-ChildItem (Join-Path $root 'lib') -EA SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
-            throw "no CORE_RL_MagickCore_.lib at $lib -- this is the Q8 or non-MSVC build"
-          }
-          Write-Host "ImageMagick root: $root"
-          "IM_ROOT=$root" >> $env:GITHUB_ENV
-          # build.cmd reads IMAGEMAGICK_ROOT, and this is the only step that knows
-          # where the installer actually landed.  Without it the nocuda job falls back
-          # to build.cmd's hardcoded C:\Program Files path, which does exist on a hosted
-          # runner but is a DIFFERENT and older ImageMagick -- or nothing at all.
-          "IMAGEMAGICK_ROOT=$root" >> $env:GITHUB_ENV
-
+        # The conda route, in a shared script so the two jobs cannot drift apart.
+        # Why the official installer is not used is recorded in the header and in
+        # tools/install-imagemagick.ps1 itself.  The script asserts the prefix is
+        # buildable rather than trusting that "exit 0" means usable.
+        run: pwsh -NoProfile -File .\tools\install-imagemagick.ps1 -Prefix C:\im
       - name: Report the toolchain actually used
         shell: pwsh
         run: |
-          & "$env:IM_ROOT\magick.exe" --version
+          magick --version
           cmake --version
           # Recorded in the log because a green run on an unexpected toolchain is not
           # the same evidence as a green run on the expected one.
@@ -208,9 +126,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          & "$env:IM_ROOT\magick.exe" --version
-          $env:MAGICK_HOME = $env:IM_ROOT
-          $env:PATH = "$env:IM_ROOT;$env:PATH"
+          # magick, MAGICK_HOME and the DLL directory are already set by the
+          # install step through GITHUB_ENV and GITHUB_PATH, so they are not
+          # re-derived here: in this layout magick.exe lives in Library\bin, not
+          # at the prefix root, so "$env:IM_ROOT\magick.exe" is not a file.
+          magick --version
           & pwsh -NoProfile -File .\verify.ps1
           $code = $LASTEXITCODE
           Write-Host "verify.ps1 exit=$code"
@@ -260,36 +180,11 @@ jobs:
 
       - name: Install ImageMagick 7.1.2-31 Q16-HDRI
         shell: pwsh
-        # Installer with a bounded wait; the three rejected alternatives and why are
-        # recorded on the same step in the nocuda job above.
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $tag = '7.1.2-31'
-          $asset = "ImageMagick-$tag-Q16-HDRI-x64-dll.exe"
-          Invoke-WebRequest -Uri "https://github.com/ImageMagick/ImageMagick/releases/download/$tag/$asset" -OutFile im-setup.exe -UseBasicParsing -TimeoutSec 900
-          $dest = 'C:\im'
-          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          # Through cmd /c, not a Start-Process argument array -- see the long note on the
-          # same step in the nocuda job.  NSIS needs /D last and unquoted, and
-          # -ArgumentList re-quotes array elements, which turns a silent install into a
-          # GUI prompt that waits for a human until the job times out.
-          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"im-setup.exe`" /S /D=$dest" -PassThru -NoNewWindow
-          if (-not $p.WaitForExit(180000)) {
-            try { $p.Kill() } catch { }
-            throw 'the ImageMagick installer did not exit within 180s'
-          }
-          Write-Host "installer exit code: $($p.ExitCode)"
-          $root = $null
-          foreach ($c in @($dest, "${env:ProgramFiles}\ImageMagick-7.1.2-Q16-HDRI")) {
-            if (Test-Path (Join-Path $c 'include\MagickCore\MagickCore.h')) { $root = $c; break }
-          }
-          if (-not $root) { throw "no include\MagickCore\MagickCore.h under any known location" }
-          if (-not (Test-Path (Join-Path $root 'lib\CORE_RL_MagickCore_.lib'))) { throw "no MSVC import library under $root" }
-          Write-Host "ImageMagick root: $root"
-          "IM_ROOT=$root" >> $env:GITHUB_ENV
-          "IMAGEMAGICK_ROOT=$root" >> $env:GITHUB_ENV
-
+        # The conda route, in a shared script so the two jobs cannot drift apart.
+        # Why the official installer is not used is recorded in the header and in
+        # tools/install-imagemagick.ps1 itself.  The script asserts the prefix is
+        # buildable rather than trusting that "exit 0" means usable.
+        run: pwsh -NoProfile -File .\tools\install-imagemagick.ps1 -Prefix C:\im
       - name: Install the CUDA toolkit
         shell: pwsh
         # The hosted runners have MSBuild and the VS C++ workload but NOT nvcc, and

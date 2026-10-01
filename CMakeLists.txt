@@ -37,6 +37,21 @@ set(RD_IMAGEMAGICK_ROOT "" CACHE PATH
     "Root of the ImageMagick 7.1.2-31 Q16-HDRI installation")
 
 # --- ImageMagick -----------------------------------------------------------
+# TWO LAYOUTS ARE SUPPORTED, and which one is in use is decided by looking at the
+# tree rather than by asking the user to say so.
+#
+#   official Windows installer        conda/mamba prefix
+#     include/MagickCore/*.h            Library/include/ImageMagick-7/MagickCore/*.h
+#     lib/CORE_RL_MagickCore_.lib        Library/lib/MagickCore-7.Q16HDRI.dll.lib
+#     magick.exe                        Library/bin/magick.exe
+#
+# The second exists because it is the only ImageMagick on Windows that installs
+# unattended.  The official installer opens a directory prompt under /S on a clean
+# machine and waits for a human; six separate attempts to work around that are
+# recorded in .github/workflows/ci.yml.  `micromamba create imagemagick=7.1.2_31`
+# takes fifteen seconds, needs no GUI, and ships the same 7.1.2-31 Q16-HDRI
+# version -- verified here to compile, link, and run a real Riemersma quantize
+# against MagickCore, not merely to be present on disk.
 if(NOT RD_IMAGEMAGICK_ROOT)
   if(DEFINED ENV{IMAGEMAGICK_ROOT})
     set(RD_IMAGEMAGICK_ROOT "$ENV{IMAGEMAGICK_ROOT}")
@@ -50,14 +65,59 @@ if(NOT RD_IMAGEMAGICK_ROOT)
   endif()
 endif()
 
-if(NOT RD_IMAGEMAGICK_ROOT OR NOT EXISTS "${RD_IMAGEMAGICK_ROOT}/include/MagickCore/MagickCore.h")
+if(NOT RD_IMAGEMAGICK_ROOT)
   message(FATAL_ERROR
-    "ImageMagick not found.  Pass -DRD_IMAGEMAGICK_ROOT=\"C:/Program Files/ImageMagick-7.1.2-Q16-HDRI\"")
+    "ImageMagick not found.  Either install it, or set IMAGEMAGICK_ROOT to the "
+    "install root, or pass -DRD_IMAGEMAGICK_ROOT=<path>.  A conda/mamba prefix "
+    "works: micromamba create -p C:/im -c conda-forge imagemagick=7.1.2_31")
 endif()
-message(STATUS "ImageMagick root: ${RD_IMAGEMAGICK_ROOT}")
 
-set(RD_IM_INCLUDE "${RD_IMAGEMAGICK_ROOT}/include")
-set(RD_IM_LIB     "${RD_IMAGEMAGICK_ROOT}/lib")
+# Layout probe, by content.  RD_IM_FLAVOUR is "windows" or "conda".
+if(EXISTS "${RD_IMAGEMAGICK_ROOT}/include/MagickCore/MagickCore.h")
+  set(RD_IM_FLAVOUR "windows")
+  set(RD_IM_INCLUDE "${RD_IMAGEMAGICK_ROOT}/include")
+  set(RD_IM_LIB     "${RD_IMAGEMAGICK_ROOT}/lib")
+  set(RD_IM_BIN      "${RD_IMAGEMAGICK_ROOT}")
+  set(RD_IM_MAGICK_EXE "${RD_IMAGEMAGICK_ROOT}/magick.exe")
+  # The official build names its import libraries per quantum; CORE_RL is Q16 HDRI.
+  set(RD_IM_CORE_LIB "CORE_RL_MagickCore_.lib")
+  set(RD_IM_WAND_LIB "CORE_RL_MagickWand_.lib")
+  # Its DLLs sit one level up from lib/, unversioned.
+  file(GLOB _rd_im_dlls "${RD_IMAGEMAGICK_ROOT}/*.dll")
+elseif(EXISTS "${RD_IMAGEMAGICK_ROOT}/Library/include/ImageMagick-7/MagickCore/MagickCore.h")
+  set(RD_IM_FLAVOUR "conda")
+  set(RD_IM_INCLUDE "${RD_IMAGEMAGICK_ROOT}/Library/include/ImageMagick-7")
+  set(RD_IM_LIB     "${RD_IMAGEMAGICK_ROOT}/Library/lib")
+  set(RD_IM_BIN      "${RD_IMAGEMAGICK_ROOT}/Library/bin")
+  set(RD_IM_MAGICK_EXE "${RD_IMAGEMAGICK_ROOT}/Library/bin/magick.exe")
+  set(RD_IM_CORE_LIB "MagickCore-7.Q16HDRI.dll.lib")
+  set(RD_IM_WAND_LIB "MagickWand-7.Q16HDRI.dll.lib")
+  # The conda DLL carries a build suffix, e.g. MagickCore-7.Q16HDRI-10.dll.
+  file(GLOB _rd_im_dlls "${RD_IM_BIN}/MagickCore*.dll")
+else()
+  message(FATAL_ERROR
+    "ImageMagick headers not found under ${RD_IMAGEMAGICK_ROOT}.  Expected either\n"
+    "  ${RD_IMAGEMAGICK_ROOT}/include/MagickCore/MagickCore.h          (Windows installer)\n"
+    "  ${RD_IMAGEMAGICK_ROOT}/Library/include/ImageMagick-7/MagickCore/MagickCore.h  (conda)")
+endif()
+
+# A conda build is driven by pkg-config, so magick-config.h does not carry the
+# quantum settings itself and REFUSES to compile without them -- it is a hard
+# #error, not a warning.  These five come from
+# Library/lib/pkgconfig/ImageMagick-7.Q16HDRI.pc, read rather than guessed:
+#   Cflags: -DMAGICKCORE_HDRI_ENABLE=1 -DMAGICKCORE_QUANTUM_DEPTH=16 -D_DLL -D_MT
+#           -DMAGICKCORE_CHANNEL_MASK_DEPTH=32
+if(RD_IM_FLAVOUR STREQUAL "conda")
+  set(RD_IM_DEFINES
+    MAGICKCORE_HDRI_ENABLE=1
+    MAGICKCORE_QUANTUM_DEPTH=16
+    MAGICKCORE_CHANNEL_MASK_DEPTH=32
+    _DLL
+    _MT)
+endif()
+
+message(STATUS "ImageMagick root:  ${RD_IMAGEMAGICK_ROOT}  (${RD_IM_FLAVOUR} layout)")
+message(STATUS "ImageMagick exe:   ${RD_IM_MAGICK_EXE}")
 
 # --- CUDA ------------------------------------------------------------------
 if(RD_WITH_CUDA)
@@ -204,10 +264,11 @@ add_executable(rdither ${RD_SOURCES})
 target_include_directories(rdither PRIVATE include "${RD_IM_INCLUDE}")
 target_link_directories(rdither PRIVATE "${RD_IM_LIB}")
 
-# The MSVC import libraries are named per-quantum, e.g. CORE_RL_MagickCore_.
-target_link_libraries(rdither PRIVATE
-  CORE_RL_MagickCore_.lib
-  CORE_RL_MagickWand_.lib)
+# The MSVC import libraries are named per-quantum.  Two naming schemes, picked by
+# the layout probe above: the official build says CORE_RL_MagickCore_.lib, conda
+# says MagickCore-7.Q16HDRI.dll.lib.  Hardcoding either one is what made the conda
+# toolchain unusable until the probe existed.
+target_link_libraries(rdither PRIVATE "${RD_IM_CORE_LIB}" "${RD_IM_WAND_LIB}")
 
 if(RD_WITH_CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -229,7 +290,14 @@ target_compile_definitions(rdither PRIVATE
   $<$<CONFIG:Release>:NDEBUG>
   _CRT_SECURE_NO_WARNINGS
   NOMINMAX
-  RD_DEFAULT_MAGICK_EXE="${RD_IMAGEMAGICK_ROOT}/magick.exe")
+  RD_DEFAULT_MAGICK_EXE="${RD_IM_MAGICK_EXE}")
+
+# The conda layout's magick-config.h #errors out unless it is told the quantum
+# settings, which its pkgconfig file carries.  Applied here rather than baked into
+# the source so the Windows layout keeps compiling with none of them.
+if(RD_IM_DEFINES)
+  target_compile_definitions(rdither PRIVATE ${RD_IM_DEFINES})
+endif()
 
 if(MSVC)
   # /fp:precise is the default and does not contract a*b+c into FMA, which the
@@ -246,8 +314,22 @@ endif()
 
 # The import libraries live in lib/, the matching DLLs one level up.  Only the
 # core DLL is required; coder modules are loaded on demand from MODULES_PATH.
-add_custom_command(TARGET rdither POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          "${RD_IMAGEMAGICK_ROOT}/CORE_RL_MagickCore_.dll"
-          "$<TARGET_FILE_DIR:rdither>"
-  VERBATIM)
+#
+# Copying is a convenience for the Windows layout, where the DLL sits beside the
+# import library and there is nothing else to arrange.  Under the conda layout
+# there are 224 dependent DLLs in the same directory and the core one is
+# version-suffixed (MagickCore-7.Q16HDRI-10.dll), so copying a single file would
+# produce an exe that dies at startup on a missing dependency.  That case is
+# handled by putting the prefix's Library/bin on PATH instead -- see the message
+# below, which names the directory to add rather than leaving it to be discovered.
+if(_rd_im_dlls)
+  add_custom_command(TARGET rdither POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_rd_im_dlls}
+            "$<TARGET_FILE_DIR:rdither>"
+    VERBATIM)
+endif()
+if(RD_IM_FLAVOUR STREQUAL "conda")
+  message(STATUS
+    "ImageMagick DLL directory (add to PATH before running rdither):\n    ${RD_IM_BIN}")
+endif()

@@ -36,11 +36,25 @@ REM conditional fall into the wrong branch.  `if defined` is the reliable test.
 set "RD_IMAGE_MAGICK=C:\Program Files\ImageMagick-7.1.2-Q16-HDRI"
 if defined IMAGEMAGICK_ROOT set "RD_IMAGE_MAGICK=%IMAGEMAGICK_ROOT%"
 
-if not exist "%RD_IMAGE_MAGICK%\include\MagickCore\MagickCore.h" (
+REM Two layouts are accepted, tested by CONTENT rather than by path shape, because
+REM a conda/mamba prefix puts headers under Library\include\ImageMagick-7 and
+REM names its import libraries MagickCore-7.Q16HDRI.dll.lib instead of
+REM CORE_RL_MagickCore_.lib.  That layout is worth supporting: it is the only
+REM ImageMagick on Windows that installs unattended, which is what CI needs.
+REM See the ImageMagick section of CMakeLists.txt, which probes the same way.
+if exist "%RD_IMAGE_MAGICK%\include\MagickCore\MagickCore.h" (
+  set "RD_IM_FLAVOUR=windows"
+  set "RD_IM_BIN=%RD_IMAGE_MAGICK%"
+) else if exist "%RD_IMAGE_MAGICK%\Library\include\ImageMagick-7\MagickCore\MagickCore.h" (
+  set "RD_IM_FLAVOUR=conda"
+  set "RD_IM_BIN=%RD_IMAGE_MAGICK%\Library\bin"
+) else (
   echo.
   echo   [FAIL] ImageMagick not found.
   echo.
-  echo     Looked for: %RD_IMAGE_MAGICK%\include\MagickCore\MagickCore.h
+  echo     Looked for, in both accepted layouts:
+  echo       %RD_IMAGE_MAGICK%\include\MagickCore\MagickCore.h
+  echo       %RD_IMAGE_MAGICK%\Library\include\ImageMagick-7\MagickCore\MagickCore.h
   echo.
   echo     rdither needs ImageMagick 7 Q16-HDRI, the MSVC dll or static build.
   echo     build.  Download it from:
@@ -51,10 +65,15 @@ if not exist "%RD_IMAGE_MAGICK%\include\MagickCore\MagickCore.h" (
   echo         set IMAGEMAGICK_ROOT=C:\path\to\ImageMagick-7.x.x-Q16-HDRI
   echo         build.cmd
   echo.
+  echo     A conda or mamba prefix also works, and installs unattended:
+  echo         micromamba create -p C:\im -c conda-forge imagemagick=7.1.2_31
+  echo         set IMAGEMAGICK_ROOT=C:\im
+  echo         build.cmd
+  echo.
   set "RC=1"
   goto :done
 )
-echo   [ok] ImageMagick: %RD_IMAGE_MAGICK%
+echo   [ok] ImageMagick: %RD_IMAGE_MAGICK%  (%RD_IM_FLAVOUR% layout)
 
 REM --- Visual Studio --------------------------------------------------------
 REM vswhere ships with VS 2022 and is the reliable way to find the install.
@@ -219,9 +238,14 @@ echo   [ok] compiled
 REM --- run it ---------------------------------------------------------------
 call :step "Smoke test ^(build a palette and check it against ImageMagick^)"
 
+REM Under the conda layout the DLLs are NOT beside magick.exe's own root, and
+REM rdither.exe will not start unless Library\bin is on PATH -- there are 224
+REM dependent DLLs there, not one.  Prepending it is what makes the smoke test
+REM below a real test rather than a failure to load.
+if "%RD_IM_FLAVOUR%"=="conda" set "PATH=%RD_IM_BIN%;%PATH%"
 set "MAGICK_HOME=%RD_IMAGE_MAGICK%"
 if not exist "%TEMP%\rdither_smoke.png" (
-  "%RD_IMAGE_MAGICK%\magick.exe" -size 64x64 gradient:black-white "%TEMP%\rdither_smoke.png"
+  "%RD_IM_BIN%\magick.exe" -size 64x64 gradient:black-white "%TEMP%\rdither_smoke.png"
 )
 if not exist "%TEMP%\rdither_smoke.png" (
   echo   [FAIL] could not create a test image with magick.exe
@@ -260,6 +284,13 @@ echo   It needs MAGICK_HOME at run time, because the ImageMagick DLLs and the
 echo   format modules load from the install directory:
 echo.
 echo       set MAGICK_HOME=%RD_IMAGE_MAGICK%
+if "%RD_IM_FLAVOUR%"=="conda" (
+  echo.
+  echo   Conda layout: the DLLs are in Library\bin rather than beside
+echo   magick.exe, so PATH needs that directory too:
+  echo.
+  echo       set PATH=%RD_IM_BIN%;%%PATH%%
+)
 echo.
 echo   Quick check:
 echo       rdither.exe --list-dithers
