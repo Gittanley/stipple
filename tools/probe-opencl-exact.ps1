@@ -30,6 +30,9 @@ param(
   # STABLE and shared, unlike $Dir.  probe-determinism.ps1 reads the same fixtures
   # from here, which is why verify.ps1 says to run this probe once before it.
   [string]$FixtureDir = "",
+  # Make the shared fixtures and stop, without running the 54-cell comparison.  See the
+  # comment at the point where it takes effect.
+  [switch]$FixturesOnly,
   [int]$Cols = 2
 )
 
@@ -81,6 +84,31 @@ cmd /c "magick ""$FixtureDir\c_astuff.png"" -alpha set -channel A -evaluate set 
 # queue, and it also trips the greyscale detection path (ImageMagick reduces this
 # to graya, so the tree is built with a different child count again).
 cmd /c "magick -size 96x64 xc:none -fill ""rgba(200,40,120,0.35)"" -draw ""circle 48,32 48,10"" ""$FixtureDir\c_ashape.png""" 2>&1 | Out-Null
+
+# -FixturesOnly stops here, on purpose.
+#
+# probe-determinism.ps1 reads c_plasma and c_ashape from this directory, and
+# verify.ps1 used to merely PRINT an instruction to run this probe first -- which no
+# automated run does, so the image determinism probe skipped in CI and nobody noticed
+# because a skip is not a failure.  The fixtures need only `magick` and are made above,
+# before any engine work, so a caller that only wants them should not have to also run a
+# 54-cell cross-engine comparison whose result it did not ask for and whose exit code it
+# would then have to interpret.
+#
+# Generating them here rather than in a new script is the point: the definitions of these
+# fixtures live in exactly one place, and a second copy would drift.
+if ($FixturesOnly) {
+  $made = @('c_flat', 'c_ramp', 'c_plasma', 'c_noise', 'c_astuff', 'c_alpha50', 'c_ashape')
+  $missing = @($made | Where-Object { -not (Test-Path (Join-Path $FixtureDir "$_.png")) })
+  if ($missing.Count) {
+    # Asserted rather than assumed: a fixture that silently failed to generate leaves
+    # probe-determinism skipping for ever, which is the exact failure being fixed here.
+    Write-Host "could not generate: $($missing -join ', ') in $FixtureDir"
+    exit 1
+  }
+  "FIXTURE_DIR=$FixtureDir"
+  exit 0
+}
 
 function Pixels($path) {
   if (-not (Test-Path $path)) { return @() }

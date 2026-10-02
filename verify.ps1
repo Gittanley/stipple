@@ -142,13 +142,38 @@ if ($fail -gt 0) { exit 1 }
 # the determinism probe exits 2 ("cannot run"), and that is reported as skipped
 # rather than as a pass and not as a failure.  A check that cannot run and says so is
 # the difference between a missing fixture and a silent hole in the suite.
+# The image determinism probe reads c_plasma and c_ashape from a shared fixture
+# directory, and this used to PRINT an instruction to run tools\probe-opencl-exact.ps1
+# first.  No automated run reads instructions, so on every clean clone -- which is every
+# runner -- the probe skipped, and a skip is not a failure, so nothing went red and
+# nothing said so.  The same shape as the missing video fixtures: a check that cannot run
+# and does not say why is a hole wearing a pass's clothes.
+#
+# The fixtures are generated here, by the script that already defines them, rather than
+# by a new one -- two copies of a fixture definition would drift.  -FixturesOnly stops
+# before the 54-cell cross-engine comparison, which is not this suite's business and
+# whose exit code would then have to be interpreted here.
+$oclFx = ''
+$oclGen = Join-Path $PSScriptRoot 'tools\probe-opencl-exact.ps1'
+if (Test-Path $oclGen) {
+  $g = & pwsh -NoProfile -File $oclGen -FixturesOnly 2>&1 | Out-String
+  $gCode = $LASTEXITCODE
+  foreach ($line in ($g -split "`r?`n")) {
+    if ($line -match '^FIXTURE_DIR=(.+)$') { $oclFx = $Matches[1].Trim() }
+    elseif ($line.Trim()) { Write-Host "  $($line.TrimEnd())" }
+  }
+  if ($gCode -ne 0) { $oclFx = '' }
+}
+
 $det = Join-Path $PSScriptRoot 'tools\probe-determinism.ps1'
 if (Test-Path $det) {
   Write-Host ""
-  & pwsh -NoProfile -File $det -Rdither $Rdither
+  $detArgs = @('-Rdither', $Rdither)
+  if ($oclFx) { $detArgs += @('-FixtureDir', $oclFx) }
+  & pwsh -NoProfile -File $det @detArgs
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "determinism: SKIPPED (fixtures missing -- run tools\probe-opencl-exact.ps1)" -ForegroundColor Yellow }
+    2 { Write-Host "determinism: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
