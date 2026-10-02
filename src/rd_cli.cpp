@@ -102,12 +102,12 @@ void PrintUsage() {
       "Video (--video; decode, dither and encode run concurrently):\n"
       "  --video                ffmpeg pipeline instead of a single image\n"
       "  --palette-frames N     frames sampled for the palette.  Default 0, meaning\n"
-      "                         'as many as --palette-budget allows' -- a few\n"
+      "                         'as many as --palette-budget-ms allows' -- a few\n"
       "                         hundred on a 3-hour clip, because 30 evenly\n"
       "                         spaced points can all land in the dull stretches\n"
       "                         and miss the colour entirely.  Give N for exactly\n"
       "                         N samples; 30 reproduces the reference pipeline.\n"
-      "  --palette-budget MS    time budget for that sampling (default 60000).\n"
+      "  --palette-budget-ms MS  time budget for that sampling (default 60000).\n"
       "                         Measured 0.12 s per sample, 6 at a time, so a\n"
       "                         slow disk takes fewer samples rather than more\n"
       "                         time.  The reported mean saturation is the thing\n"
@@ -188,6 +188,51 @@ bool NeedsValue(int argc, int i, const char* flag) {
     std::fprintf(stderr, "error: %s requires a value\n", flag);
     return false;
   }
+  return true;
+}
+
+// Parses an integer option value, rejecting anything that is not entirely numeric.
+//
+// atoi() is the wrong tool here, and not because of overflow.  It returns 0 for
+// anything it cannot read, and several of these flags treat 0 as a MEANINGFUL
+// setting rather than as "unset":
+//
+//   --cpu-threads 0   means "GPU only"
+//   --queue-depth 0   a depth of one
+//
+// It also stops at the first non-digit, so a typo is accepted as the prefix.
+// Measured, before this existed:
+//
+//   --colors 3x        -> 3,   exit 0, silent
+//   --cpu-threads auto -> 0,   exit 0, silent, i.e. "GPU only" as a side effect
+//   --batch-frames 16x -> 16,  exit 0, silent
+//
+// So a mistyped number quietly becomes a different program.  `end` must land on the
+// NUL terminator, which rejects both "auto" and "3x" in one check, and the reported
+// text is the value the user actually typed rather than a guess.
+bool ParseIntArg(const char* raw, const char* flag, long* out) {
+  char* end = nullptr;
+  const long v = std::strtol(raw, &end, 10);
+  if (end == raw || end == nullptr || *end != '\0') {
+    std::fprintf(stderr, "error: %s wants an integer, got '%s'\n", flag, raw);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+// The same rule for the two floating-point options.  atof("abc") is 0.0, and 0.0 is
+// not a neutral default for either of these: --mem-fraction 0 means "use no RAM" and
+// --diffusion 0 means "no diffusion at all", so a typo would produce a program that
+// runs and quietly discards the effect the flag was for.
+bool ParseDoubleArg(const char* raw, const char* flag, double* out) {
+  char* end = nullptr;
+  const double v = std::strtod(raw, &end);
+  if (end == raw || end == nullptr || *end != '\0') {
+    std::fprintf(stderr, "error: %s wants a number, got '%s'\n", flag, raw);
+    return false;
+  }
+  *out = v;
   return true;
 }
 
@@ -688,7 +733,12 @@ int main(int argc, char** argv) {
       return 0;
     } else if (arg == "--colors") {
       if (!NeedsValue(argc, i, "--colors")) return 2;
-      opt.colors = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--colors", &parsed_v)) return 2;
+        ++i;
+        opt.colors = static_cast<decltype(opt.colors)>(parsed_v);
+      }
       if (opt.colors < 2 || opt.colors > rd::kMaxColormapSize) {
         std::fprintf(stderr, "error: --colors must be 2..%d\n",
                      rd::kMaxColormapSize);
@@ -715,14 +765,29 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--blocks") {
       if (!NeedsValue(argc, i, "--blocks")) return 2;
-      opt.blocks.block = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--blocks", &parsed_v)) return 2;
+        ++i;
+        opt.blocks.block = static_cast<decltype(opt.blocks.block)>(parsed_v);
+      }
     } else if (arg == "--approx-iters") {
       if (!NeedsValue(argc, i, "--approx-iters")) return 2;
-      opt.approx.iterations = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--approx-iters", &parsed_v)) return 2;
+        ++i;
+        opt.approx.iterations = static_cast<decltype(opt.approx.iterations)>(parsed_v);
+      }
       if (opt.approx.iterations < 1) opt.approx.iterations = 1;
     } else if (arg == "--approx-taps") {
       if (!NeedsValue(argc, i, "--approx-taps")) return 2;
-      opt.approx.taps = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--approx-taps", &parsed_v)) return 2;
+        ++i;
+        opt.approx.taps = static_cast<decltype(opt.approx.taps)>(parsed_v);
+      }
     } else if (arg == "--approx-fp64") {
       opt.approx.fp64 = true;
     } else if (arg == "--approx-linear") {
@@ -731,7 +796,12 @@ int main(int argc, char** argv) {
       opt.approx.use_tree = false;
     } else if (arg == "--diffusion") {
       if (!NeedsValue(argc, i, "--diffusion")) return 2;
-      opt.diffusion = std::atof(argv[++i]);
+      {
+        double parsed_d = 0.0;
+        if (!ParseDoubleArg(argv[i + 1], "--diffusion", &parsed_d)) return 2;
+        ++i;
+        opt.diffusion = parsed_d;
+      }
     } else if (arg == "--max-ram-mb") {
       if (!NeedsValue(argc, i, "--max-ram-mb")) return 2;
       std::size_t mb = 0;
@@ -750,7 +820,12 @@ int main(int argc, char** argv) {
       opt.max_vram_mb = mb;
     } else if (arg == "--frames") {
       if (!NeedsValue(argc, i, "--frames")) return 2;
-      opt.frames = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--frames", &parsed_v)) return 2;
+        ++i;
+        opt.frames = static_cast<decltype(opt.frames)>(parsed_v);
+      }
       if (opt.frames < 1) opt.frames = 1;
     } else if (arg == "--format") {
       if (!NeedsValue(argc, i, "--format")) return 2;
@@ -766,7 +841,12 @@ int main(int argc, char** argv) {
       opt.list_dithers = true;
     } else if (arg == "--palette-budget-ms") {
       if (!NeedsValue(argc, i, "--palette-budget-ms")) return 2;
-      opt.video_opt.palette_budget_ms = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--palette-budget-ms", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.palette_budget_ms = static_cast<decltype(opt.video_opt.palette_budget_ms)>(parsed_v);
+      }
       if (opt.video_opt.palette_budget_ms <= 0) {
         std::fprintf(stderr, "[video] --palette-budget-ms must be positive.\n");
         return 2;
@@ -782,16 +862,31 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--palette-tile") {
       if (!NeedsValue(argc, i, "--palette-tile")) return 2;
-      opt.video_opt.palette_tile = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--palette-tile", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.palette_tile = static_cast<decltype(opt.video_opt.palette_tile)>(parsed_v);
+      }
     } else if (arg == "--batch-frames") {
       if (!NeedsValue(argc, i, "--batch-frames")) return 2;
-      opt.video_opt.batch_frames = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--batch-frames", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.batch_frames = static_cast<decltype(opt.video_opt.batch_frames)>(parsed_v);
+      }
     } else if (arg == "--video-codec") {
       if (!NeedsValue(argc, i, "--video-codec")) return 2;
       opt.video_opt.codec = argv[++i];
     } else if (arg == "--crf") {
       if (!NeedsValue(argc, i, "--crf")) return 2;
-      opt.video_opt.crf = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--crf", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.crf = static_cast<decltype(opt.video_opt.crf)>(parsed_v);
+      }
     } else if (arg == "--preset") {
       if (!NeedsValue(argc, i, "--preset")) return 2;
       opt.video_opt.preset = argv[++i];
@@ -837,19 +932,44 @@ int main(int argc, char** argv) {
       opt.video_opt.audio = false;
     } else if (arg == "--reader-threads") {
       if (!NeedsValue(argc, i, "--reader-threads")) return 2;
-      opt.video_opt.reader_threads = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--reader-threads", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.reader_threads = static_cast<decltype(opt.video_opt.reader_threads)>(parsed_v);
+      }
     } else if (arg == "--decode-threads") {
       if (!NeedsValue(argc, i, "--decode-threads")) return 2;
-      opt.video_opt.decode_threads = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--decode-threads", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.decode_threads = static_cast<decltype(opt.video_opt.decode_threads)>(parsed_v);
+      }
     } else if (arg == "--encode-threads") {
       if (!NeedsValue(argc, i, "--encode-threads")) return 2;
-      opt.video_opt.encode_threads = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--encode-threads", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.encode_threads = static_cast<decltype(opt.video_opt.encode_threads)>(parsed_v);
+      }
     } else if (arg == "--queue-depth") {
       if (!NeedsValue(argc, i, "--queue-depth")) return 2;
-      opt.video_opt.queue_depth = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--queue-depth", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.queue_depth = static_cast<decltype(opt.video_opt.queue_depth)>(parsed_v);
+      }
     } else if (arg == "--gpu-workers") {
       if (!NeedsValue(argc, i, "--gpu-workers")) return 2;
-      opt.video_opt.gpu_workers = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--gpu-workers", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.gpu_workers = static_cast<decltype(opt.video_opt.gpu_workers)>(parsed_v);
+      }
     } else if (arg == "--gpu-float-out") {
       opt.video_opt.gpu_float_out = true;
     } else if (arg == "--video-preserve-vfr") {
@@ -872,7 +992,12 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--segment-frames") {
       if (!NeedsValue(argc, i, "--segment-frames")) return 2;
-      opt.video_opt.segment_frames = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--segment-frames", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.segment_frames = static_cast<decltype(opt.video_opt.segment_frames)>(parsed_v);
+      }
     } else if (arg == "--resume") {
       opt.video_opt.resume = true;
     } else if (arg == "--palette-export") {
@@ -892,21 +1017,46 @@ int main(int argc, char** argv) {
       opt.video_opt.palette_from = argv[++i];
     } else if (arg == "--palette-stage1-colors") {
       if (!NeedsValue(argc, i, "--palette-stage1-colors")) return 2;
-      opt.video_opt.palette_stage1_colors = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--palette-stage1-colors", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.palette_stage1_colors = static_cast<decltype(opt.video_opt.palette_stage1_colors)>(parsed_v);
+      }
     } else if (arg == "--palette-max-samples") {
       if (!NeedsValue(argc, i, "--palette-max-samples")) return 2;
-      opt.video_opt.palette_max_samples = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--palette-max-samples", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.palette_max_samples = static_cast<decltype(opt.video_opt.palette_max_samples)>(parsed_v);
+      }
     } else if (arg == "--palette-dedup") {
       if (!NeedsValue(argc, i, "--palette-dedup")) return 2;
-      opt.video_opt.palette_dedup = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--palette-dedup", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.palette_dedup = static_cast<decltype(opt.video_opt.palette_dedup)>(parsed_v);
+      }
     } else if (arg == "--palette-only") {
       opt.video_opt.palette_only = true;
     } else if (arg == "--host-grace-ms") {
       if (!NeedsValue(argc, i, "--host-grace-ms")) return 2;
-      opt.video_opt.host_grace_ms = std::atoi(argv[++i]);
+      {
+        long parsed_v = 0;
+        if (!ParseIntArg(argv[i + 1], "--host-grace-ms", &parsed_v)) return 2;
+        ++i;
+        opt.video_opt.host_grace_ms = static_cast<decltype(opt.video_opt.host_grace_ms)>(parsed_v);
+      }
     } else if (arg == "--mem-fraction") {
       if (!NeedsValue(argc, i, "--mem-fraction")) return 2;
-      opt.video_opt.mem_fraction = std::atof(argv[++i]);
+      {
+        double parsed_d = 0.0;
+        if (!ParseDoubleArg(argv[i + 1], "--mem-fraction", &parsed_d)) return 2;
+        ++i;
+        opt.video_opt.mem_fraction = parsed_d;
+      }
       rd::g_video_memory_fraction = opt.video_opt.mem_fraction;
     } else if (arg == "--video-pix-fmt") {
       if (!NeedsValue(argc, i, "--video-pix-fmt")) return 2;
