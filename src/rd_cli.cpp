@@ -1604,6 +1604,18 @@ int main(int argc, char** argv) {
   }
 
   // ---- write -------------------------------------------------------------
+  // Checked here rather than at parse time because the answer comes from ImageMagick,
+  // which is not started until the image is loaded.  Checked at all because an unknown
+  // coder name is not an error ImageMagick reports: SetImageInfo falls back to the
+  // output path's extension, so `--format BOGUS` used to exit 0 having quietly written
+  // a PNG.  A file that exists, is the wrong format, and reports success.
+  if (!rd::ImFormatKnown(opt.format, &error)) {
+    std::fprintf(stderr, "error: --format %s\n", error.c_str());
+    delete store;
+    rd::ImFree(&image);
+    rd::ImShutdown();
+    return 2;
+  }
   if (!rd::ImStore(image, *store, opt.output, opt.format, &error)) {
     std::fprintf(stderr, "error: %s\n", error.c_str());
     delete store;

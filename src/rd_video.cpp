@@ -3032,7 +3032,14 @@ bool VideoProcess(const std::string& in, const std::string& out,
     return false;
   }
   if (write_failed || encode_code != 0) {
-    *error = "ffmpeg encode failed";
+    // Name the codec that was asked for.  "ffmpeg encode failed" on its own sends the
+    // reader to ffmpeg, when the thing worth knowing is which of their own arguments
+    // ffmpeg rejected -- and an unknown encoder name is the usual reason, because
+    // ffmpeg reports it as a generic failure rather than as a bad argument.
+    *error = "ffmpeg encode failed (codec: " +
+             std::string(opt.lossless ? "ffv1" : opt.codec) +
+             ").  `ffmpeg -encoders` lists what this build supports; an unknown name "
+             "is reported by ffmpeg as a plain encode failure, not as a bad argument.";
     return false;
   }
 

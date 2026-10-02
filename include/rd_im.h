@@ -93,6 +93,11 @@ bool ImBuildPaletteAppend8(const RgbaF* pixels, std::size_t width,
                            std::size_t height, int colors, Palette* palette,
                            ColorTree* tree, std::string* error);
 
+// Is `format` a coder this build of ImageMagick has?  An empty format is valid and
+// means "no override": the output path's extension decides.  Asks ImageMagick rather
+// than carrying a list, so the answer tracks whatever is linked here.
+bool ImFormatKnown(const std::string& format, std::string* error);
+
 // Writes the dithered pixels back over a clone of the loaded image and encodes
 // it to `path`, using `format` when non-empty.
 bool ImStore(const LoadedImage& image, const PixelStore& store,

@@ -5,6 +5,7 @@
 #include <MagickCore/MagickCore.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -311,6 +312,42 @@ DiffResult CompareStores(const PixelStore& a, const PixelStore& b,
 // long comment copied five times is five comments that will drift apart.
 inline void ZeroQueuedRow(Quantum* q, std::size_t width, std::size_t channels) {
   std::memset(q, 0, channels * width * sizeof(Quantum));
+}
+
+// Is `format` a coder this build of ImageMagick actually has?
+//
+// `--format BOGUS` used to exit 0 and write a PNG: the name was carried into
+// SetImageInfo, which fell back to the output file's extension, so a typo silently
+// produced a different format than the one asked for.  That is the same class of fault
+// as the writer that inherited its coder from the input and wrote JPEG bytes into a .png
+// -- a file that exists, is the wrong format, and reports success.
+//
+// The check asks ImageMagick rather than carrying a hard-coded list, because a list
+// would be wrong twice over: it would go stale against whatever ImageMagick is linked
+// here, and it would reject formats this build supports.  An empty `format` means "no
+// override" and is always valid; the extension decides.
+bool ImFormatKnown(const std::string& format, std::string* error) {
+  if (format.empty()) return true;
+  // GetMagickInfo rather than a walk of GetMagickInfoList: this is a lookup by name,
+  // and the list variant wants a pattern plus an ExceptionInfo and hands back every
+  // match.  The uppercase retry is because coder names are canonically upper case
+  // ("PNG", "TIFF") and relying on the lookup being case-insensitive would be assuming
+  // something about a library that is not this code's to change.
+  ScopedException exc;
+  if (GetMagickInfo(format.c_str(), exc.get()) != nullptr) return true;
+  std::string upper(format);
+  for (char& c : upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (upper != format && GetMagickInfo(upper.c_str(), exc.get()) != nullptr) {
+    return true;
+  }
+  *error = "no ImageMagick coder named '" + format +
+           "'.  `magick -list format` lists what this build supports.  An unknown "
+           "name is not an error ImageMagick reports -- it falls back to the output "
+           "file's extension, which is how a typo produced a PNG when TIFF was asked "
+           "for.";
+  return false;
 }
 
 bool ImStore(const LoadedImage& loaded, const PixelStore& store,
