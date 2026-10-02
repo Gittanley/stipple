@@ -3029,3 +3029,228 @@ the scatter -- and this codebase's record is that two separate versions of that 
 passed 135/135 while being wrong in ways only a decoded A/B caught.  A bit-exactness
 claim that has not been verified end to end against ImageMagick is not a claim.  Written
 up in `docs/OPENCL.md`.
+
+---
+
+## Faults found by the suite, and by running two configurations at once
+
+These moved here from README.md, which is for people deciding whether to use the
+software.  They are kept together because each is a story about a fault and what it
+cost to find, and the pattern across them is worth more than any single entry:
+every one was silent, and every one was found by a check built to catch something
+else.
+
+### The same blind spot, twice more
+
+Two more faults were found by the same reasoning, recorded because the pattern recurs
+rather than because the bugs were interesting.
+
+**The writer wrote the wrong format.** `ImStore()` cloned the input image and inherited
+its coder, so dithering a JPEG to a path called `out.png` produced **JPEG bytes** — the
+file began `FF D8 FF` rather than `89 50 4E 47`. That is lossy re-compression of pixels
+which were already an exact 16-colour palette, so `--colors 16` gave a file with
+**93,377 distinct colours** where ImageMagick's own Riemersma output has 16. It is also
+why the example images above used to look poor: they were JPEG, compressed twice.
+
+Two things hid it. Every committed fixture was a **PNG**, and a PNG's clone already names
+the PNG coder, so no PNG input could reach the bug. And `--verify` compared the in-memory
+store rather than the file that was written, so it reported `AE=0` on the broken file.
+Both are closed: there is now a JPEG fixture in the suite, and `--verify` re-reads what it
+wrote and prints a second line:
+
+```
+verify     : AE=0/1297920 pixels, max channel delta=0, RMSE=0.00000000 -> BIT-EXACT
+verify file: AE=1016/4096 pixels, max channel delta=1, RMSE=0.00000547 -> BIT-EXACT (8-bit)
+```
+
+The second line is compared at 8-bit precision rather than exactly, because a Q16 codec
+round-trip can differ by 1 in 65535 from its own rounding. Requiring exactness there
+would fail every correct run and teach people to ignore the check; a genuine coder
+mix-up shows up as thousands of differing pixels, which is what this one did.
+
+**`--cpu-threads 0` crashed the video path, whatever the engine.** The README used to
+blame `--engine blocks` for this, which was wrong — `--engine cpu` crashed identically, and
+so did a 64x64 three-frame clip. It was never the engine or the size.
+
+`--cpu-threads 0` means "GPU only" (see `--help`). The float4 buffer that a host worker
+dithers from was allocated under this condition:
+
+```cpp
+float_path_ = !(opt.use_gpu && !opt.gpu_float_out) || opt.cpu_threads > 0;
+```
+
+`opt.use_gpu` is what the user **asked for**. Whether a GPU is actually present is resolved
+later, in `RunVideo`, and is not known when `Pipeline` is constructed. So on a `--no-cuda`
+build with `--cpu-threads 0` the request said "use the GPU", the whole expression evaluated
+false, and the buffer was never allocated — while `RunVideo`, having found no device,
+launched a host worker that dereferences exactly that buffer. Access violation,
+`0xC0000005`, after a stub container `ffprobe` calls malformed — 583 bytes for the 1080p
+clip, 577 for a three-frame one, the size tracking whatever the encoder flushed before
+it was killed mid-stream.
+
+The buffer is now always allocated. That costs one float4 buffer per queue slot when a GPU
+*is* present — already counted in the RAM budget — and the alternative is a crash whenever
+the request and the hardware disagree.
+
+Two smaller fixes came out of the same investigation:
+
+* `--cpu-threads 0` with no usable GPU is now **refused with an explanation** rather than
+  silently run on the host. Running it anyway would give "GPU only" an answer that quietly
+  is not bit-identical to a GPU's, which is the one thing that flag exists to guarantee.
+* The host-walk note used to end "For bit-exact output use `--cpu-threads 0`"
+  **unconditionally** — advice that crashed a GPU-less build. It now says so only when a
+  GPU is actually there.
+* `--cpu-threads` is parsed with `strtol` and validated. `atoi("auto")` is `0`, and `0` is a
+  *meaningful* value here, so `--cpu-threads auto` — which reads like the obvious way to ask
+  for the default — silently became "GPU only". Omitting the flag is how you get auto; now
+  a typo says so and exits 2. **All 21 numeric options are now validated the same way**, by
+  `ParseIntArg`/`ParseDoubleArg`, which reject trailing junk instead of stopping at it
+  (`--colors 3x` was `3`, `--batch-frames 16x` was `16`, `--queue-depth abc` was `0`).
+
+  Sweeping that class found one more site afterwards, and it is recorded because it shows
+  why a sweep has to be finished rather than believed finished: `--palette-frames` was
+  missed, and it was the **worst** instance of the shape. `0` is not a neutral value there,
+  it *means* "all", so `--palette-frames abc` did not compute something useless — it
+  silently asked to sample the entire clip. The remaining `atoi`/`atof` calls parse
+  **ffprobe's output**, not user input, so they are a different risk and are not counted
+  here.
+
+Verified against the committed build, which still crashes on the 1080p clip:
+
+| | committed | fixed |
+|---|---|---|
+| `--no-cuda`, 1080p clip | crash, 583 B | **60 frames, 9,304,502 B** |
+| `--no-cuda`, `--cpu-threads 0` | crash | clear error, exit 1 |
+| CUDA build, `--cpu-threads 0` | 60 frames in 2.77 s | unchanged |
+| suite, CUDA build | 150 passed | 150 passed, 0 failed |
+
+The suite still cannot catch this automatically, for the structural reason above:
+`tests\clip1920.mp4` is **not tracked** (it is a large local file), so the video check
+reports SKIPPED wherever a clean clone is used, which is everywhere automated.
+
+**The video path had no CI coverage at all, and the reason was not ffmpeg.** The hosted
+runners had no ffmpeg, so all three video probes skipped. CI installs one now, and with it
+present they skipped for the *next* reason instead — the runner log was explicit:
+
+```
+cannot run: no clip at tests\clip1920.mp4                      -> video
+cannot run: this test needs the blocks engine -- no CUDA device -> unvisited pixel
+cannot run: no video fixture (tests\clip1920_audio.mkv)         -> video determinism
+```
+
+So ffmpeg was necessary and not sufficient. The fixtures are large local files that are
+deliberately untracked, so they are now **generated** instead (`tools\make-video-fixtures.ps1`):
+a 320x180, 30-frame lavfi pair at 7 kB and 236 kB, built on demand and then *verified* —
+30 frames each, with the audio clip's stream deliberately the longer one so the `-shortest`
+shape is reproduced. Nothing binary enters the repository. The audio clip is only worth
+generating because the frame-accounting check needs one, and a silent fixture cannot catch
+a frame-deleting bug however many times it is rendered.
+
+Two engine gates also had to move, or the probes would still not run on a GPU-less runner:
+
+* `probe-unvisited-pixel` hardcoded `--engine blocks`, so it skipped entirely. It now
+  prefers `blocks` and falls back to `cpu`, and says on stdout that the GPU half of the
+  check is **not** covered. Measured: 9 of 9 geometries ok on a `--no-cuda` build.
+* Both video probes counted *any* nonzero exit as a failure. An engine with no device
+  exits nonzero **by design** — `rd_video.cpp` refuses rather than falling back, precisely
+  so `--engine opencl` cannot quietly end up measuring the other engine. So both now
+  capture stderr and report "no usable device" as SKIPPED. `probe-video-determinism` was
+  sending stderr to `$null`, which is why it could not tell the two apart.
+
+`probe-video-exact` still skips on CI, and honestly so: it compares `blocks` against
+`opencl`, and a runner with no GPU can produce neither.
+
+**What is given up, stated rather than glossed:** the generated fixtures are small, so a
+bug that only appears at 1920x1080 with 60 frames would not be caught by a 320x180,
+30-frame fixture. This narrows the blind spot; it does not close it.
+
+**A run that dithered nothing was reported as a success.** The same blind spot a third
+time. The encoder is opened before the first frame reaches it, so a run that produces
+nothing still closes it cleanly and ffmpeg still exits 0. `gpu_error` is empty and
+`encode_code` is 0 on that path, so neither check noticed, and the result was a container
+with no frames in it — measured at **572 bytes**, which ffprobe rejects as malformed
+(`Duplicate element`, `invalid as first byte of an EBML number`, `End of file`).
+
+Reproduced deterministically with `--segment-frames` over a truncated input whose header
+still claims 60 frames, so the last segment falls entirely past the surviving data:
+
+| | before | after |
+|---|---|---|
+| exit | **0** | **1** |
+| the empty segment | `572 bytes, checkpointed` | not written |
+| message | `frames : 32 in 2.27 s` — a success | `error: segment 3: no frames were dithered, but the input has 60` |
+
+The segmented path already had a guard for this — `error: segment N produced an empty
+file` — one branch over from the default non-segmented path, which had none. That is why
+it survived: the check existed, in the sibling branch. The off-by-one in that label is
+fixed too, so the error names the segment the banner named.
+
+`--palette-frames` was validated at the same time. It was the one site the numeric sweep
+missed, and the worst of the shape: `0` is not a neutral value there, it *means* "all", so
+`--palette-frames abc` silently asked to sample the entire clip.
+
+**`--engine blocks` ran on the host and said nothing.** The image path has always refused
+this — "no CUDA device" — and the video path lacked the refusal, so on a
+`-DRD_WITH_CUDA=OFF` build `--engine blocks` completed the whole job on the CPU with no
+diagnostic: 30 frames, a valid file, exit 0. A silent fallback is the problem, not the
+missing device, because it makes `--engine X` measure something other than X — which is
+precisely why `rd_video.cpp` already refused it for OpenCL. It now refuses here too, and
+the difference matters: `--engine cpu` and `--engine blocks` share one internal enum,
+because `--video` has always used the block-parallel engine, so the refusal is gated on
+whether a GPU engine was *named*. On a `--no-cuda` build:
+
+| | |
+|---|---|
+| `--engine blocks` | refuses, exit 1 |
+| `--engine cpu` | 30 frames, exit 0 |
+| no `--engine` (the default) | 30 frames, exit 0 |
+| `--engine blocks --no-gpu` | 30 frames, exit 0 |
+
+### The same bug twice: a CUDA allocator gating the OpenCL engine
+
+`--engine opencl` on the **video** path in a `-DRD_WITH_CUDA=OFF` build dithered **0 frames
+and reported no error** — exit 0, and a 572-byte container. Deterministic: every run, on
+both the small fixture and the 1080p clip, while a CUDA build on the same machine produced
+every frame. The same build dithers correctly on the *image* path and reports the device, so
+the engine was compiled in and a device was found.
+
+`CudaAllocPinned` is a **CUDA** function, and the video path chose its buffers on which
+*engine was requested* rather than on which *allocation succeeded*:
+
+```cpp
+if (use_gpu && !opt.gpu_float_out) {
+  b.in16_pin  = CudaAllocPinned(in_bytes);   // nullptr in a --no-cuda build
+  b.out16_pin = CudaAllocPinned(out_bytes);
+} else {
+  b.in16.resize(...);    // <-- only ever SIZED here
+  b.out16.resize(...);
+}
+```
+
+OpenCL works without CUDA, so `use_gpu` is true, the pinned branch is taken, and it yields
+nothing. `in()` and `out()` already fell back to the pageable vectors, but those were only
+ever sized in the `else`, so the fallback pointed the engine at an empty buffer. It read
+nothing, wrote nothing, and reported success, because the engine's contract is that an empty
+error string means the dither ran.
+
+That contract is why this failed silently, and it is the second instance of one mistake; the
+first is the `--cpu-threads 0` access violation above. There a buffer was allocated on the
+**requested** engine rather than the **resolved** one; here buffers were sized on the
+**requested branch** rather than the one actually taken. Both are allocation decisions made
+from what was asked for instead of what turned out to be true.
+
+The fix conditions on the allocation rather than the request. Verified three ways, comparing
+decoded pixels rather than container bytes — lossless video still carries per-run metadata,
+so file hashes differ while the images are identical. All three decode to 5,184,000 bytes
+with the same SHA-256:
+
+| | frames | decoded pixels |
+|---|---|---|
+| CUDA build, `--engine opencl` | 30 | `16A6B7E2…` |
+| `-DRD_WITH_CUDA=OFF`, `--engine opencl` | 30 | `16A6B7E2…` |
+| CUDA build, `--engine blocks` | 30 | `16A6B7E2…` |
+
+**CI cannot catch this class.** It needs a machine with an OpenCL device *and* a
+`--no-cuda` build, and the hosted runners have neither. To check it yourself, build both
+configurations on one machine that has a GPU and compare decoded pixels;
+`tools\probe-opencl.exe` reports what a build can actually run.
