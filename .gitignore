@@ -27,6 +27,22 @@ out/
 /FFmpeg-master/
 /OpenCL-SDK-*/
 
+# claimlint.py is somebody else's tool, kept in the working tree and NOT tracked.
+# It arrived from outside this repository's history, it is not part of the build or
+# the suite, and nothing in .github\workflows\ci.yml invokes it.  Tracking it would
+# put a 33 kB script of unknown provenance into this project's history and imply the
+# project depends on it, which it does not.
+#
+# .cache/ is that tool's name index: 9.5 MB of derived data rebuilt from the tree on
+# demand, which is exactly what a cache is for and exactly what should not be committed.
+#
+# .claimlint-baseline.json would be the record of findings accepted as benign, so that
+# exit 0 keeps meaning "nothing new" on a later run.  It does not exist yet because no
+# baseline has been accepted; if one is, it belongs here too.
+claimlint.py
+/.cache/
+/.claimlint-baseline.json
+
 # Probe binaries.  tools\probe_swscale_matrix.cpp is tracked; its .exe is not,
 # because a 220 KB binary in a source tree is the kind of thing that gets
 # committed by accident and then conflicts on every branch.  Rebuild it from
