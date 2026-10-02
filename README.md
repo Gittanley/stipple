@@ -834,13 +834,12 @@ is not evidence.
 These are current, not history. Fixed faults are not listed here; they are in
 [docs/DESIGN.md](docs/DESIGN.md) with the reasoning, and in the commit history.
 
-**`--no-gpu` video is not reproducible run to run.** A quarter of runs produce a
-different result from the rest, measured over 24 runs of one command. That is a real
-race or uninitialised read in the host pipeline, and it is not localised. The suite
-reports it rather than failing, so the rest of the sweep stays usable while it is open.
-Note that the suite samples 8 runs per case, which detects this roughly 13% of the
-time, so the case is reported as `ok` on most runs. The known-defect note is the
-reliable signal, not the absence of a failure.
+**`--no-gpu` video is not reproducible run to run.** On the default input path 11 of 24
+identical runs produced a different result, so it is close to a coin flip rather than a
+rare event. That is a real race or uninitialised read in the host pipeline, and it is not
+localised. The suite reports it rather than failing, so the rest of the sweep stays usable
+while it is open, and it says "no divergence observed" rather than "deterministic" —
+8 runs that agree is an observation, not a proof.
 
 **Intel and AMD iGPUs are untested.** No hardware was available, so no claim is made
 either way. `tools\probe-opencl.exe` is the check.

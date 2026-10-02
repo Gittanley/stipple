@@ -45,6 +45,18 @@
 
 param(
   [string]$Clip = "",
+  # 8 stays.  It looked like 8 was too few, and the measurement says otherwise for the
+  # path this probe actually samples.
+  #
+  # On the default yuv444p input the `cpu` case diverges on 11 of 24 runs -- a rate of
+  # 0.458 -- so an 8-run sample misses it with probability 0.542^7, about 1.4%.  The
+  # suite detects this reliably at 8, and raising it to 24 measured 21 s against 62 s
+  # for a gain from 98.6% to 99.9%.  Not worth 3x the time.
+  #
+  # The confusion worth recording: on --input-mode rgba64 the same case diverges on
+  # only 6 of 24 runs, a rate of 0.25, where 8 runs miss it 13% of the time.  Both
+  # figures are real and they are for different paths.  The rgba64 number is the one
+  # that made this look urgent, and it is the one this probe never takes.
   [int]$Runs = 8,
   [int]$Colors = 16,
   [string]$Rdither = "",
@@ -298,7 +310,12 @@ foreach ($c in $cases) {
   } else {
     $n = ($counts.Keys)[0]
     $mb = [math]::Round((($hashes.GetEnumerator())[0].Value) / 1MB, 1)
-    "  $tag  ok    1 pixel set ($mb MB decoded), $n frames, $Runs runs"
+    # "no divergence in N samples", not "deterministic".  A run of identical results
+    # shows that nothing diverged while it was watched; it is not a proof, and the
+    # wording should not read as one.  The number is on the line so the reader can
+    # judge the sample rather than take the verdict on trust.
+    "  $tag  ok    1 pixel set over $Runs runs ($mb MB decoded, $n frames) -- no " +
+      "divergence observed"
   }
 }
 
