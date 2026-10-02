@@ -105,6 +105,20 @@ struct VideoOptions {
   // reports an error instead of silently decoding something else.
   enum class GpuEngine { kBlocks, kOpenCL };
   GpuEngine gpu_engine = GpuEngine::kBlocks;
+  // Whether the user NAMED a GPU engine, as opposed to leaving the default.
+  //
+  // GpuEngine cannot answer that on its own: `--engine cpu` and `--engine blocks` both
+  // map to kBlocks, because --video has always used the block-parallel engine and
+  // rejecting the default would break a plain `--video in out`.  So the two are
+  // indistinguishable downstream unless it is recorded here.
+  //
+  // It matters because the two want opposite behaviour when there is no CUDA device.
+  // `--engine blocks` asked for the GPU, so running on the host is a silent fallback
+  // and is refused.  `--engine cpu` -- and an unspecified engine, which defaults to it
+  // -- asked for the host, so running on the host is the whole request.  Without this
+  // field the refusal meant for the first also fired on the second, which broke every
+  // plain --video run on a build with no CUDA.
+  bool gpu_engine_named = false;
   // Variable frame rate.  The DEFAULT behaviour is already correct on duration and
   // A/V sync: the source's frame timings are measured, and a variable-rate source is
   // re-emitted at its true average rather than at r_frame_rate (which is the

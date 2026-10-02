@@ -1204,6 +1204,12 @@ int main(int argc, char** argv) {
       return 2;
     } else {
       opt.video_opt.gpu_engine = rd::VideoOptions::GpuEngine::kBlocks;
+      // `cpu` and `blocks` both land here, because --video has always used the
+      // block-parallel engine.  Only the second one is a request for a GPU, and
+      // VideoProcess refuses rather than falling back to the host when there is no
+      // CUDA device -- so the distinction has to be carried across, or the refusal
+      // meant for `--engine blocks` also breaks the default `--video`.
+      opt.video_opt.gpu_engine_named = (opt.engine == rd::Engine::kBlocks);
     }
     if (opt.input.empty() || opt.output.empty()) {
       std::fprintf(stderr, "error: --video needs <input> <output>\n");

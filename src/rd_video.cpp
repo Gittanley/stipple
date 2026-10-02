@@ -2388,6 +2388,35 @@ bool VideoProcess(const std::string& in, const std::string& out,
                    why.c_str());
       return false;
     }
+    // The same refusal the IMAGE path already makes at rd_cli.cpp ("--engine %s
+    // requested but no CUDA device"), which the video path was simply missing.
+    //
+    // Measured on a -DRD_WITH_CUDA=OFF build: `--engine blocks` on video ran the whole
+    // job on the host with no diagnostic at all -- 30 frames, a valid file, exit 0 --
+    // so a probe case named `cuda` was quietly measuring the host while printing as a
+    // cuda result.  That is what turned a CI run red, and the awkward part was that
+    // the suite had ALREADY decided how to report the non-determinism of that host
+    // path as a KNOWN DEFECT: the same bug was counted once as a failure and once as
+    // excused, from the same code path, because one route into it was named `cpu` and
+    // the other was named `cuda`.
+    //
+    // A silent fallback is the thing being refused, not the absence of a device: it
+    // makes `--engine X` measure something other than X, which is the same reason the
+    // OpenCL branch above refuses rather than falling back to CUDA.
+    //
+    // gpu_engine_named is what keeps this off the default path.  `--engine cpu` and an
+    // unspecified engine both mean the host here -- --video has always used the
+    // block-parallel engine -- so refusing those would break a plain `--video in out`
+    // on any build without CUDA.  The first version of this guard did exactly that,
+    // which is why the field exists.
+    if (opt.gpu_engine_named) {
+      std::fprintf(stderr,
+                   "error: --engine blocks requested for video but no CUDA device\n"
+                   "       refusing rather than running on the host: a silent fallback\n"
+                   "       makes --engine X measure something other than X.  Use\n"
+                   "       --engine cpu, or --no-gpu, for the host path.\n");
+      return false;
+    }
   }
   // Independent GPU workers, each with its own device state.  Measured as no
   // faster than one (see the note on the option), so one is the default; the pool

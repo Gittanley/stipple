@@ -253,8 +253,11 @@ foreach ($c in $cases) {
     # and once excused, which is how this was found: the run went red on a defect the
     # suite had already decided how to report.
     #
-    # rdither's own pipeline line says which happened (`gpu=yes x1` / `gpu=no`), so
-    # this is read from the run rather than guessed from the build's configuration.
+    # rdither now REFUSES that fallback rather than making it, so the refusal message
+    # above normally catches this case first.  This check is kept as a backstop rather
+    # than deleted along with the symptom: it reads what the run actually did
+    # (`gpu=yes x1` / `gpu=no`) instead of trusting a flag, so it still holds if a
+    # silent fallback ever reappears somewhere else.
     if ($c.name -eq 'cuda' -and $text -match 'gpu=no') {
       $unavailable = 'no CUDA device, and --engine blocks fell back to the host, so ' +
                      'this case did not test the engine it is named for'

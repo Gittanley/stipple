@@ -971,6 +971,33 @@ fixed too, so the error names the segment the banner named.
 missed, and the worst of the shape: `0` is not a neutral value there, it *means* "all", so
 `--palette-frames abc` silently asked to sample the entire clip.
 
+**`--engine blocks` ran on the host and said nothing.** The image path has always refused
+this — "no CUDA device" — and the video path simply lacked the refusal, so on a
+`-DRD_WITH_CUDA=OFF` build `--engine blocks` completed the whole job on the CPU with no
+diagnostic: 30 frames, a valid file, exit 0. A silent fallback is the problem, not the
+missing device, because it makes `--engine X` measure something other than X — which is
+precisely why `rd_video.cpp` already refused it for OpenCL.
+
+It was found by CI going red, and the way it went red is the interesting part. A probe case
+*named* `cuda` had been quietly measuring the host while printing as a cuda result, and
+then failed — for exactly the non-determinism the suite had **already** classified as a
+KNOWN DEFECT on the `cpu` case. The same bug, counted once as a failure and once as
+excused, from the same code path.
+
+Getting the guard right needed one new field. `--engine cpu` and `--engine blocks` both
+map to the same internal enum, because `--video` has always used the block-parallel engine
+and rejecting the default would break a plain `--video in out`. The first version of the
+guard could not tell them apart and so fired on both, which broke every default video run
+on a build with no GPU — caught by testing all four invocations rather than the one the
+change was about:
+
+| on a `--no-cuda` build | |
+|---|---|
+| `--engine blocks` | refuses, exit 1 |
+| `--engine cpu` | 30 frames, exit 0 |
+| no `--engine` (the default) | 30 frames, exit 0 |
+| `--engine blocks --no-gpu` | 30 frames, exit 0 |
+
 ### What is still broken, and not fixed here
 
 **The OpenCL video path is broken in a `--no-cuda` build.** This was first written down as
