@@ -109,6 +109,19 @@ jobs:
         # tools/install-imagemagick.ps1 itself.  The script asserts the prefix is
         # buildable rather than trusting that "exit 0" means usable.
         run: pwsh -NoProfile -File .\tools\install-imagemagick.ps1 -Prefix C:\im
+      - name: Install ffmpeg
+        shell: pwsh
+        # The hosted runners have NO ffmpeg, so every video check in verify.ps1
+        # reported SKIPPED.  That is not a cosmetic gap: the video path is where the
+        # --cpu-threads 0 access violation lived, and nothing in CI could have seen it
+        # because the code was never reached.
+        #
+        # A pinned portable build rather than an installer, for the same reason
+        # ImageMagick uses one here: an installer that can prompt is an installer that
+        # eventually hangs a job.  Verified locally before being pushed: exit 0, and the
+        # script asserts ffmpeg and ffprobe both run and that the libx264 and ffv1
+        # encoders the pipeline asks for by name are present.
+        run: pwsh -NoProfile -File .\tools\install-ffmpeg.ps1 -Prefix C:\ffmpeg
       - name: Report the toolchain actually used
         shell: pwsh
         run: |
@@ -193,6 +206,19 @@ jobs:
         # tools/install-imagemagick.ps1 itself.  The script asserts the prefix is
         # buildable rather than trusting that "exit 0" means usable.
         run: pwsh -NoProfile -File .\tools\install-imagemagick.ps1 -Prefix C:\im
+      - name: Install ffmpeg
+        shell: pwsh
+        # The hosted runners have NO ffmpeg, so every video check in verify.ps1
+        # reported SKIPPED.  That is not a cosmetic gap: the video path is where the
+        # --cpu-threads 0 access violation lived, and nothing in CI could have seen it
+        # because the code was never reached.
+        #
+        # A pinned portable build rather than an installer, for the same reason
+        # ImageMagick uses one here: an installer that can prompt is an installer that
+        # eventually hangs a job.  Verified locally before being pushed: exit 0, and the
+        # script asserts ffmpeg and ffprobe both run and that the libx264 and ffv1
+        # encoders the pipeline asks for by name are present.
+        run: pwsh -NoProfile -File .\tools\install-ffmpeg.ps1 -Prefix C:\ffmpeg
       - name: Install the CUDA toolkit
         shell: pwsh
         # The hosted runners have MSBuild and the VS C++ workload but NOT nvcc, and

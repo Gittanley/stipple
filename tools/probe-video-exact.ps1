@@ -86,6 +86,7 @@ $paths = @(
 
 $fail = 0
 $compared = 0
+$skipped = 0
 foreach ($p in $paths) {
   if ($null -eq $p.yuv) { Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue }
   else { $env:RD_YUV444_OUT = $p.yuv }
@@ -110,6 +111,23 @@ foreach ($p in $paths) {
     $fps = if ($text -match 'frames\s+:\s+(\d+) in [\d.]+ s \(([\d.]+) fps\)') {
       "  $($Matches[1]) frames, $($Matches[2]) fps"
     } else { "" }
+    # An engine that ran ZERO frames has not run.  `--engine opencl` on a machine
+    # with no OpenCL device exits 0 and leaves the "ran ok" line without a frame
+    # count, because the engine reports itself unavailable and the pipeline hands
+    # the work to the host workers rather than refusing.  Counting that as a run
+    # made this probe fail on every GPU-less machine -- including CI, which has no
+    # GPU -- with a misleading "decode FAILED (is ImageMagick on PATH?)" pointing at
+    # the wrong thing entirely.
+    #
+    # The fix is to require frames, and to say which engine is absent rather than
+    # treating it as a defect.  An absent engine is a SKIP, matching what the image
+    # suite already does and reports as SKIPPED rather than passed.
+    if ($text -notmatch 'frames\s+:\s+([1-9]\d*)\s+in') {
+      $skipped++
+      "  $eng  SKIPPED (no frames: this build has no usable $eng device)"
+      $ran = @($ran | Where-Object { $_ -ne $eng })
+      continue
+    }
     "  $eng  ran ok$fps"
   }
   if ($ran.Count -ne 2) { ''; continue }
@@ -152,10 +170,15 @@ Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue
 
 if ($fail -gt 0) { "`n$fail check(s) failed."; exit 1 }
 if ($compared -eq 0) {
-  "`ncannot run: no data path produced two comparable engines."
+  # Exit 2 is the "cannot run" convention used across this suite, distinct from a
+  # pass and from a failure.  An absent engine is a skip, never a pass.
+  "`ncannot run: no data path produced two comparable engines. ($skipped engine run(s) skipped for want of a device)"
   exit 2
 }
 "$compared of $($paths.Count) data paths identical."
+if ($skipped -gt 0) {
+  "$skipped engine run(s) SKIPPED for want of a device.  These are not passes."
+}
 
 # FRAME ACCOUNTING, on the clip that carries audio.  This is the check that would
 # have caught the -shortest bug, and it is separate from the hash comparison above

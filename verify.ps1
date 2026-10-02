@@ -166,7 +166,12 @@ if (Test-Path $vid) {
   & pwsh -NoProfile -File $vid
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "video: SKIPPED (no tests\clip1920.mp4)" -ForegroundColor Yellow }
+    # Not "no tests\clip1920.mp4".  The probe exits 2 for three different reasons --
+    # no clip, no ffmpeg, or no pair of engines that both produced frames -- and it
+    # prints which one above.  Naming the clip here regardless meant that once the
+    # probe learned to skip an engine for want of a device, this line went on
+    # reporting a missing file that was present, pointing at the wrong thing.
+    2 { Write-Host "video: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
