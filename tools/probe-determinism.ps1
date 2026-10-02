@@ -42,7 +42,13 @@ param(
   # These are inputs, generated once and only read here, so sharing them is correct and
   # is what verify.ps1's "run probe-opencl-exact.ps1 first" instruction relies on.
   [string]$FixtureDir = "",
-  [int]$Runs = 12
+  [int]$Runs = 12,
+  # Which rdither to test.  verify.ps1 passes its own -Rdither through; before this
+  # parameter existed the probe hardcoded build\Release\rdither.exe, so pointing the
+  # suite at any other build silently tested a DIFFERENT BINARY than the rest of the
+  # suite.  A harness that quietly ignores the binary under test is worse than no
+  # harness, because the tally it prints is then about something else.
+  [string]$Rdither = ""
 )
 
 # Per-run OUTPUT directory, unique per process.  This used to be one fixed name shared
@@ -56,7 +62,8 @@ $Dir = Join-Path $env:TEMP ('rddet_' + [Guid]::NewGuid().ToString('N').Substring
 # notice aborts the sweep before it starts.  Failure is detected from exit codes
 # and from the decoded hash count, which are the things that actually mean failure.
 $ErrorActionPreference = 'Continue'
-$rd = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Release\rdither.exe'
+if (-not $Rdither) { $Rdither = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Release\rdither.exe' }
+$rd = $Rdither
 if (-not (Test-Path $rd)) { "missing $rd -- build first"; exit 1 }
 if (-not (Test-Path $FixtureDir)) { New-Item -ItemType Directory -Force -Path $FixtureDir | Out-Null }
 # BOTH directories are created here.  Creating only $FixtureDir -- which is what an

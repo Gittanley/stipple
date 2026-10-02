@@ -910,10 +910,9 @@ The suite still cannot catch this automatically, for the structural reason above
 `tests\clip1920.mp4` is **not tracked** (it is a large local file), so the video check
 reports SKIPPED wherever a clean clone is used, which is everywhere automated.
 
-**The video path is still untested in CI, and installing ffmpeg did not change that.**
-The hosted runners had no ffmpeg, so all three video probes skipped; CI now installs one.
-With it present they skip for the *next* reason instead, and the runner log is explicit
-about all three:
+**The video path had no CI coverage at all, and the reason was not ffmpeg.** The hosted
+runners had no ffmpeg, so all three video probes skipped. CI installs one now, and with it
+present they skipped for the *next* reason instead — the runner log was explicit:
 
 ```
 cannot run: no clip at tests\clip1920.mp4                      -> video
@@ -921,11 +920,31 @@ cannot run: this test needs the blocks engine -- no CUDA device -> unvisited pix
 cannot run: no video fixture (tests\clip1920_audio.mkv)         -> video determinism
 ```
 
-So ffmpeg was necessary and not sufficient. Closing this properly means either committing
-a small generated clip (a 320x180, 25-frame lavfi render is about 150 kB) or letting the
-probes generate their fixtures, which two of the three already can. Until one of those
-lands, the crash this section describes could not have been caught automatically, and the
-next one will not be either.
+So ffmpeg was necessary and not sufficient. The fixtures are large local files that are
+deliberately untracked, so they are now **generated** instead (`tools\make-video-fixtures.ps1`):
+a 320x180, 30-frame lavfi pair at 7 kB and 236 kB, built on demand and then *verified* —
+30 frames each, with the audio clip's stream deliberately the longer one so the `-shortest`
+shape is reproduced. Nothing binary enters the repository. The audio clip is only worth
+generating because the frame-accounting check needs one, and a silent fixture cannot catch
+a frame-deleting bug however many times it is rendered.
+
+Two engine gates also had to move, or the probes would still not run on a GPU-less runner:
+
+* `probe-unvisited-pixel` hardcoded `--engine blocks`, so it skipped entirely. It now
+  prefers `blocks` and falls back to `cpu`, and says on stdout that the GPU half of the
+  check is **not** covered. Measured: 9 of 9 geometries ok on a `--no-cuda` build.
+* Both video probes counted *any* nonzero exit as a failure. An engine with no device
+  exits nonzero **by design** — `rd_video.cpp` refuses rather than falling back, precisely
+  so `--engine opencl` cannot quietly end up measuring the other engine. So both now
+  capture stderr and report "no usable device" as SKIPPED. `probe-video-determinism` was
+  sending stderr to `$null`, which is why it could not tell the two apart.
+
+`probe-video-exact` still skips on CI, and honestly so: it compares `blocks` against
+`opencl`, and a runner with no GPU can produce neither.
+
+**What is given up, stated rather than glossed:** the generated fixtures are small, so a
+bug that only appears at 1920x1080 with 60 frames would not be caught by a 320x180,
+30-frame fixture. This narrows the blind spot; it does not close it.
 
 **A run that dithered nothing was reported as a success.** The same blind spot a third
 time. The encoder is opened before the first frame reaches it, so a run that produces
@@ -954,21 +973,32 @@ missed, and the worst of the shape: `0` is not a neutral value there, it *means*
 
 ### What is still broken, and not fixed here
 
-**The OpenCL video path intermittently dithers zero frames with no error.** On this
-machine `--engine opencl` reports the device correctly on the *image* path (the colormap
-matches ImageMagick exactly). On the *video* path it sometimes writes 572 bytes and reports
-nothing dithered, and sometimes runs all 60 frames and matches `--engine blocks`
-bit-for-bit — from identical source, on the same machine, with no reboot in between. So
-this is intermittent, not a broken code path: a race or a device-state problem, not a
-deterministic fault. The new guard turns the silent answer into a loud failure, which is
-strictly better and is all that was done: **the cause is not found.**
+**The OpenCL video path is broken in a `--no-cuda` build.** This was first written down as
+intermittent, which was wrong, and the correction matters more than the bug. Measured
+interleaved, same machine, same driver, same inputs:
 
-An earlier attempt at the cause — retrying the ICD enumeration, on the theory that a cold
-loader answers "no platform" exactly once — was written, measured, and then **reverted**,
-because the comparison that appeared to justify it turned out to be invalid: the "before"
+| build | 320x180 fixture | tests\clip1920.mp4 |
+|---|---|---|
+| CUDA | **30 frames** | **60 frames** |
+| `-DRD_WITH_CUDA=OFF` | 0 frames | 0 frames |
+
+Not flaky: every run of the no-CUDA build produced 0 frames, and every run of the CUDA
+build produced all of them. The same build dithers correctly on the *image* path and
+reports the device (`NVIDIA ... GTX 1650 SUPER (OpenCL 3.0 CUDA)`), so the engine is
+compiled in and a device is found -- it is the video path that then does nothing and
+**reports no error**, which is what the new guard converts into a loud failure. The cause
+is not localised. One hypothesis was tested and disproved: it is not reader starvation
+from `--cpu-threads` being forced to 0 when a GPU is selected (`--cpu-threads 1`, `2` and
+`4` all still gave 0 frames, with the worker count correctly set).
+
+An earlier attempt at a cause — retrying the ICD enumeration — was written, measured, and
+**reverted**, because the comparison that appeared to justify it was invalid: the "before"
 binary had been built with OpenCL compiled out, so it was refusing for a different reason
-entirely. It is cheaper to record that than to ship a retry justified by a broken
-experiment. The hypothesis is untested, not disproved.
+entirely. Cheaper to record that than to ship a retry justified by a broken experiment.
+
+Note what this means for CI: the hosted runners have no GPU, so OpenCL is *unavailable*
+there rather than broken, and the probe skips it. The defect is found by running a
+no-CUDA build on a machine that happens to have an OpenCL device.
 
 ---
 

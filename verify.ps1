@@ -145,7 +145,7 @@ if ($fail -gt 0) { exit 1 }
 $det = Join-Path $PSScriptRoot 'tools\probe-determinism.ps1'
 if (Test-Path $det) {
   Write-Host ""
-  & pwsh -NoProfile -File $det
+  & pwsh -NoProfile -File $det -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
     2 { Write-Host "determinism: SKIPPED (fixtures missing -- run tools\probe-opencl-exact.ps1)" -ForegroundColor Yellow }
@@ -160,10 +160,52 @@ if (Test-Path $det) {
 # than run by default -- but it is wired in, because a check nothing invokes is a
 # check that rots.  Exit 2 from the probe means "cannot run" (no clip), and that is
 # reported as skipped, never as a pass and never as a failure.
+# Fixtures for the two clip-taking probes.  tests\clip1920.mp4 and
+# tests\clip1920_audio.mkv are large local files that are deliberately untracked, so
+# every clean clone -- which is every automated run -- reported the video checks as
+# SKIPPED.  Installing ffmpeg did not change that; it only moved the reason.  With
+# ffmpeg present the runner said "no clip at tests\clip1920.mp4" instead of "ffmpeg not
+# found", and the video path still had no coverage at all.
+#
+# So when the real fixtures are absent, GENERATE small ones rather than skipping.
+# Nothing binary enters the repository, and the checks still assert what they assert:
+# cross-engine bit identity, run-to-run determinism, and no frame lost to -shortest.
+# What is given up is SIZE, and that is a real loss: a bug that only appears at
+# 1920x1080 with 60 frames would not be caught by a 320x180, 30-frame fixture.  This
+# narrows the blind spot; it does not close it, and saying so is cheaper than letting
+# someone assume the video path is now fully covered.
+$genClip = ''
+$genAudio = ''
+$needFixtures = -not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920.mp4')) -or
+                -not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920_audio.mkv'))
+if ($needFixtures) {
+  $mk = Join-Path $PSScriptRoot 'tools\make-video-fixtures.ps1'
+  if (Test-Path $mk) {
+    Write-Host ""
+    $fx = & pwsh -NoProfile -File $mk 2>&1 | Out-String
+    $fxCode = $LASTEXITCODE
+    foreach ($line in ($fx -split "`r?`n")) {
+      if ($line -match '^(CLIP|CLIP_AUDIO)=(.+)$') {
+        if ($Matches[1] -eq 'CLIP') { $genClip = $Matches[2].Trim() } else { $genAudio = $Matches[2].Trim() }
+      } elseif ($line.Trim()) { Write-Host "  $($line.TrimEnd())" }
+    }
+    if ($fxCode -ne 0) {
+      # Not fatal.  The probes keep their own defaults, hit the missing clip, and exit
+      # 2, which is reported as SKIPPED -- the same honest outcome as before, and the
+      # message above has already said why.
+      $genClip = ''
+      $genAudio = ''
+    }
+  }
+}
+
 $vid = Join-Path $PSScriptRoot 'tools\probe-video-exact.ps1'
 if (Test-Path $vid) {
   Write-Host ""
-  & pwsh -NoProfile -File $vid
+  $vidArgs = @('-Rdither', $Rdither)
+  if ($genClip) { $vidArgs += @('-Clip', $genClip) }
+  if ($genAudio) { $vidArgs += @('-AudioClip', $genAudio) }
+  & pwsh -NoProfile -File $vid @vidArgs
   switch ($LASTEXITCODE) {
     0 { }
     # Not "no tests\clip1920.mp4".  The probe exits 2 for three different reasons --
@@ -185,7 +227,7 @@ if (Test-Path $vid) {
 $unv = Join-Path $PSScriptRoot 'tools\probe-unvisited-pixel.ps1'
 if (Test-Path $unv) {
   Write-Host ""
-  & pwsh -NoProfile -File $unv
+  & pwsh -NoProfile -File $unv -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
     2 { Write-Host "unvisited pixel: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
@@ -203,10 +245,12 @@ if (Test-Path $unv) {
 $vdet = Join-Path $PSScriptRoot 'tools\probe-video-determinism.ps1'
 if (Test-Path $vdet) {
   Write-Host ""
-  & pwsh -NoProfile -File $vdet
+  $vdetArgs = @('-Rdither', $Rdither)
+  if ($genAudio) { $vdetArgs += @('-Clip', $genAudio) }
+  & pwsh -NoProfile -File $vdet @vdetArgs
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "video determinism: SKIPPED (no tests\clip1920_audio.mkv)" -ForegroundColor Yellow }
+    2 { Write-Host "video determinism: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }

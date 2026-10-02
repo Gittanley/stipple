@@ -127,6 +127,23 @@ function Get-FrameCount([string]$mkv) {
 $cases = @(
   @{ name = 'cuda';    args = @('--engine', 'blocks') },
   @{ name = 'opencl';  args = @('--engine', 'opencl', '--input-mode', 'yuv444'); env = $true },
+  # Left as '--engine blocks --no-gpu' on purpose, after trying '--engine cpu' here
+  # and measuring what that did.  It looked like a cleanup: --no-gpu asks for the CUDA
+  # blocks engine and then declines to use a GPU, which is a strange way to say "host".
+  # But two things came out of the experiment:
+  #
+  #  * --engine blocks FALLS BACK TO THE HOST when there is no CUDA device -- measured,
+  #    on a -DRD_WITH_CUDA=OFF build -- so this case was never blocked by the missing
+  #    engine in the first place.  The change was not what let it run.
+  #  * This case is the one carrying the known host-path non-determinism, and the
+  #    KNOWN DEFECT reporting is keyed to the case NAME at line ~207.  Renaming the
+  #    engine silently moved that defect out of "reported, not failed" and into a hard
+  #    failure -- and --engine cpu is deterministic, so the case that failed was a
+  #    different code path than the one being reported on.
+  #
+  # So it stays.  The real gap is that `--engine blocks` falling back to the host with
+  # no diagnostic is its own defect: rd_video.cpp refuses exactly that fallback for
+  # OpenCL, because a silent fallback makes --engine X quietly measure something else.
   @{ name = 'cpu';     args = @('--engine', 'blocks', '--no-gpu') }
 )
 
@@ -135,6 +152,7 @@ $cases = @(
 "clip: $Clip"
 ''
 $fail = 0
+$skipped = 0
 $total = 0
 
 foreach ($c in $cases) {
@@ -206,14 +224,28 @@ foreach ($c in $cases) {
   $hashes = @{}
   $counts = @{}
   $bad = 0
+  $unavailable = ''
   for ($i = 1; $i -le $Runs; $i++) {
     $out = Join-Path $tmp "det_$($c.name)_$i.mkv"
     # Delete first: a crashed run leaves a stale file, and a stale file hashes fine,
     # so a failing engine would report as a stable one -- the precise opposite.
     Remove-Item -EA SilentlyContinue $out
-    & $Rdither --video @($c.args) --colors $Colors --video-lossless --no-audio `
-                $Clip $out 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $out)) { $bad++; continue }
+    # stderr is CAPTURED, not sent to $null.  It used to be discarded, which is exactly
+    # why an engine with no device could not be told from a crashed one: both arrived
+    # as "nonzero exit", and both counted as failures.  On a runner with no GPU -- which
+    # is every runner CI has -- `--engine opencl` refuses BY DESIGN, so this probe would
+    # have failed there rather than skipping.
+    $text = & $Rdither --video @($c.args) --colors $Colors --video-lossless --no-audio `
+              $Clip $out 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+    if ($text -match 'requested for video but' -or
+        $text -match 'this build has no (OpenCL|CUDA)' -or
+        $text -match 'no CUDA device') {
+      $unavailable = (($text -split "`r?`n" | Where-Object { $_ -match 'error:' } |
+                       Select-Object -First 1) -replace '.*error:\s*', '').Trim()
+      break
+    }
+    if ($rc -ne 0 -or -not (Test-Path $out)) { $bad++; continue }
     $d = Get-DecodedHash $out
     if ($null -eq $d) { $bad++; continue }
     $hashes[$d.hash] = $d.bytes
@@ -223,6 +255,11 @@ foreach ($c in $cases) {
   Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue
 
   $tag = "{0,-8}" -f $c.name
+  if ($unavailable) {
+    $skipped++
+    "  $tag SKIPPED (no usable device: $unavailable)"
+    continue
+  }
   $verdict = $null
   if ($bad -gt 0) {
     $verdict = @($bad, $Runs, "FAIL", "runs produced no output")
@@ -272,5 +309,11 @@ if ($fail -eq 0) {
   }
   exit 0
 }
-"{0} of {1} cases FAILED." -f ($total - $fail), $total
+# "2 of 3 cases FAILED" was printed when 2 of 3 cases PASSED: the count was
+# ($total - $fail) under a label that said FAILED.  It has been misread at least twice
+# in this session, once by me while checking whether the OpenCL fault was a real
+# failure, and it would be misread by anyone skimming a green run.  A tally that
+# mislabels its own direction is worse than no tally.
+if ($fail -eq 0) { "all {0} cases deterministic." -f $total } else { "{0} of {1} cases FAILED." -f $fail, $total }
+if ($skipped -gt 0) { "{0} case(s) SKIPPED for want of a device.  These are not passes." -f $skipped }
 exit 1

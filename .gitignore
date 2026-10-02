@@ -1,5 +1,11 @@
 # Build output
 build/
+# Side-by-side build trees, e.g. build-nocuda/ for the --no-cuda configuration that
+# CI's first job uses.  This existed and was NOT covered by the rule above, so a
+# `git add -A` would have committed a whole second build tree.  The suffix form is
+# deliberate: `build/` alone is what let that happen.
+build-*/
+build*/
 out/
 *.obj
 *.pdb

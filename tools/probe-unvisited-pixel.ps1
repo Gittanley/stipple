@@ -105,10 +105,22 @@ if (-not (Test-Path $availPng)) {
   exit 2
 }
 . "$PSScriptRoot\rd-engine-probe.ps1"
-$avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('blocks') -Fixture $availPng
-if ($avail['blocks']) {
-  Write-Host "cannot run: this test needs the blocks engine -- $($avail['blocks'])"
+$avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('blocks', 'cpu') -Fixture $availPng
+# blocks is preferred, because the fault this probe was written for was a cudaMalloc
+# with no fill.  But refusing to run without it meant this probe reported SKIPPED on
+# every automated run -- the hosted runners have no GPU -- so the video path had no
+# coverage at all.  What remains on the host engine is still the comparison that
+# caught the original bug: output against SOURCE, across nine geometries, including
+# the three that DO have an unvisited pixel.  The reduced scope is stated on stdout
+# rather than being discovered later by reading a tally.
+if ($avail['blocks']) { $engine = 'cpu' } else { $engine = 'blocks' }
+if ($avail[$engine]) {
+  Write-Host "cannot run: no usable engine -- $($avail[$engine])"
   exit 2
+}
+if ($engine -eq 'cpu') {
+  Write-Host ("engine     : cpu -- no usable blocks device, so the GPU half of this" +
+              " check is NOT covered.  Comparing output against SOURCE still is.")
 }
 
 # Read one pixel as planar YUV444.
@@ -165,7 +177,7 @@ foreach ($g in $Geometries) {
   $log = Join-Path $tmp "log_$g.txt"
   # Not $args: that is an automatic variable, and shadowing it works right up
   # until something reads it.
-  $rargs = @('--video','--engine','blocks','--video-lossless','--colors',"$Colors",$clip,$dith)
+  $rargs = @('--video','--engine',$engine,'--video-lossless','--colors',"$Colors",$clip,$dith)
   $rp = Start-Process -FilePath $Rdither -ArgumentList $rargs -NoNewWindow -PassThru -Wait `
           -RedirectStandardError $log -RedirectStandardOutput ($log + '.out')
   $text = (Get-Content $log -Raw -ErrorAction SilentlyContinue)

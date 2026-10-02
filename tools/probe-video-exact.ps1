@@ -39,12 +39,17 @@ param(
   # one it deletes video frames to make the tracks match.  Measured: a 30 s excerpt
   # with 895 video frames against 30.0128 s of audio came out with 892.  A silent
   # fixture cannot catch that however many times it is rendered.
-  [string]$AudioClip = ""
+  [string]$AudioClip = "",
+  # Which rdither to test.  verify.ps1 passes its own -Rdither through.  This probe
+  # had no such parameter and hardcoded build\Release\rdither.exe, so pointing the
+  # suite at another build tested a different binary here than everywhere else.
+  [string]$Rdither = ""
 )
 
 $ErrorActionPreference = 'Continue'
 $root = Split-Path $PSScriptRoot -Parent
-$rd = Join-Path $root 'build\Release\rdither.exe'
+if (-not $Rdither) { $Rdither = Join-Path $root 'build\Release\rdither.exe' }
+$rd = $Rdither
 if (-not (Test-Path $rd)) { "missing $rd -- build first"; exit 1 }
 
 if (-not $Clip) { $Clip = Join-Path $root 'tests\clip1920.mp4' }
@@ -101,10 +106,27 @@ foreach ($p in $paths) {
                    --video-lossless --no-audio $Clip $out 2>&1 | Out-String
     $rc = $LASTEXITCODE
     if ($rc -ne 0 -or -not (Test-Path $out)) {
-      $fail++
-      "  $eng  FAILED to run (exit $rc)"
-      ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3) |
-        ForEach-Object { "        $($_)" }
+      # An engine with no device is NOT a failure.  `--engine opencl` on a machine
+      # with no usable OpenCL exits nonzero BY DESIGN: rd_video.cpp refuses rather
+      # than falling back to CUDA, so that `--engine opencl` cannot quietly end up
+      # measuring the other engine.  This probe used to call that a failure, and the
+      # only reason that was quiet is that the same run used to exit 0 having written
+      # nothing at all.  Now that a run which dithers no frames is a hard error, the
+      # two cases have to be told apart or the suite fails on every GPU-less runner --
+      # which is every runner CI has.
+      $why = (($text -split "`n" | Where-Object { $_ -match 'error:' } |
+               Select-Object -First 1) -replace '.*error:\s*', '').Trim()
+      if ($text -match 'requested for video but' -or
+          $text -match 'this build has no (OpenCL|CUDA)' -or
+          $text -match 'no CUDA device') {
+        $skipped++
+        "  $eng  SKIPPED (no usable device: $why)"
+      } else {
+        $fail++
+        "  $eng  FAILED to run (exit $rc)"
+        ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3) |
+          ForEach-Object { "        $($_)" }
+      }
       continue
     }
     $ran += $eng
