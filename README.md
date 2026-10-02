@@ -885,8 +885,17 @@ Two smaller fixes came out of the same investigation:
 * `--cpu-threads` is parsed with `strtol` and validated. `atoi("auto")` is `0`, and `0` is a
   *meaningful* value here, so `--cpu-threads auto` — which reads like the obvious way to ask
   for the default — silently became "GPU only". Omitting the flag is how you get auto; now
-  a typo says so and exits 2. **The other 19 `atoi` call sites have the same shape and are
-  not yet audited.**
+  a typo says so and exits 2. **All 21 numeric options are now validated the same way**, by
+  `ParseIntArg`/`ParseDoubleArg`, which reject trailing junk instead of stopping at it
+  (`--colors 3x` was `3`, `--batch-frames 16x` was `16`, `--queue-depth abc` was `0`).
+
+  Sweeping that class found one more site afterwards, and it is recorded because it shows
+  why a sweep has to be finished rather than believed finished: `--palette-frames` was
+  missed, and it was the **worst** instance of the shape. `0` is not a neutral value there,
+  it *means* "all", so `--palette-frames abc` did not compute something useless — it
+  silently asked to sample the entire clip. The remaining `atoi`/`atof` calls parse
+  **ffprobe's output**, not user input, so they are a different risk and are not counted
+  here.
 
 Verified against the committed build, which still crashes on the 1080p clip:
 
@@ -900,6 +909,66 @@ Verified against the committed build, which still crashes on the 1080p clip:
 The suite still cannot catch this automatically, for the structural reason above:
 `tests\clip1920.mp4` is **not tracked** (it is a large local file), so the video check
 reports SKIPPED wherever a clean clone is used, which is everywhere automated.
+
+**The video path is still untested in CI, and installing ffmpeg did not change that.**
+The hosted runners had no ffmpeg, so all three video probes skipped; CI now installs one.
+With it present they skip for the *next* reason instead, and the runner log is explicit
+about all three:
+
+```
+cannot run: no clip at tests\clip1920.mp4                      -> video
+cannot run: this test needs the blocks engine -- no CUDA device -> unvisited pixel
+cannot run: no video fixture (tests\clip1920_audio.mkv)         -> video determinism
+```
+
+So ffmpeg was necessary and not sufficient. Closing this properly means either committing
+a small generated clip (a 320x180, 25-frame lavfi render is about 150 kB) or letting the
+probes generate their fixtures, which two of the three already can. Until one of those
+lands, the crash this section describes could not have been caught automatically, and the
+next one will not be either.
+
+**A run that dithered nothing was reported as a success.** The same blind spot a third
+time. The encoder is opened before the first frame reaches it, so a run that produces
+nothing still closes it cleanly and ffmpeg still exits 0. `gpu_error` is empty and
+`encode_code` is 0 on that path, so neither check noticed, and the result was a container
+with no frames in it — measured at **572 bytes**, which ffprobe rejects as malformed
+(`Duplicate element`, `invalid as first byte of an EBML number`, `End of file`).
+
+Reproduced deterministically with `--segment-frames` over a truncated input whose header
+still claims 60 frames, so the last segment falls entirely past the surviving data:
+
+| | before | after |
+|---|---|---|
+| exit | **0** | **1** |
+| the empty segment | `572 bytes, checkpointed` | not written |
+| message | `frames : 32 in 2.27 s` — a success | `error: segment 3: no frames were dithered, but the input has 60` |
+
+The segmented path already had a guard for this — `error: segment N produced an empty
+file` — one branch over from the default non-segmented path, which had none. That is why
+it survived: the check existed, in the sibling branch. The off-by-one in that label is
+fixed too, so the error names the segment the banner named.
+
+`--palette-frames` was validated at the same time. It was the one site the numeric sweep
+missed, and the worst of the shape: `0` is not a neutral value there, it *means* "all", so
+`--palette-frames abc` silently asked to sample the entire clip.
+
+### What is still broken, and not fixed here
+
+**The OpenCL video path intermittently dithers zero frames with no error.** On this
+machine `--engine opencl` reports the device correctly on the *image* path (the colormap
+matches ImageMagick exactly). On the *video* path it sometimes writes 572 bytes and reports
+nothing dithered, and sometimes runs all 60 frames and matches `--engine blocks`
+bit-for-bit — from identical source, on the same machine, with no reboot in between. So
+this is intermittent, not a broken code path: a race or a device-state problem, not a
+deterministic fault. The new guard turns the silent answer into a loud failure, which is
+strictly better and is all that was done: **the cause is not found.**
+
+An earlier attempt at the cause — retrying the ICD enumeration, on the theory that a cold
+loader answers "no platform" exactly once — was written, measured, and then **reverted**,
+because the comparison that appeared to justify it turned out to be invalid: the "before"
+binary had been built with OpenCL compiled out, so it was refusing for a different reason
+entirely. It is cheaper to record that than to ship a retry justified by a broken
+experiment. The hypothesis is untested, not disproved.
 
 ---
 

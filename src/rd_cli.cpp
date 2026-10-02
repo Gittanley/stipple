@@ -614,7 +614,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
                 static_cast<long long>(first + want - 1), seg_path.c_str());
     if (!rd::VideoProcess(in_path, seg_path, opt, info, *palette, *tree,
                           &seg_result, &error)) {
-      std::fprintf(stderr, "error: segment %d: %s\n", seg, error.c_str());
+      std::fprintf(stderr, "error: segment %d: %s\n", seg + 1, error.c_str());
       failed = true;
       break;
     }
@@ -625,7 +625,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     }
     const std::uint64_t bytes = rd::FileSize(seg_path);
     if (bytes == 0) {
-      std::fprintf(stderr, "error: segment %d produced an empty file\n", seg);
+      std::fprintf(stderr, "error: segment %d produced an empty file\n", seg + 1);
       failed = true;
       break;
     }
@@ -858,7 +858,14 @@ int main(int argc, char** argv) {
       if ((value == "all") || (value == "ALL")) {
         opt.video_opt.palette_frames = 0;
       } else {
-        opt.video_opt.palette_frames = std::atoi(value.c_str());
+        // atoi() here was a site the numeric-validation sweep missed, and it was the
+        // worst instance of the class: 0 is not a neutral value for this option, it is
+        // "all", so `--palette-frames abc` did not compute something useless -- it
+        // silently asked for every frame, which for a long clip means sampling the
+        // whole thing instead of a handful.
+        long parsed_v = 0;
+        if (!ParseIntArg(value.c_str(), "--palette-frames", &parsed_v)) return 2;
+        opt.video_opt.palette_frames = static_cast<decltype(opt.video_opt.palette_frames)>(parsed_v);
       }
     } else if (arg == "--palette-tile") {
       if (!NeedsValue(argc, i, "--palette-tile")) return 2;

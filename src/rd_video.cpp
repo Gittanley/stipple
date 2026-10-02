@@ -2982,6 +2982,40 @@ bool VideoProcess(const std::string& in, const std::string& out,
     return false;
   }
 
+  // Zero frames dithered is not a success, and nothing above noticed.
+  //
+  // The encoder is opened before the first frame reaches it, so a run that
+  // dithered nothing still closes it cleanly and ffmpeg still exits 0.  The
+  // result is a container with no frames in it: measured at 572 bytes, which
+  // ffprobe rejects as malformed ("Duplicate element", "invalid as first byte of
+  // an EBML number", "End of file").  So this returned true, rdither printed
+  // "frames     : 0 in ..." and exited 0 -- a file on disk, no diagnostic, and
+  // nothing playable in it.  gpu_error is empty and encode_code is 0 on that
+  // path, which is why neither of the two checks above caught it.
+  //
+  // An input that genuinely has no frames is a different thing and gets its own
+  // message, because "the clip is empty" is the user's situation to fix and
+  // "the dither produced nothing from a clip that has frames" is ours.
+  if (frames_dithered == 0) {
+    if (info.frames > 0) {
+      *error = "no frames were dithered, but the input has " +
+               std::to_string(static_cast<long long>(info.frames)) +
+               " -- the encoder was closed cleanly, so the output holds no "
+               "frames.  This is a fault, not an empty clip.";
+    } else {
+      // NOT "the input has no decodable frames".  That was measured to be wrong:
+      // ffprobe reports 0 for a Matroska whose frame count it cannot determine,
+      // and in the case that reached here the palette stage had already sampled a
+      // frame from the very same input.  So the count being 0 says nothing about
+      // the input, and blaming it sends the reader looking in the wrong place.
+      *error = "no frames were dithered, and ffprobe reported 0 frames for the "
+               "input, so this is NOT an empty clip -- the palette stage read "
+               "frames from it.  Something selected but never ran; check the "
+               "engine line above.";
+    }
+    return false;
+  }
+
   if (result != nullptr) {
     result->frames = frames_dithered;
     result->dither_ms = dither_ms;
