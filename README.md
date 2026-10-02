@@ -998,34 +998,78 @@ change was about:
 | no `--engine` (the default) | 30 frames, exit 0 |
 | `--engine blocks --no-gpu` | 30 frames, exit 0 |
 
+### The same bug twice: a CUDA allocator gating the OpenCL engine
+
+`--engine opencl` on the **video** path in a `-DRD_WITH_CUDA=OFF` build dithered **0 frames
+and reported no error** — exit 0, and a 572-byte container. Not flaky: every run, on both
+the small fixture and the 1080p clip, while a CUDA build on the same machine produced every
+frame. The same build dithers correctly on the *image* path and reports the device, so the
+engine was compiled in and a device was found.
+
+It was the second instance of one mistake. `CudaAllocPinned` is a **CUDA** function, and the
+video path chose its buffers on which *engine was requested* rather than on which
+*allocation succeeded*:
+
+```cpp
+if (use_gpu && !opt.gpu_float_out) {
+  b.in16_pin  = CudaAllocPinned(in_bytes);   // nullptr in a --no-cuda build
+  b.out16_pin = CudaAllocPinned(out_bytes);
+} else {
+  b.in16.resize(...);    // <-- only ever SIZED here
+  b.out16.resize(...);
+}
+```
+
+OpenCL works perfectly well without CUDA, so `use_gpu` is true, the pinned branch is taken,
+and it yields nothing. `in()` and `out()` already fell back to the pageable vectors — the
+right design, plainly written for this case — but those vectors were only ever sized in the
+`else`, so the fallback handed the engine an **empty** buffer. It read nothing, wrote
+nothing, and reported success, because the engine's contract is "an empty string means it
+ran".
+
+That contract is why this was silent rather than loud, and it is the same shape as the
+`--cpu-threads 0` access violation above: there the buffer was allocated on the *requested*
+engine instead of the *resolved* one, here it was sized on the *requested branch* instead of
+the one actually taken. Two faults, one pattern, found a day apart.
+
+The fix conditions on the allocation rather than the request. Verified three ways, all
+decoding to identical 5,184,000 bytes of pixels — the no-CUDA build's OpenCL now agrees
+exactly with a CUDA build's OpenCL *and* with the CUDA blocks engine:
+
+| | frames | decoded pixels |
+|---|---|---|
+| CUDA build, `--engine opencl` | 30 | `16A6B7E2…` |
+| `-DRD_WITH_CUDA=OFF`, `--engine opencl` | 30 | `16A6B7E2…` |
+| CUDA build, `--engine blocks` | 30 | `16A6B7E2…` |
+
+**This class cannot be caught by CI.** It needs a machine with an OpenCL device *and* a
+`--no-cuda` build, and the hosted runners have neither. It was found by building both
+configurations on one GPU machine, which is why the local `--no-cuda` tree is kept rather
+than assumed equivalent. `tools\probe-opencl.exe` is the check for such hardware.
+
+Two false leads are recorded because they cost the most time. It was first written down as
+*intermittent*, which was wrong — it is deterministic, and the confusion came from comparing
+a **stale** CUDA binary against a fresh no-CUDA one. An ICD-enumeration retry was written,
+measured and **reverted**, because the "before" binary had OpenCL compiled out and was
+refusing for an unrelated reason; shipping a retry justified by a broken experiment would
+have been worse than shipping nothing. `--cpu-threads 1/2/4` and every `--batch-frames`
+value from 1 to 16 were tested and eliminated — the first as a reader-starvation theory, the
+second as a multi-frame-batch theory. Both were reasonable. Neither was the cause.
+
 ### What is still broken, and not fixed here
 
-**The OpenCL video path is broken in a `--no-cuda` build.** This was first written down as
-intermittent, which was wrong, and the correction matters more than the bug. Measured
-interleaved, same machine, same driver, same inputs:
+**`--no-gpu` video is not reproducible run to run.** Distinct decoded pixel sets across
+repeated identical runs — a genuine race or uninitialised read in the host pipeline, not
+localised. The suite reports it as a KNOWN DEFECT rather than failing it, so the rest of the
+sweep stays usable while it is open, and it is not suppressed: it is named in every run.
 
-| build | 320x180 fixture | tests\clip1920.mp4 |
-|---|---|---|
-| CUDA | **30 frames** | **60 frames** |
-| `-DRD_WITH_CUDA=OFF` | 0 frames | 0 frames |
+**String-valued options accept junk.** `--format`, `--video-codec`, `--dither`,
+`--palette-export` and `--palette-import` take any string and fail later inside
+ImageMagick, with a worse message than rdither could have given. Every numeric option was
+validated; these were not.
 
-Not flaky: every run of the no-CUDA build produced 0 frames, and every run of the CUDA
-build produced all of them. The same build dithers correctly on the *image* path and
-reports the device (`NVIDIA ... GTX 1650 SUPER (OpenCL 3.0 CUDA)`), so the engine is
-compiled in and a device is found -- it is the video path that then does nothing and
-**reports no error**, which is what the new guard converts into a loud failure. The cause
-is not localised. One hypothesis was tested and disproved: it is not reader starvation
-from `--cpu-threads` being forced to 0 when a GPU is selected (`--cpu-threads 1`, `2` and
-`4` all still gave 0 frames, with the worker count correctly set).
-
-An earlier attempt at a cause — retrying the ICD enumeration — was written, measured, and
-**reverted**, because the comparison that appeared to justify it was invalid: the "before"
-binary had been built with OpenCL compiled out, so it was refusing for a different reason
-entirely. Cheaper to record that than to ship a retry justified by a broken experiment.
-
-Note what this means for CI: the hosted runners have no GPU, so OpenCL is *unavailable*
-there rather than broken, and the probe skips it. The defect is found by running a
-no-CUDA build on a machine that happens to have an OpenCL device.
+**Intel and AMD iGPUs are untested.** No hardware was available, so no claim is made either
+way. `tools\probe-opencl.exe` is the check.
 
 ---
 

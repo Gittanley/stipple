@@ -2527,6 +2527,31 @@ bool VideoProcess(const std::string& in, const std::string& out,
           static_cast<std::size_t>(batch) * out_frame_bytes;
       b.in16_pin = static_cast<std::uint16_t*>(CudaAllocPinned(in_bytes));
       b.out16_pin = static_cast<std::uint16_t*>(CudaAllocPinned(out_bytes));
+      // CudaAllocPinned is a CUDA function.  In a --no-cuda build it returns nullptr,
+      // and the OpenCL engine is perfectly usable there -- so this branch is taken and
+      // then yields nothing at all.
+      //
+      // in() and out() already fall back to the pageable vectors when the pinned
+      // pointers are null, which is the right design and was clearly meant for exactly
+      // this case.  But those vectors were only ever SIZED in the else branch below, so
+      // the fallback handed the engine an EMPTY vector: nothing to read from, nowhere
+      // to write to.  The engine then did nothing, reported success, and the run
+      // finished with 0 frames, exit 0, and a 572-byte container.  That is the whole
+      // OpenCL-on-video fault in a --no-cuda build, and it survived because the failure
+      // is silent rather than loud.
+      //
+      // So size them whenever the pinned allocation did not happen.  The condition is
+      // on whether the allocation SUCCEEDED, not on which engine was requested -- which
+      // is the same mistake as the float_path_ crash in c5efb68, one layer down: there
+      // the buffer was allocated on the requested engine rather than the resolved one,
+      // here it is sized on the requested branch rather than the one that was taken.
+      if (b.in16_pin == nullptr) {
+        b.in16.resize(static_cast<std::size_t>(batch) * pixels *
+                      static_cast<std::size_t>(dec_channels));
+      }
+      if (b.out16_pin == nullptr) {
+        b.out16.resize(static_cast<std::size_t>(batch) * pixels * 4);
+      }
     } else {
       b.in16.resize(static_cast<std::size_t>(batch) * pixels *
                     static_cast<std::size_t>(dec_channels));
