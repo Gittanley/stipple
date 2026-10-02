@@ -245,6 +245,21 @@ foreach ($c in $cases) {
                        Select-Object -First 1) -replace '.*error:\s*', '').Trim()
       break
     }
+    # A case named for an engine must not report a result for an engine it did not
+    # use.  `--engine blocks` on a build with no CUDA device FALLS BACK TO THE HOST
+    # with no diagnostic, so on the CI runner the case named `cuda` was quietly
+    # measuring the host -- and then failing for exactly the reason the `cpu` case is
+    # already reported as a KNOWN DEFECT.  The same bug, counted twice, once failed
+    # and once excused, which is how this was found: the run went red on a defect the
+    # suite had already decided how to report.
+    #
+    # rdither's own pipeline line says which happened (`gpu=yes x1` / `gpu=no`), so
+    # this is read from the run rather than guessed from the build's configuration.
+    if ($c.name -eq 'cuda' -and $text -match 'gpu=no') {
+      $unavailable = 'no CUDA device, and --engine blocks fell back to the host, so ' +
+                     'this case did not test the engine it is named for'
+      break
+    }
     if ($rc -ne 0 -or -not (Test-Path $out)) { $bad++; continue }
     $d = Get-DecodedHash $out
     if ($null -eq $d) { $bad++; continue }
