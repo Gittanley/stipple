@@ -3530,3 +3530,69 @@ none: Matroska embeds a random SegmentUID and a writing timestamp, so files can 
 compared byte for byte, and a pixel golden would need regenerating whenever the palette
 or the walk changed, which is a fixture that rots quietly and then gets "updated" without
 review.
+
+### The void-and-cluster anomaly, measured properly and still not explained
+
+The README carried a sentence that had been there long enough to be treated as settled:
+the 64x64 and 32x32 void-and-cluster outputs "differ by only ~32 pixels in half a
+million, which is less than a tile-size change should produce and is not yet explained".
+That is a real anomaly worth chasing rather than repeating, so here is what measuring it
+actually shows.
+
+Reproduced on `tests\noisy.png`, 512x384, 16 colours, comparing decoded rgb24 byte for
+byte. (Not `magick compare -metric AE`, which prints a normalised fraction and cost this
+project a full afternoon once already -- see the note in probe-video-determinism.ps1.)
+
+| | differing pixels |
+|---|---|
+| `--diffusion 0` | **0** of 196,608 |
+| `--diffusion 1` | 144 (0.073%) |
+| `--diffusion 2` | 144 |
+| `--diffusion 8` | 144 |
+
+The zero at diffusion 0 is the load-bearing measurement. `--diffusion` reaches exactly
+one place in the ordered path -- `scaled = 0.5 + (t - 0.5) * diffusion`, feeding
+`OrderedPick` -- and at 0 it collapses the threshold to a constant, which makes both
+filters plain nearest-colour. They then agree perfectly. So the entire disagreement lives
+in the threshold decision and nowhere else: not the palette, not the search, not the
+write-back.
+
+The invariance across 1, 2 and 8 is the strange part, and it is not an artefact of the
+measurement: each filter's own output hash does change with diffusion (verified
+separately), so those were four genuinely different renders. Scaling both thresholds
+about 0.5 widens the gap between them by the scale factor, which should sweep in more
+pixels each time. It does not, and the same 144 positions differ every time.
+
+Mapping those positions back through the tiling:
+
+  * all 144 lie on a 32-tile seam; **none** is strictly interior;
+  * they are the image positions of exactly **3 cells of the 64x64 matrix** --
+    (32,0), (0,32) and (32,32);
+  * all three of those correspond to **(0,0) in the 32x32 grid**.
+
+So as far as the decision function can reveal it, the two rank fields agree at 4093 of
+4096 positions, and the entire disagreement is one cell of the 32x32 grid against the
+four quadrant origins of the 64x64 one.
+
+What is NOT the cause, having been checked rather than assumed:
+
+  * not a shared table. `VoidCluster32Table()` and `VoidCluster64Table()` are two
+    separate function-local statics, each building its own size, and the comment above
+    them explains exactly why the choice must sit outside the function. There is no path
+    by which one returns the other's data;
+  * not a stub. The build costs differ 9.4x (492 ms against 52 ms on this input),
+    consistent with n^4 work at two different n, so both matrices are really built;
+  * not a stale binary. Both renders came from one build, and the four diffusion runs
+    were each re-rendered to distinct filenames after the first measurement loop proved
+    unable to tell them apart.
+
+Why two independently computed blue-noise rank fields agree that closely is not
+established. It is not a defect in the product's promise -- these are dither *choices*,
+documented as bit-exact with nothing and not trying to be -- but it does mean
+`void-and-cluster-fast` is 9x cheaper for an output that is 99.93% the same, which is
+either a bug or a documentation problem, and I cannot yet say which.
+
+The next step, if anyone wants it, is to dump both rank fields directly and diff them,
+which a fixture that exposes the raw matrix would allow; the obstacle noted in the
+README stands, because with a 2-colour palette the two distances are equal exactly at the
+midpoint and the pattern cannot appear in the output at all.
