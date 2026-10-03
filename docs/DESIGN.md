@@ -3254,3 +3254,94 @@ with the same SHA-256:
 `--no-cuda` build, and the hosted runners have neither. To check it yourself, build both
 configurations on one machine that has a GPU and compare decoded pixels;
 `tools\probe-opencl.exe` reports what a build can actually run.
+
+### The host video path wrote frames in completion order
+
+The `--no-gpu` path was not reproducible run to run, and the suite had been reporting
+it as a KNOWN DEFECT for some time without saying why. It is a permutation.
+
+Two runs of one command produced the **same 30 frames as a multiset**, with only 6 of
+30 in identical positions. Every frame was present, the count was right, the palette
+was byte-identical -- and the order was wrong. That is the worst shape a video bug can
+take: nothing downstream can detect it, because a permuted clip decodes cleanly.
+
+The cause was one missing field. `done` is a `std::deque<int>` of slot indices, and
+nothing carried a position with it, so the writer took `done.front()` -- whatever had
+finished first -- and wrote it:
+
+```cpp
+slot = done.front();
+done.pop_front();
+...
+const bool wrote = encoder.Write(b.out(), bytes);
+```
+
+With one batch that is correct by accident. With several it interleaves them. The
+evidence lined up with that exactly, and nothing else would have explained all of it:
+
+| `--batch-frames` | batches over 30 frames | distinct results in 8 runs |
+|---|---|---|
+| 30 | 1 | **1** |
+| 15 | 2 | 2 |
+| 10 | 3 | 3 |
+| 1 | 30 | **8** |
+
+`Batch::first_frame` now carries the position the reader already knew, and the writer
+waits for its turn rather than for any batch. `next_write` advances by
+`frames_to_write` -- the CLIPPED count, not `b.frames` -- because a batch straddling a
+segment boundary is written in part, and advancing by the unclamped size would step
+over a frame the encoder never saw and stall the predicate permanently.
+
+After: 24 runs, 1 distinct result, where before there were 2 at a divergence rate of
+0.458.
+
+### The same check could not see it, and a second fault is behind it
+
+`probe-video-exact` compares `--engine blocks` against `--engine opencl` -- **both
+device engines**. The host path is only ever checked for determinism, never against a
+device engine for correctness, and on a runner with no GPU that comparison skips
+entirely. So the host path has no reference anywhere in the suite, and a wrong-but-
+stable result passes every check there is.
+
+Which is what a second fault is. With the ordering fixed, output became deterministic
+but a multi-batch run still does not match a single-batch one -- and at
+`--batch-frames 1`, **none** of the 30 output frames appear in the single-batch output
+at all. The palette is byte-identical across every batch size, and `RiemersmaBlocksCpu`
+zeroes the error queue per frame per block, so neither can explain it. The decoded
+input can:
+
+| | per pixel | units |
+|---|---|---|
+| `in_frame_bytes`, `yuv444p` (`rd_video.cpp`) | `pixels * 3` | bytes |
+| `dec_pix_fmt` (`rd_video.cpp`) | `yuv444p` | 8-bit planar |
+| `RawToFloatsParallel` frame stride | `pixels * channels` | **uint16** |
+
+The reader writes 3 bytes per pixel; the converter reads 6, as `uint16`. Frame *f* is
+written at byte `f*pixels*3` and read from `f*pixels*6`, so every frame after the first
+is read from the wrong place and the tail is uninitialised heap. `RawToFloats` is a
+uint16-to-float widening that is exactly right for `rgba64le` and meaningless for
+8-bit planar YUV -- the host path never implemented that conversion. The device has
+it, and only under `upload_u16`: `in_yuv` is gated on `want_in_u16` in
+`rd_blocks_cuda.cu`. The device also agrees on the buffer size, `in_bytes_for`
+returning `total_px * 3`, so the two paths agree on the allocation and disagree on
+how to read it.
+
+That is the probe header's "INPUT FORMAT (NOT FIXED)" item, now reduced to a unit
+mismatch rather than a mystery. It is not fixed here, and the fix is not small: the
+host needs the planar YCbCr-to-float routine transliterated from the device so the
+engines agree bit for bit, which is the only version of this fix worth having.
+
+### Two things that cost time and were worth writing down
+
+**A stale control binary looked like intermittency.** The OpenCL fault above was first
+recorded as intermittent, which was wrong: it is deterministic. The confusion came from
+comparing a CUDA build compiled before three commits against a fresh `--no-cuda` one.
+Build both configurations before comparing them.
+
+**A metric that was wrong in a way that flattered the answer.** To check frame order
+after the fix, per-frame mean luminance was used, on the reasoning that it survives
+dithering. It does -- and it is too weak: `testsrc` has a moving element, so its
+per-frame mean drifts, and an offset of -3 "aligned" every case *including a single
+batch, which cannot be permuted at all*. A check whose best fit is found at a
+non-zero offset on data known to be in order is measuring its own noise. The right
+fixture marks each frame so dithering cannot move it.

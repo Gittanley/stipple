@@ -841,6 +841,15 @@ localised. The suite reports it rather than failing, so the rest of the sweep st
 while it is open, and it says "no divergence observed" rather than "deterministic" —
 8 runs that agree is an observation, not a proof.
 
+**The host video path reads planar YUV input at the wrong stride.** On `--no-gpu` with
+the default `yuv444p` input, the decoder delivers 3 bytes per pixel and the converter
+reads 6, as `uint16`, so every frame after the first is read from the wrong offset and the
+tail is uninitialised memory. The palette and the frame count are both correct, so nothing
+downstream notices; the result is a wrong picture that looks well-formed. `--input-mode
+rgba64` is unaffected, and the CUDA and OpenCL engines have their own conversion. The
+writeup, and why the fix is not a one-liner, is in
+[docs/DESIGN.md](docs/DESIGN.md).
+
 **Intel and AMD iGPUs are untested.** No hardware was available, so no claim is made
 either way. `tools\probe-opencl.exe` is the check.
 

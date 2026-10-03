@@ -1803,6 +1803,17 @@ struct Batch {
   std::vector<std::uint16_t> out16;
   std::uint16_t* in16_pin = nullptr;
   std::uint16_t* out16_pin = nullptr;
+  // Where this batch starts in the source, relative to this segment.  Set by the
+  // reader, which is the only thing that knows it.
+  //
+  // It exists because the writer used to emit batches in COMPLETION order: `done` is a
+  // deque of slot indices and nothing carried a position, so the writer took
+  // `done.front()` and wrote whatever had finished first.  With one batch that is
+  // correct by accident.  With several it is a silent permutation of the output -- and a
+  // silent one, because the frame count was always right and every frame was always
+  // present, just not in order.  Measured on a 30-frame clip: two runs produced the same
+  // 30 frames as a multiset with only 6 of 30 in identical positions.
+  int first_frame = 0;
   ~Batch() {
     if (in16_pin != nullptr) CudaFreePinned(in16_pin);
     if (out16_pin != nullptr) CudaFreePinned(out16_pin);
@@ -2562,6 +2573,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
   for (int i = 0; i < depth; ++i) free_slots.push_back(i);
   std::deque<int> ready;
   std::deque<int> done;
+  // The next source frame the writer is allowed to emit.  Batches land on `done` in
+  // whatever order their workers finish, and the encoder is a stream, so this is what
+  // turns completion order back into source order.
+  int next_write = 0;
+  // True when the batch holding `next_write` has finished.  Called with `mu` held.
+  const auto HasTurn = [&](int want) {
+    for (int s : done) {
+      if (slots[static_cast<std::size_t>(s)].first_frame == want) return true;
+    }
+    return false;
+  };
 
   std::mutex mu;
   std::condition_variable cv_free, cv_ready, cv_done;
@@ -2690,6 +2712,9 @@ bool VideoProcess(const std::string& in, const std::string& out,
         b.frames = filled;
         {
           std::lock_guard<std::mutex> lock(mu);
+          // Taken before the increment below, so this is the batch's FIRST source frame
+          // and not its last-plus-one.  frames_read is reader-only up to this point.
+          b.first_frame = static_cast<int>(frames_read);
           frames_read += filled;
           // End of file for this *segment* as well as for the clip: once the segment's
           // frame count is read there is nothing more to pull, and saying so stops the
@@ -2905,9 +2930,13 @@ bool VideoProcess(const std::string& in, const std::string& out,
       // wait_for, not wait: a 18000-frame job must not be able to hang silently
       // if a stage wedges.  Ten minutes without a single frame is a fault.
       cv_done.wait_for(lock, std::chrono::seconds(600), [&] {
-        return !done.empty() || eof || failed;
+        return HasTurn(next_write) || eof || failed;
       });
-      if (done.empty() && !eof && !failed) {
+      // Waiting for the TURN rather than for any batch.  A batch that has finished out of
+      // turn has to stay on `done` until its predecessor is written, which is the whole
+      // fix: the encoder is a stream, so the order frames reach it is the order they
+      // appear in the file.  Taking whatever arrived first is what permuted the output.
+      if (!HasTurn(next_write) && !eof && !failed) {
         *error =
             "pipeline stalled: no batch completed within 600 s "
             "(check the decoder and encoder processes)";
@@ -2945,8 +2974,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
         if (eof && frames_dithered >= frames_read) break;
         continue;
       }
-      slot = done.front();
-      done.pop_front();
+      const auto it = std::find_if(done.begin(), done.end(), [&](int s) {
+        return slots[static_cast<std::size_t>(s)].first_frame == next_write;
+      });
+      if (it == done.end()) {
+        // Everything on `done` belongs to a later part of the source.  Leave it there;
+        // the predicate above will wake us when the missing batch lands.
+        if (eof && frames_dithered >= frames_read) break;
+        continue;
+      }
+      slot = *it;
+      done.erase(it);
     }
     Batch& b = slots[static_cast<std::size_t>(slot)];
     const double e0 = NowMs();
@@ -2979,6 +3017,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
         static_cast<std::size_t>(frames_to_write) * out_frame_bytes;
     const bool wrote = encoder.Write(b.out(), bytes);
     segment_written += frames_to_write;
+    // Advanced by what was WRITTEN, not by b.frames: a batch straddling the segment
+    // boundary is clipped above, and advancing by the unclamped size would skip past a
+    // frame the encoder never saw and stall the predicate forever.
+    next_write += frames_to_write;
+    cv_done.notify_all();
     const double dt = NowMs() - e0;
     std::int64_t frames_read_now = 0;
     {
