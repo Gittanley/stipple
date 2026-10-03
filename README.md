@@ -331,9 +331,9 @@ GPU's data path needs.
 
 So **any explicit value ≥ 1 turns the host walk on**, and the host walk is not
 bit-identical to the GPU walk — the program says so on every run that does it. Even among
-host-only runs the count matters: fewer workers means a different block partition, and each
-block restarts its error queue, so `--cpu-threads 1` and `auto` differ by about 4,200
-pixels. **If you need reproducible output, leave it on `auto`.**
+host-only runs the worker count matters, because fewer workers means a different block
+partition and each block restarts its error queue. **If you need reproducible output,
+leave it on `auto`.**
 
 Other knobs, briefly: `--reader-threads`, `--decode-threads` and `--encode-threads` cap
 ffmpeg's own threads; `--gpu-workers N` runs N GPU walks at once (2 measured no faster,
@@ -370,20 +370,12 @@ moves with your source frame rate: 60 fps footage takes ~17% longer than it play
 so ~1 h 46 m for 3 hours). Whether this beats real time depends on your source rate, so
 it is worth checking rather than assuming.
 
-**Three reasons not to quote the 51 fps at anyone.** It is a low-bitrate,
-already-compressed file of a grey low-saturation hyperlapse, so the encode half is
-flattered by unrepresentative content. The walk kernel is branch-free, so the dither
-costs the same per pixel whatever the values — but the *palette* is built from your
-frames, and a lopsided one sends every lookup deeper: 387 ms against 166-181 ms on
-`tests/L605.mp4` at identical geometry, nodes-visited-per-pixel 3.71 against 2.63. And
-`busy time` is *thread*-time summed across six cores, so **two thirds of the work is not
-GPU work at all** — decode and encode are bound by memory bandwidth, storage and
-single-thread CPU, which makes that 2014-era Xeon the most likely reason the machine is
-slow. More bandwidth moves the number with the same GPU; a faster GPU will not fix a
-pipeline that is not GPU-bound.
-
-So read which stage is largest in your own `busy time` line before buying a GPU. The
-reported wall **includes the palette stage** — 28.7 s here, about 8%.
+**Do not quote the 51 fps at anyone.** It is one low-bitrate, already-compressed file of
+grey low-saturation material on a 2014-era 6-core Xeon, and two thirds of the thread-time
+is decode and encode rather than GPU work — so a faster CPU, NVMe or more memory
+bandwidth moves this number with the same GPU, and a faster GPU will not fix a pipeline
+that is not GPU-bound. Read which stage is largest in your own `busy time` line before
+buying hardware. The reported wall **includes the palette stage** — 28.7 s here, ~8%.
 
 **On a long job you can work before the whole thing lands:** `--segment-frames N` writes
 separate muxed segment files as it goes, so early ones are playable while later ones
@@ -554,15 +546,10 @@ rdither --help
 
 ---
 
-## Two things worth knowing before you judge the output
+## One thing worth knowing before you judge the output
 
-**The encoder can throw the palette away.** A 16-colour image re-encoded as lossy 4:2:0
-does not have 16 colours any more — chroma subsampling averages the dither's per-pixel
-alternation away, and lossy compression invents colours around every transition. Measured
-on this pipeline: 16 colours in, 36356 out at `yuv420p`, 30445 at `libx264 yuv444p crf 18`,
-56 at `ffv1 yuv444p`. If the result looks flat and grey, this is usually why, and the fix
-is `--video-lossless` (about 28× the bitrate) or accepting some loss. rdither warns you
-when the chosen settings cannot carry the palette.
+(The other one — *the encoder can throw the palette away*, and what `--video-lossless`
+is for — is covered under [Where bit-exactness holds](#where-bit-exactness-holds).)
 
 **The palette comes from sampling, so it can miss.** For video it samples frames across
 the whole clip — as many as a 60-second budget allows, up to 256 — and reports the mean
@@ -620,12 +607,6 @@ and distinct; the quality claim is not yet earned.
 Writing your own is three steps: copy that file, write the kernel, add it to
 `RD_SOURCES` in `CMakeLists.txt`. [include/rd_plugin.h](include/rd_plugin.h) has the
 interface and, more usefully, the two mistakes that cost real time to diagnose.
-
-Registration is at compile time, not runtime loading, on purpose. A `LoadLibrary` plugin
-built with a different toolchain has to agree with the host on struct layout, calling
-convention and allocator, and this program is built with a specific MSVC + CUDA against a
-specific ImageMagick. Same-binary means the same compiler, the same headers, and none of
-that class of problem.
 
 ---
 
