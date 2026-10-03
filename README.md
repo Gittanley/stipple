@@ -26,40 +26,19 @@ A skipped check is never counted as a pass, and the CPU job asserts that at leas
 real cases actually ran — because a suite that skips nearly everything and exits 0 is
 worse than a failing one.
 
-Both jobs are green on every push. Getting there took three fixes in the CUDA job
-alone, and every one of them was in code I had written minutes earlier and never run:
-the toolkit search looked one level deep when the archive nests three, the component
-archives were never merged into the single root `find_package(CUDAToolkit)` needs, and
-`build.cmd` ignored `CUDA_PATH` entirely. The third one had a fault inside the fix —
-`%VAR%` inside a parenthesised batch block expands before the block runs, so the test
-always saw an empty variable. That is why the workflow's own header now says to test
-toolchain code locally before pushing it.
+Both jobs are green on every push. Getting there took three fixes in the CUDA job alone —
+every one of them in code written minutes earlier and never run — and a hunt for a
+*buildable* ImageMagick on a runner that ships only the runtime. All of it is recorded in
+[the workflow](.github/workflows/ci.yml) and [docs/DESIGN.md](docs/DESIGN.md) so nobody
+repeats it. Two facts out of that hunt matter to you:
 
-**The toolchain took some finding.** GitHub's hosted Windows runners ship ImageMagick
-7.1.2-25 Q16-HDRI — the right variant, at the path `build.cmd` looks in first — but
-**runtime only**: no `include\MagickCore\MagickCore.h`, no `lib\CORE_RL_MagickCore_.lib`,
-so nothing can link against it. Five ways of installing a buildable copy were tried and
-measured on a runner, and all five are recorded in
-[the workflow](.github/workflows/ci.yml) so nobody repeats them. The installer in
-particular is *not* drivable unattended: under `/S` it opens a directory prompt and
-waits for a human, and one attempt to reproduce that locally "passed" only because this
-machine already had ImageMagick installed.
-
-What works is conda, which has no installer to prompt with:
-
-```
-pwsh -File tools/install-imagemagick.ps1
-```
-
-Twenty-one seconds, and it produces the same pinned version — 7.1.2-31 Q16-HDRI, 1,459
-headers, MSVC import libraries. The script does not trust that `exit 0` means usable: it
-asserts every file the build needs is present and then *reads back* the version it
-actually got, because a prefix that installs cleanly can still be unbuildable.
-
-That support is why `CMakeLists.txt` and `build.cmd` now accept **two** ImageMagick
-layouts — the official Windows one, and a conda prefix, which puts headers under
-`Library\include\ImageMagick-7`, names its libraries `MagickCore-7.Q16HDRI.dll.lib`, and
-keeps 224 versioned DLLs in `Library\bin` rather than one beside the executable.
+- The runners' ImageMagick cannot be linked against, so CI installs its own:
+  `pwsh -File tools/install-imagemagick.ps1` — 21 s, pinned to 7.1.2-31 Q16-HDRI. It
+  asserts every file the build needs and reads back the version it got, because a prefix
+  that installs cleanly can still be unbuildable.
+- `CMakeLists.txt` and `build.cmd` therefore accept **two** ImageMagick layouts: the
+  official Windows one, and a conda prefix, which puts headers under
+  `Library\include\ImageMagick-7` and names its libraries `MagickCore-7.Q16HDRI.dll.lib`.
 
 ```
 rdither --colors 16 photo.png out.png
@@ -337,62 +316,42 @@ H.264.
 
 ### Concurrency, and the RAM it uses
 
-Decode, dither and encode all run at once, and the tool will use the machine you give
-it. On the benchmark machine, thread-time totals 647 s against a 352 s wall, so every
-core is busy — and roughly two thirds of that is decode and encode rather than GPU
-work. The GPU is not usually the constraint; see
+Decode, dither and encode all run at once, and the tool will use the machine you give it.
+On the benchmark machine, thread-time totals 647 s against a 352 s wall, so every core is
+busy — and roughly two thirds of that is decode and encode rather than GPU work. The GPU
+is not usually the constraint; see
 [what the fps number means](#what-the-fps-number-means-in-practice).
 
 **`--cpu-threads` is not a scheduling knob, and this is the part worth reading.** With
-`auto` and a GPU present, the host worker pool is **off** (`0`), and the GPU walk is the
-only walk. That is measured, not incidental: the host block walk costs ~937 ms/frame at
-1080p against the GPU's 63.5, and on a deep queue ten host workers make the whole
-pipeline *slower* (219–244 ms/frame with them, 115 without) because they saturate the
-memory bandwidth the GPU's data path needs.
+`auto` and a GPU present, the host worker pool is **off** (`0`) and the GPU walk is the
+only walk. That is measured: the host block walk costs ~937 ms/frame at 1080p against the
+GPU's 63.5, and on a deep queue ten host workers make the whole pipeline *slower*
+(219–244 ms/frame with them, 115 without) because they saturate the memory bandwidth the
+GPU's data path needs.
 
 So **any explicit value ≥ 1 turns the host walk on**, and the host walk is not
-bit-identical to the GPU walk — the program says so on every run that does it:
+bit-identical to the GPU walk — the program says so on every run that does it. Even among
+host-only runs the count matters: fewer workers means a different block partition, and each
+block restarts its error queue, so `--cpu-threads 1` and `auto` differ by about 4,200
+pixels. **If you need reproducible output, leave it on `auto`.**
 
-```
-[video] note: the 10 host worker(s) use the host block walk, which is NOT bit-identical to ...
-```
+Other knobs, briefly: `--reader-threads`, `--decode-threads` and `--encode-threads` cap
+ffmpeg's own threads; `--gpu-workers N` runs N GPU walks at once (2 measured no faster,
+the dither being saturated rather than stalled); `--frames`, `--batch-frames` and
+`--queue-depth` set the work granularity.
 
-Consequences, all measured on a 2-second clip with the palette pinned:
-
-| | what runs | vs `auto` |
-|---|---|---|
-| `auto`, GPU present | GPU walk only | — |
-| `--cpu-threads 2` | host walk | **AE 0** with `--no-gpu` auto |
-| `--cpu-threads 1` | host walk, one worker's partition | differs |
-
-Even among host-only runs the count matters: fewer workers means a different block
-partition, and each block restarts its error queue, so `--cpu-threads 1` and `auto`
-differ by about 4,200 pixels. **If you need reproducible output, leave it on `auto`.**
-
-Other knobs, briefly: `--reader-threads`, `--decode-threads` and `--encode-threads`
-cap ffmpeg's own threads; `--gpu-workers N` runs N GPU walks at once (2 measured no
-faster, the dither being saturated rather than stalled); `--frames`, `--batch-frames`
-and `--queue-depth` set the work granularity.
-
-**RAM.** The queue is sized first and the worker count trimmed to fit it, because a
-deep queue with fewer workers beats a shallow one with more. `[ram]` on every run
-reports the real figure — 42 slots + a 782 MiB reserve ≈ 824 MiB peak at 1080p, with
-the reserve dominating. `--mem-fraction` sets the share of physical RAM the queue may
-use (default about a third) and `--max-ram-mb` caps it absolutely; frames beyond the
-budget spill to disk rather than failing.
+**RAM.** The queue is sized first and the worker count trimmed to fit it, because a deep
+queue with fewer workers beats a shallow one with more. `[ram]` on every run reports the
+real figure — 42 slots + a 782 MiB reserve ≈ 824 MiB peak at 1080p, with the reserve
+dominating. `--mem-fraction` sets the share of physical RAM the queue may use (default
+about a third) and `--max-ram-mb` caps it absolutely; frames beyond the budget spill to
+disk rather than failing.
 
 ### What the fps number means in practice
 
-The measurement below is on a real clip, not a synthetic one:
-
-```
-rdither --video --engine blocks --colors 16 input.mp4 out.mkv
-```
-
-`input.mp4` is 18001 frames, 1920x1080, 60 fps, 300.032 s — h264 yuv420p, bt709,
-tv range, 10.2 Mbps, 373 MB, with stereo AAC. Machine: **Xeon E5-2620 v3 @ 2.40 GHz**,
-6 physical cores / 12 threads, 15.8 GB RAM, **GTX 1650 SUPER**. Input mode, pixel format,
-preset, queue depth, workers and batch size were all left at their defaults.
+Measured end to end on a real clip — 18001 frames of 1920x1080 60 fps h264 (300 s of
+footage), all defaults, on a **Xeon E5-2620 v3 @ 2.40 GHz**, 6 cores / 12 threads,
+15.8 GB RAM, **GTX 1650 SUPER**:
 
 ```
 palette    : 16 colours from 256 sampled frame(s), 128x128 montage, 64.0 MiB, 28676.7 ms, mean saturation 22.1%, 9 near-neutral
@@ -400,164 +359,79 @@ frames     : 18001 in 352.51 s (51.1 fps)
 busy time  : palette 28677 | decode 270944 | dither 222857 | encode 153089 | wall 352507 ms
 ```
 
-**Read that as elapsed time, not as a benchmark.** 18000 frames at 60 fps is 5 minutes
-of footage, and it finished in 352 seconds. So:
+**Read that as elapsed time, not as a benchmark.** 300 s of footage took 353 s, so:
 
-> **5 minutes of 60 fps video takes about 5 minutes 53 seconds to render.** You wait
-> roughly six minutes, and the file is complete, seekable and openable in an editor
-> when the command returns. Nothing is queued up behind it.
+> **5 minutes of 60 fps video takes about 6 minutes to render.** You wait, and the file
+> is complete, seekable and openable in an editor when the command returns.
 
-The same ratio holds wherever you point it — roughly **1.17x the footage's own
-duration**. That means:
+The ratio — roughly **1.17x the footage's own duration** — is the useful part, and it
+moves with your source frame rate: 60 fps footage takes ~17% longer than it plays (a
+3-hour clip is about 3 h 31 m), while 30 fps comes out well ahead of real time (~0.59x,
+so ~1 h 46 m for 3 hours). Whether this beats real time depends on your source rate, so
+it is worth checking rather than assuming.
 
-- **60 fps footage takes about 17% longer than it plays.** A 3-hour 60 fps clip is
-  about 3 hours 31 minutes. A 30-second insert takes 35 seconds.
-- **30 fps footage comes out well ahead of real time** — 30 frames per second of
-  footage against a ~51 fps pipeline, so roughly **0.59x**, and a 3-hour 30 fps clip
-  lands in about 1 hour 46 minutes. Same machine, same numbers, opposite conclusion.
+**Three reasons not to quote the 51 fps at anyone.** It is a low-bitrate,
+already-compressed file of a grey low-saturation hyperlapse, so the encode half is
+flattered by unrepresentative content. The walk kernel is branch-free, so the dither
+costs the same per pixel whatever the values — but the *palette* is built from your
+frames, and a lopsided one sends every lookup deeper: 387 ms against 166-181 ms on
+`tests/L605.mp4` at identical geometry, nodes-visited-per-pixel 3.71 against 2.63. And
+`busy time` is *thread*-time summed across six cores, so **two thirds of the work is not
+GPU work at all** — decode and encode are bound by memory bandwidth, storage and
+single-thread CPU, which makes that 2014-era Xeon the most likely reason the machine is
+slow. More bandwidth moves the number with the same GPU; a faster GPU will not fix a
+pipeline that is not GPU-bound.
 
-So whether this is faster or slower than real time depends entirely on your source
-frame rate, and it is worth checking rather than assuming.
+So read which stage is largest in your own `busy time` line before buying a GPU. The
+reported wall **includes the palette stage** — 28.7 s here, about 8%.
 
-#### This clip is not a real-world benchmark, and here is the measurement that says so
-
-Do not quote the 51 fps at anyone. That clip is a **DaVinci Resolve render using the
-YouTube 1080p preset** — a low-bitrate, already-compressed, heavily re-encoded file —
-and the content is a **grey, low-saturation extreme hyperlapse at 2000% speed**, so
-almost nothing in it resembles real footage. It is the longest clip this project was
-measured on, and it is unrepresentative in ways the tool can partly quantify.
-
-The palette line is the tell: **mean saturation 22.1%, and 9 of the 16 palette entries
-near-neutral.** Nine greys in a 16-colour palette is not what most video looks like. A
-palette sampled from saturated, colourful material would spend that budget on hues
-instead, and hue transitions are more expensive to encode than flat greys — so the
-encode half of this measurement is flattered by the content in a way yours would not be.
-
-What survives the criticism is the part that is not merely a property of this one
-clip — with one important qualification, which is worth stating rather than glossing:
-
-#### The dither cost depends on the palette, not on the pixels
-
-The walk kernel has no data-dependent branch and no early exit: given a palette, every
-pixel of every frame costs the same — a fixed 16-deep error-queue shift plus a palette
-search. So the *pixel values* cannot change the dither's cost. Measured here:
-
-| | |
-|---|---|
-| per frame, 1920x1080, 16 colours, B=512 | **~10 ms** |
-| pixels dithered | 2,073,600 x 18,001 = **37.3 gigapixel** |
-| implied rate | ~207 Mpixel/s, **100 fps of dithering** |
-| against 60 fps footage | **1.7x real time, on its own** |
-
-**But the palette is built from your frames, and its shape changes the search.** A
-palette of 16 entries where most are near-neutral greys is very lopsided, and a lopsided
-tree makes each lookup descend further. Measured on this project at identical geometry
-and identical tree *size*: **387 ms** on the grey clip against **166-181 ms** on
-`tests/L605.mp4`, with nodes-visited-per-pixel at **3.71 against 2.63** — a 2.2×
-difference caused entirely by what the sampler picked. See
-[docs/DESIGN.md](docs/DESIGN.md) §12.
-
-So do not carry the 10 ms/frame figure to your own footage as a promise. It is a number
-*for this palette* — 9 of 16 entries near-neutral, mean saturation 22.1% — and a
-saturated, evenly-spread palette will search less deep. It could be faster or slower.
-The honest summary is that the dither is the stage a GPU accelerates, and on this
-machine with this palette it is not the bottleneck; how much of the wall it takes on
-your content is measurable from the same `busy time` line.
-
-#### Which is why the machine matters more than the GPU
-
-The `busy time` line is *thread*-time summed across all six cores, so the stages total
-647 s against a 352 s wall and you cannot divide them to get each stage's share of it.
-As a rough split of that thread-time, though, decode is 271 s, dither 223 s, encode
-153 s — **two thirds of the work is not GPU work at all.**
-
-So the same GPU on a better machine finishes faster without the dither doing a single
-extra FLOP. Decode and encode are bound by memory bandwidth, storage throughput and
-single-thread CPU — and this machine has a **2014-era server Xeon at 2.4 GHz**, which
-is very likely the single biggest thing making it slow. A machine with the identical
-GPU but a modern CPU, NVMe storage and more memory bandwidth will render this
-materially faster. The converse also holds: if you are already faster than real time,
-a better GPU will not meaningfully change your edit session. Look at which stage is
-largest for your content before spending money on a GPU.
-
-**On a segment you can work before the whole thing lands:** `--segment-frames N` writes
-separate muxed segment files as it goes, so for a long job the early ones are already
-on disk and playable while the later ones render. The default single-file mode writes
-one complete file on return; if you interrupt it, that file holds the frames completed
-so far and `--resume` continues from there.
-
-The reported wall **includes the palette stage** — 28.7 s of it here, about 8%. It did
-not for a while: the denominator was measured from inside the pipeline, which starts
-after the palette is already built, so two runs whose palettes differed by 25 s
-reported the same fps. If a number here looks worse than one you remember, this is why.
+**On a long job you can work before the whole thing lands:** `--segment-frames N` writes
+separate muxed segment files as it goes, so early ones are playable while later ones
+render. The default single-file mode writes one complete file on return; interrupt it and
+that file holds the frames completed so far, and `--resume` continues from there.
 
 ### Rotated video
 
 A stream with a 90 or 270 degree display matrix — every portrait phone video — used to
-come out **sheared**. The picture was correct but sliced as if it were the wrong width,
-and the output had no rotation tag to compensate.
-
-The cause was silent. ffmpeg's rawvideo output auto-rotates by default, so the decoder
-handed the pipeline 1080x1920 frames, while rdither sized every buffer from `width` and
-`height` in the stream header, which are the **coded** 1920x1080. The pixel *count* is
-identical either way, so no bounds check could detect it — only the row width was
-wrong, and the frame was read back sliced differently.
-
-rdither now uses the **displayed** geometry everywhere: buffers, the raw pipe's `-s`,
-the encoder, and all three dither engines. The output carries upright pixels and no
-rotation tag, so it is correct in any container. It says so when it happens:
+come out **sheared**. rdither now uses the **displayed** geometry everywhere: buffers,
+the raw pipe's `-s`, the encoder and all three dither engines. The output carries upright
+pixels and no rotation tag, so it is correct in any container, and it says so when it
+happens:
 
 ```
 [video] source carries a -90 degree display matrix; the decoder rotates, so the
 frames are processed and written as 1080x1920 upright with no rotation tag.
 ```
 
-Rotating the pixels in, rather than copying the display matrix to the output, is forced
-rather than preferred: ffmpeg 9 exposes `-display_rotation` as an **input** option only
-and has removed `-metadata:s:v rotate=`, so there is no way to carry the matrix to a
-re-encoded output. The cost is that the error diffusion runs on upright pixels, so its
-direction is rotated relative to ImageMagick's own pipeline — that changes which pixels
+Rotating the pixels in rather than carrying the matrix to the output is forced, not
+preferred: ffmpeg 9 exposes `-display_rotation` as an **input** option only and has
+removed `-metadata:s:v rotate=`. The cost is that error diffusion runs on upright pixels,
+so its direction is rotated relative to ImageMagick's — which changes *which* pixels
 differ, not whether the result is a correct 16-colour dither.
 
-**There is no regression test for this.** Every clip in `tests/` is unrotated, and
-ffmpeg cannot *write* a display matrix at all, so a fixture cannot be generated the
-obvious way. It is the one known gap in the suite, and the reason to suspect rotation
-first when a rendered video looks wrong.
+**There is no regression test for this**, and ffmpeg cannot *write* a display matrix, so a
+fixture cannot be generated the obvious way. It is the one known gap in the suite, and the
+reason to suspect rotation first when a rendered video looks wrong. The writeup is in
+[docs/DESIGN.md](docs/DESIGN.md).
 
 ### Variable frame rate
 
-A VFR source used to render at the wrong length. Three separate faults, all of which
-present as "doesn't render correctly":
+A VFR source used to render at the wrong length. rdither now **measures the real frame
+timings and re-emits at the true average** — the encoder is not fed the container's
+`r_frame_rate`, which for a variable-rate source is the maximum instantaneous rate rather
+than a summary. Constant-rate inputs are unaffected: the two numbers are identical.
+`-shortest` is now used only where it trims audio, never where it would delete video
+frames to make the tracks match.
 
-**The rate.** The encoder was fed `r_frame_rate`, which for a variable-rate source is
-the *maximum instantaneous* rate, not an average — a container hint, not a summary. A
-3.03 s source came out 1.63 s long, with matching A/V desync. rdither now measures the
-real frame timings and re-emits at the true average. Constant-rate inputs are
-unaffected: the two numbers are identical.
-
-**`-shortest`.** That flag stops output at the shorter of the two streams, which is
-right when the audio runs long and actively wrong the other way: when the **video** is
-longer, it *deletes video frames* to make the tracks match. On a 30 s excerpt with 895
-frames against 30.0128 s of audio, the output had 892 — three frames gone, every run,
-scaling with the clip. It is now used only where it trims audio, decided by comparing
-the measured durations.
-
-**Per-frame cadence is still flattened.** The output is constant rate at the true
-average, which fixes duration and A/V sync but resamples the motion once. Restoring
-the cadence needs a piecewise `setpts` re-applied at the encoder, because a rawvideo
-pipe carries no timestamps. `--video-preserve-vfr` does this and is **off by default**:
-the mechanism is proven in isolation, but it is not verified end to end, because no
-genuinely variable-timestamp fixture could be produced on this machine.
+**Per-frame cadence is still flattened.** The output is constant rate at the true average,
+which fixes duration and A/V sync but resamples the motion once. `--video-preserve-vfr`
+restores the cadence with a piecewise `setpts` re-applied at the encoder, because a
+rawvideo pipe carries no timestamps — it is **off by default**: the mechanism is proven in
+isolation but not verified end to end, because no genuinely variable-timestamp fixture
+could be produced on this machine.
 
 rdither reports what it did, because a flattened VFR render is frame-for-frame
-indistinguishable from a correct one and nothing in the output says which you got:
-
-```
-[video] variable frame rate: 5128 frames in 322 constant-rate runs, 172.0645 s
-total, 29.803 fps average (the container declares 29.833333333).
-[video]   re-emitted at the true average, 29.803 fps.  Duration and A/V sync match
-the source; per-frame motion cadence is flattened.
-```
+indistinguishable from a correct one and nothing in the output says which you got.
 
 ## Where bit-exactness holds
 
@@ -604,20 +478,23 @@ approximation by necessity, and that is the honest answer to "is video bit-exact
 **no**.
 
 There is no bit-exact video mode, and `--no-gpu` is not one. `--no-gpu` runs the *same*
-block walk on host workers, so on paper it is the way to check the GPU is not lying to
-you without a second GPU. **On video it currently is not, because it has real bugs.**
+block walk on host workers, so it is still the approximation above — on paper the way to
+check the GPU is not lying to you without a second GPU.
 
-One is fixed: the host path was writing rgba64le into a pipe declared as planar 4:4:4,
-so the encoder read the wrong bytes and a red band came out green. `--no-gpu` and CUDA
-are now **AE 0** against each other on the `rgba64le` path.
+**It is now trustworthy for that.** The host path agrees with CUDA **byte for byte** on
+video, at every `--batch-frames` from 1 to 30, in `yuv444`, `yuv444-prepass` and
+`rgba64`, and at 1920x1080 as well as 320x180 — so `--no-gpu` measures the GPU rather
+than the host. Getting there took three fixes, all found by running two builds on one
+machine and comparing decoded pixels, because `probe-video-exact` compares two *device*
+engines and the host was only ever checked for determinism: frames written in
+worker-completion order, 8-bit planar YUV read through a `uint16` stride, and a
+float→planar converter whose plane stride was the whole batch rather than one frame,
+which made every `--batch-frames` above 3 wrong — including the default of 16. All three
+are written up in [docs/DESIGN.md](docs/DESIGN.md).
 
-Two are open. The `yuv444` input mode is still misread on the host (16-bit elements
-read from an 8-bit planar buffer), and the host pipeline does not reproduce run to
-run — two runs of the identical command still differ, at `--cpu-threads 1` as well, so
-it is not a race. The same engine on a single *image* is bit-exact against CUDA, so all
-of this is the video plumbing rather than the block walk. Measurements are in the
-comment at the top of `tools/probe-video-determinism.ps1`; look there before trusting
-`--no-gpu` on video. **Treat it as CUDA-only until that test passes.**
+What none of that changes: the host walk is still the block walk, so it is still ~1.7% of
+pixels from ImageMagick. `--no-gpu` answers "does the GPU agree with the CPU", not "is
+this bit-exact".
 
 If per-pixel agreement with ImageMagick matters more than throughput, the dither has to
 be cut rather than parallelised, and that is an architectural change to the video
@@ -803,62 +680,48 @@ Beyond that suite, `verify.ps1` also runs:
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
 | `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
-| `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count | 2/2, **1 known defect** |
+| `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count, on each of the three engines | 3/3 |
 | `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
 
-That last one is the odd one out and earns its place. The other three all compare
-two engines against each other, which makes them **structurally blind to a bug both
-engines share** — and that is not hypothetical. ImageMagick's Riemersma walk skips one
-in-bounds cell for some geometries; the GPU scatters write only visited pixels; and the
-uint16/4:4:4 output buffer is a bare `cudaMalloc`. So that pixel was uninitialised device
-memory, in *both* engines, and the cross-engine tests passed. `1920×1080` has no such
-pixel, so the five-minute benchmark never saw it either.
+That last one is the odd one out and earns its place. The cross-engine checks compare two
+engines against each other, which makes them **structurally blind to a fault both engines
+share** — and that has happened: the pixel ImageMagick's walk never visits was
+uninitialised device memory in *both* engines, and it was invisible by eye because a fresh
+`cudaMalloc` returns zeroed pages. So that check compares against the **source** rather
+than against another engine, and carries a negative control — the unvisited pixel must
+match the source *and* its neighbour must **not**, or a renderer that dithered nothing
+would pass.
 
-It is invisible by eye too: a fresh `cudaMalloc` returns zeroed pages, so the pixel reads
-as a slightly dark value until the buffer is reused across batches. So the check compares
-against the **source** rather than against another engine, and carries a negative control —
-the unvisited pixel must match the source *and* its neighbour must **not**, or a renderer
-that dithered nothing would pass.
-
-`probe-video-determinism.ps1` is the same idea applied one level up, and for the same
-reason: the video pipeline had **no** self-comparison at all, so any fault both engines
-shared there was invisible. That is where the `-shortest` frame-deleting bug lived — both
-engines dropped the same three frames, so comparing them agreed — and frame accounting had
-to be bolted on afterwards as a separate, differently-shaped check. It now also verifies
-the frame count from the file rather than from rdither's own report, because a pipeline
-that consistently drops frames reports a consistent number, and a self-consistent report
-is not evidence.
+`probe-video-determinism.ps1` is the same idea one level up, and for the same reason. It
+verifies the frame count **from the file** rather than from rdither's own report: a
+pipeline that consistently drops frames reports a consistent number, and a self-consistent
+report is not evidence.
 
 ### Known limitations
 
 These are current, not history. Fixed faults are not listed here; they are in
 [docs/DESIGN.md](docs/DESIGN.md) with the reasoning, and in the commit history.
 
-**`--no-gpu` video is not reproducible run to run.** On the default input path 11 of 24
-identical runs produced a different result, so it is close to a coin flip rather than a
-rare event. That is a real race or uninitialised read in the host pipeline, and it is not
-localised. The suite reports it rather than failing, so the rest of the sweep stays usable
-while it is open, and it says "no divergence observed" rather than "deterministic" —
-8 runs that agree is an observation, not a proof.
+**`--video-preserve-vfr` is off by default.** The mechanism is proven in isolation, not
+end to end — no genuinely variable-timestamp fixture could be produced on this machine.
 
-**The host video path reads planar YUV input at the wrong stride.** On `--no-gpu` with
-the default `yuv444p` input, the decoder delivers 3 bytes per pixel and the converter
-reads 6, as `uint16`, so every frame after the first is read from the wrong offset and the
-tail is uninitialised memory. The palette and the frame count are both correct, so nothing
-downstream notices; the result is a wrong picture that looks well-formed. `--input-mode
-rgba64` is unaffected, and the CUDA and OpenCL engines have their own conversion. The
-writeup, and why the fix is not a one-liner, is in
-[docs/DESIGN.md](docs/DESIGN.md).
+**There is no regression test for rotated video.** ffmpeg cannot *write* a display
+matrix, so the fixture cannot be generated the obvious way.
+
+**The suite cannot check the host video path for correctness.** `probe-video-exact`
+compares `--engine blocks` against `--engine opencl` — both *device* engines — and the
+host path is only ever checked for *determinism*. **Four** separate faults lived in
+exactly that gap, including one that made `--no-gpu` wrong at every `--batch-frames`
+above 3, which is the default. They are now fixed and the host path is byte-identical to
+CUDA at every batch size, but nothing in `verify.ps1` would have caught them and nothing
+there will catch the next one. See [docs/DESIGN.md](docs/DESIGN.md).
 
 **Intel and AMD iGPUs are untested.** No hardware was available, so no claim is made
 either way. `tools\probe-opencl.exe` is the check.
 
-**Faults in this class need two builds and a GPU.** The OpenCL video path was broken
-in every `-DRD_WITH_CUDA=OFF` build -- 0 frames, exit 0, a malformed file -- while being
-correct on the image path in the same build. CI cannot see that: it has no GPU, so
-OpenCL is unavailable there rather than broken. It is found by building both
-configurations on one machine that has a GPU and comparing decoded pixels. The writeup
-is in [docs/DESIGN.md](docs/DESIGN.md).
+**OpenCL is unavailable in CI, not verified there.** The runners have no GPU, so the
+OpenCL engine skips rather than runs. Faults of the class "correct on images, broken on
+video in a `-DRD_WITH_CUDA=OFF` build" need two builds and a real GPU to find.
 
 ## Further reading
 

@@ -3295,7 +3295,7 @@ over a frame the encoder never saw and stall the predicate permanently.
 After: 24 runs, 1 distinct result, where before there were 2 at a divergence rate of
 0.458.
 
-### The same check could not see it, and a second fault is behind it
+### The same check could not see it, and two more faults were behind it
 
 `probe-video-exact` compares `--engine blocks` against `--engine opencl` -- **both
 device engines**. The host path is only ever checked for determinism, never against a
@@ -3303,7 +3303,7 @@ device engine for correctness, and on a runner with no GPU that comparison skips
 entirely. So the host path has no reference anywhere in the suite, and a wrong-but-
 stable result passes every check there is.
 
-Which is what a second fault is. With the ordering fixed, output became deterministic
+Which is what the next two faults are. With the ordering fixed, output became deterministic
 but a multi-batch run still does not match a single-batch one -- and at
 `--batch-frames 1`, **none** of the 30 output frames appear in the single-batch output
 at all. The palette is byte-identical across every batch size, and `RiemersmaBlocksCpu`
@@ -3327,21 +3327,141 @@ returning `total_px * 3`, so the two paths agree on the allocation and disagree 
 how to read it.
 
 That is the probe header's "INPUT FORMAT (NOT FIXED)" item, now reduced to a unit
-mismatch rather than a mystery. It is not fixed here, and the fix is not small: the
-host needs the planar YCbCr-to-float routine transliterated from the device so the
-engines agree bit for bit, which is the only version of this fix worth having.
+mismatch rather than a mystery. **It is fixed**, in the only form worth having: the
+device's `d_sws_yuv_to_rgb16` was transliterated to the host as `SwsYuvToRgb16`, same six
+coefficients and the same `av_clip_uintp2` tail, and `RawYuv444ToFloatsParallel` walks the
+three planes per frame. A near-equivalent would have been a hue shift — the comment above
+the device function records that an earlier float approximation of the same matrix
+produced a measurably different picture — so "port it, do not derive it" was the only
+version worth writing. See the next section for what fixing it exposed.
 
-### Two things that cost time and were worth writing down
+### The writer's plane stride was the whole batch, not one frame
 
-**A stale control binary looked like intermittency.** The OpenCL fault above was first
-recorded as intermittent, which was wrong: it is deterministic. The confusion came from
-comparing a CUDA build compiled before three commits against a fresh `--no-cuda` one.
+Fixing the input stride produced a result that should have been impossible: the host path
+at `--batch-frames 1` became **byte-identical** to the CUDA engine, in both input modes,
+while `--batch-frames 4` and above stayed wrong. Same dither, same palette, same
+converter. A threshold at 4 and not at 2 points at one number, and the number is
+`writer_convert_threads`:
+
+```cpp
+const int writer_convert_threads =
+    std::max(1, std::min(3, static_cast<int>(std::thread::hardware_concurrency()) - 2));
+```
+
+Three. So `frames > 3` means the frame splitter hands a chunk of more than one frame to
+the converter, and that is where it breaks.
+
+The converter is two functions. The worker is fine — it splits by frame and steps the
+destination by `f0 * pixels * 3`, which is the per-frame planar layout. The leaf is not:
+
+```cpp
+void FloatsToYuv444(const RgbaF* src, unsigned char* dst, std::size_t pixels) {
+  ...
+  dst[i]           = yv;   // Y
+  dst[pixels + i]  = uv;   // U
+  dst[2 * pixels + i] = vv;
+}
+```
+
+`pixels` is the **plane stride** as well as the pixel count, so the function is correct for
+exactly one frame and silently wrong for any number of them: handed four frames it writes
+all four Y planes, then all four U, then all four V. The splitter passed `count = (f1-f0) *
+pixels` as that stride, so per-frame destination offsets and a batch-wide plane stride
+disagreed about where frame *f*'s chroma lives. The two `frames * pixels` early-returns
+had the same defect for *any* `frames > 1`.
+
+The symptom is worth recording because it is diagnostic and it is not noise. The output
+drifted **brighter the further into the clip it came** — sampled means of 125.1, 127.3,
+129.3, 130.3 at frames 0, 1, 15 and 27, against a reference that sits flat at 104-106.
+Each multi-frame chunk puts a later frame's luma where an earlier frame's chroma belongs,
+so the error accumulates monotonically and no frame looks obviously broken. The last
+partial batch was correct, because its frames fitted in one chunk.
+
+`--batch-frames` defaults to **16**, so this was not an edge case. The host video path was
+wrong by default, in every build, and had been for as long as the function existed.
+
+**How it was localised in three runs.** The suspicion had been the dither or the reader,
+and both had been cleared by reading. What settled it was switching the writer to a
+different function: `RD_YUV444_OUT=0` selects the interleaved `FloatsToRawParallel`, where
+a multi-frame call is inherently correct because there are no planes. Under it, batch 1 and
+batch 16 became **byte-identical**. The dithered floats did not depend on batch size at
+all, which eliminates everything upstream of the writer in one measurement instead of by
+inspection.
+
+**Verified after the fix** — host vs CUDA, byte for byte, at 320x180 and at 1920x1080:
+
+| check | result |
+|---|---|
+| `--batch-frames` 1, 2, 3, 4, 5, 6, 7, 8, 10, 15, 16, 17, 30 | 13 of 13 byte-identical to CUDA |
+| 1920x1080 (not a power of two, so the curve revisits pixels) | byte-identical at 1, 4, 16 |
+| `--input-mode rgba64`, `yuv444-prepass` | byte-identical |
+| `RD_YUV444_OUT=0` (interleaved writer) | unchanged, batch-invariant |
+
+**Why nothing caught it.** `probe-video-exact` compares `--engine blocks` against
+`--engine opencl` — both *device* engines. The host is only ever checked for determinism,
+and this failure is perfectly deterministic: identical bytes on every run. Three separate
+faults lived in that gap, and the honest conclusion is not "the third was subtle" but that
+the suite had no check with the right shape. A wrong-but-stable result passes every
+determinism probe ever written. The check that finds this class is host-vs-device on
+decoded pixels, which is why the README now says the gap is still there and will catch
+nothing.
+
+### Four measurements of mine that were wrong, and what fixed them
+
+**A stale control binary looked like intermittency.** The OpenCL fault recorded above was
+first written up as intermittent, which was wrong: it is deterministic. The confusion came
+from comparing a CUDA build compiled before three commits against a fresh `--no-cuda` one.
 Build both configurations before comparing them.
 
-**A metric that was wrong in a way that flattered the answer.** To check frame order
-after the fix, per-frame mean luminance was used, on the reasoning that it survives
-dithering. It does -- and it is too weak: `testsrc` has a moving element, so its
-per-frame mean drifts, and an offset of -3 "aligned" every case *including a single
-batch, which cannot be permuted at all*. A check whose best fit is found at a
-non-zero offset on data known to be in order is measuring its own noise. The right
-fixture marks each frame so dithering cannot move it.
+**A metric that was wrong in a way that flattered the answer.** To check frame order after
+the ordering fix, per-frame mean luminance was used, on the reasoning that it survives
+dithering. It does — and it is too weak: `testsrc` has a moving element, so its per-frame
+mean drifts, and an offset of −3 "aligned" every case *including a single batch, which
+cannot be permuted at all*. A check whose best fit is found at a non-zero offset on data
+known to be in order is measuring its own noise. The right fixture marks each frame so
+dithering cannot move it.
+
+**A metric compared against a baseline that was itself broken.** The evidence recorded
+above for the input-stride fault was "at `--batch-frames 1`, 0 of 30 output frames appear
+in the single-batch output". That is a real observation and it meant nothing, because the
+reference it was compared against was the host's own `--batch-frames 30` output — which
+this section shows was wrong for an unrelated reason. Both sides were the faulty engine.
+The metric only became evidence once a trusted baseline existed, and the batch-invariance
+premise was confirmed *first* on the CUDA build as a control: 30 of 30 at both batch sizes
+and both input modes. Without that control I would have gone looking for a fault in the
+dither.
+
+**A trace that named the wrong process.** `RD_TRACE` logs every spawn. Filtering it for
+`-pix_fmt` matched the *decoder*, so `--video-pix-fmt yuv420p` appeared to have no effect
+on the encoder and the flag looked like an inert ghost that only altered a warning string.
+`ffprobe` on the output file said `pix_fmt=yuv420p`: the flag works, reaches the encoder,
+and the warning about chroma subsampling was true. I was one command from adding a
+refusal for a flag that works. When a trace suggests an argument is ignored, confirm it
+against the artefact before concluding the argument is inert — the trace shows what was
+attempted, the artefact shows what happened.
+
+### The colour-format warning is conditional, and where it fires it is true
+
+Reported as "the console always warns about colour formats and colour loss even when the
+colour format is chosen properly". Measured across eight flag combinations, the warning
+is **silent in six** and fires in two, both provably correct:
+
+| flags | console | ffprobe on the output |
+|---|---|---|
+| defaults (`libx264`) | warns: lossy compression invents colours | `yuv444p`, lossy codec |
+| `--video-lossless` | silent | `yuv444p` |
+| `--video-codec ffv1` | silent | `yuv444p` |
+| `ffv1` + `--video-pix-fmt yuv444p` | silent | `yuv444p` |
+| `ffv1` + `--video-pix-fmt yuv420p` | **warns: chroma subsampled** | **`yuv420p`** — correct |
+| `libx264` + `yuv444p` | warns: lossy | lossy codec |
+
+The warning derives its codec and pixel format from the same locals the encoder command
+uses (`enc_args += " -pix_fmt " + pix_fmt`), so it cannot describe a format that was not
+written. It is a warning about the file you are about to get, and it is right when it
+speaks.
+
+One real gap beside it: `--video-lossless` overrides an explicit `--video-pix-fmt` without
+saying so. `--video-lossless --video-pix-fmt yuv420p` writes `yuv444p`, which is the
+right call — the encoder cannot carry a palette through subsampling — but it discards a
+stated argument in silence, and this codebase's own rule is to refuse rather than to
+quietly reinterpret.
