@@ -663,6 +663,7 @@ Beyond that suite, `verify.ps1` also runs:
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
 | `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count, on each of the three engines | 3/3 |
 | `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
+| `tools\probe-video-invariance.ps1` | `--batch-frames 16` gives the same pixels as `1`, and `--no-gpu` the same as the device | 2/2, 1 half skipped without a GPU |
 
 That last one is the odd one out and earns its place. The cross-engine checks compare two
 engines against each other, which makes them **structurally blind to a fault both engines
@@ -689,13 +690,15 @@ end to end — no genuinely variable-timestamp fixture could be produced on this
 **There is no regression test for rotated video.** ffmpeg cannot *write* a display
 matrix, so the fixture cannot be generated the obvious way.
 
-**The suite cannot check the host video path for correctness.** `probe-video-exact`
-compares `--engine blocks` against `--engine opencl` — both *device* engines — and the
-host path is only ever checked for *determinism*. **Four** separate faults lived in
-exactly that gap, including one that made `--no-gpu` wrong at every `--batch-frames`
-above 3, which is the default. They are now fixed and the host path is byte-identical to
-CUDA at every batch size, but nothing in `verify.ps1` would have caught them and nothing
-there will catch the next one. See [docs/DESIGN.md](docs/DESIGN.md).
+**A fault that the host and the device share in the video path is still invisible.**
+`probe-video-invariance.ps1` compares the host against the device, so it catches a host
+answer that differs — which is where **four** separate faults lived, one of them making
+`--no-gpu` wrong at every `--batch-frames` above 3, which is the default. But if both
+agreed on something wrong, it would pass, exactly as the cross-engine checks do. What
+would catch that class is a video comparison against a *known-good* render, and there is
+no committed golden clip: Matroska embeds a random SegmentUID and a writing timestamp, so
+files can never be compared byte-for-byte, and a pixel golden would have to be regenerated
+whenever the palette or the walk changed. See [docs/DESIGN.md](docs/DESIGN.md).
 
 **Intel and AMD iGPUs are untested.** No hardware was available, so no claim is made
 either way. `tools\probe-opencl.exe` is the check.

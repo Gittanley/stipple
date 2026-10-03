@@ -3465,3 +3465,68 @@ saying so. `--video-lossless --video-pix-fmt yuv420p` writes `yuv444p`, which is
 right call — the encoder cannot carry a palette through subsampling — but it discards a
 stated argument in silence, and this codebase's own rule is to refuse rather than to
 quietly reinterpret.
+
+### A check that counts a skip as a pass, printed directly under the skip
+
+`probe-video-determinism.ps1` tallied `$total - $fail` over `$total`, and `$total` counts
+every case including the ones that never ran. On a GPU-less build it therefore printed
+
+```
+  cuda     SKIPPED (no usable device: --engine blocks requested for video but no CUDA device)
+  opencl   ok    1 pixel set over 8 runs ...
+  cpu      ok    1 pixel set over 8 runs ...
+  3 of 3 cases deterministic.
+```
+
+Three of three, one line below a case that did not run. It is the same mistake as the
+mislabelled `FAILED` tally this probe already carries a comment about — "2 of 3 cases
+FAILED" printed when 2 of 3 passed — and the same lesson: a tally that miscounts its own
+coverage is worse than no tally, because it is the one line a reader skims. Found by
+reading a real CI-configuration log rather than by a failing test, which is the worst way
+to find it: every assertion in that run was true and the suite was green.
+
+Now `$ran = $total - $skipped`, and the line reads `2 of 3 cases deterministic, 1 SKIPPED
+for want of a device.  Skips are not passes.` A green run and a correct run are not the
+same thing, and this project has now been bitten by that twice in the same file.
+
+### The check that would have caught all of it, added after
+
+`tools/probe-video-invariance.ps1`, wired into `verify.ps1`. Two parts, because the two
+halves of the gap need different hardware and only one of them is available on a CI
+runner:
+
+- **Batch invariance**: `--batch-frames 16` against `--batch-frames 1`, compared pixel by
+  pixel. No GPU required, so it runs on every push. Batch 1 is the reference because it
+  is the one setting under which this fault class *cannot* appear — with one frame per
+  batch the converter's 2x stride never applies, because each frame is read from offset 0
+  of its own buffer.
+- **Host against device**: `--engine blocks --no-gpu` against `--engine blocks`. The
+  comparison no check here had ever made. Skips without a GPU, and says so.
+
+Verified to actually fail, by rebuilding `src/rd_video.cpp` at `dc1f3d6` — which has the
+ordering fix but not the two stride fixes — and running the probe against it:
+
+| | fixed | pre-fix |
+|---|---|---|
+| exit | 0 | **1** |
+| part A | identical | **FAIL, 30 of 30 frames differ, first at frame 0** |
+| part B | byte-identical | **FAIL, host vs device differ** |
+
+A check that has never failed is not known to work, so that is the measurement that
+matters. The control still passed on the broken build, which is the other half of it: the
+control is there to stop a renderer that did nothing from passing, and it did not fire,
+so parts A and B are what caught the fault rather than the control misfiring.
+
+The control exists because "these two renders agree" is also what a renderer that dithered
+nothing reports, and what two runs of the same broken pipeline report. Before the
+reference is used it must have the right frame count read *from the container* rather than
+from rdither's own report, must differ from the source, and must not be constant.
+
+What it still cannot catch, and this is now in Known limitations rather than assumed
+away: a fault the host and the device **share** in the video path. The probe compares
+them to each other, so they agreeing on something wrong passes it — exactly as the
+cross-engine checks do. Catching that needs a committed golden render, and there is
+none: Matroska embeds a random SegmentUID and a writing timestamp, so files can never be
+compared byte for byte, and a pixel golden would need regenerating whenever the palette
+or the walk changed, which is a fixture that rots quietly and then gets "updated" without
+review.

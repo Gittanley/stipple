@@ -279,4 +279,23 @@ if (Test-Path $vdet) {
     default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
+# And a sixth, and the one that closes a gap four faults lived in: does the video
+# pipeline give the same ANSWER at different batch sizes, and does the host give the
+# same answer as the device?  probe-video-exact compares two DEVICE engines, and
+# probe-video-determinism checks the host for DETERMINISM, which is structurally blind
+# to a wrong-but-stable answer -- three of the four host faults were exactly that.  The
+# batch half needs no GPU, so unlike the device half it runs on every CI push, which is
+# the only reason it can catch anything there.
+$vinv = Join-Path $PSScriptRoot 'tools\probe-video-invariance.ps1'
+if (Test-Path $vinv) {
+  Write-Host ""
+  $vinvArgs = @('-Rdither', $Rdither)
+  if ($genAudio) { $vinvArgs += @('-Clip', $genAudio) }
+  & pwsh -NoProfile -File $vinv @vinvArgs
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "video invariance: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "video invariance: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
 exit 0

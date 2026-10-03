@@ -312,8 +312,20 @@ foreach ($c in $cases) {
 Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
 
 ''
+# A SKIPPED case is not a deterministic case.  The tally below divided by $total,
+# which counts every case including the ones that never ran, so a GPU-less build
+# printed "3 of 3 cases deterministic" immediately under a line reading
+# "cuda  SKIPPED (no usable device)".  That is a false claim in the one line a reader
+# skims, and it is the same mistake as the mislabelled FAILED tally below -- a tally
+# that miscounts its own coverage is worse than no tally.  Found by reading a real
+# CI-configuration log, where the skip was on screen directly above the claim.
+$ran = $total - $skipped
 if ($fail -eq 0) {
-  "{0} of {1} cases deterministic." -f ($total - $fail), $total
+  if ($skipped -gt 0) {
+    "{0} of {1} cases deterministic, {2} SKIPPED for want of a device.  Skips are not passes." -f $ran, $total, $skipped
+  } else {
+    "{0} of {1} cases deterministic." -f $ran, $total
+  }
   exit 0
 }
 # "2 of 3 cases FAILED" was printed when 2 of 3 cases PASSED: the count was
@@ -321,6 +333,6 @@ if ($fail -eq 0) {
 # in this session, once by me while checking whether the OpenCL fault was a real
 # failure, and it would be misread by anyone skimming a green run.  A tally that
 # mislabels its own direction is worse than no tally.
-if ($fail -eq 0) { "all {0} cases deterministic." -f $total } else { "{0} of {1} cases FAILED." -f $fail, $total }
-if ($skipped -gt 0) { "{0} case(s) SKIPPED for want of a device.  These are not passes." -f $skipped }
+if ($fail -eq 0) { "all {0} cases deterministic." -f $total } else { "{0} of {1} cases FAILED." -f $fail, ($total - $skipped) }
+if ($skipped -gt 0) { "{0} of {1} case(s) SKIPPED for want of a device.  These are not passes." -f $skipped, $total }
 exit 1
