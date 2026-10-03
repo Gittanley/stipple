@@ -304,6 +304,98 @@ void RawToFloatsParallel(const std::uint16_t* raw, RgbaF* dst, std::size_t pixel
   for (std::thread& t : pool) t.join();
 }
 
+// swscale's 8-bit YUV -> 16-bit RGB, bit-exact.  PORTED from the device's
+// d_sws_yuv_to_rgb16 rather than derived a third time, because a near-equivalent here
+// is a hue shift: the device comment above that function records that an earlier float
+// approximation of the same matrix produced a measurably different picture.
+inline std::uint16_t SwsClip16(int x) {
+  const int v = x + (1 << 15);
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return static_cast<std::uint16_t>(v);
+}
+
+inline void SwsYuvToRgb16(unsigned y, unsigned u, unsigned v, std::uint16_t* out) {
+  int yy = static_cast<int>((y - 128u) * 512u);
+  const int uu = static_cast<int>((u - 128u) * 512u);
+  const int vv = static_cast<int>((v - 128u) * 512u);
+  yy += 0x10000;
+  yy -= 8192;                              // yuv2rgb_y_offset
+  yy *= 9539;                              // yuv2rgb_y_coeff
+  yy += (1 << 13) - (1 << 29);
+  const int ri = vv * 13075;               // yuv2rgb_v2r_coeff
+  const int gi = vv * -6660 + uu * -3209;  // v2g, u2g
+  const int bi = uu * 16525;               // yuv2rgb_u2b_coeff
+  out[0] = SwsClip16((ri + yy) >> 14);
+  out[1] = SwsClip16((gi + yy) >> 14);
+  out[2] = SwsClip16((bi + yy) >> 14);
+}
+
+// Planar 8-bit 4:4:4 -> RgbaF, for the host paths.  This is the conversion the host
+// never had.
+//
+// A frame here is three planes of `pixels` bytes -- Y, then Cb, then Cr -- so the frame
+// stride is 3 * pixels BYTES.  It was being handed to RawToFloats, which takes a
+// `const std::uint16_t*` and strides by pixels * channels uint16: twice the distance,
+// in the wrong unit.  Frame f was written at byte f*pixels*3 and read from
+// f*pixels*6, so every frame after the first was read from the wrong place and the tail
+// was uninitialised heap.
+//
+// Nothing noticed, which is the part worth recording.  The palette came out
+// byte-identical across every batch size, the frame count was right, and
+// RiemersmaBlocksCpu zeroes its error queue per frame per block -- so the dither could
+// not average the error away, and no check compared the host path against a known-good
+// one.  A run at --batch-frames 1 produced 0 of 30 frames that appear in the
+// single-batch output: wrong content, well-formed file.
+//
+// The device has always had this (BlkGatherYuv444Kernel, gated on upload_u16).  Only
+// the host lacked it, which is why it survived: probe-video-exact compares two DEVICE
+// engines, and the host is only ever checked for determinism -- a wrong-but-stable
+// result passes every check there is.
+void RawYuv444ToFloats(const unsigned char* raw, RgbaF* dst, std::size_t pixels,
+                       std::size_t frames) {
+  const std::size_t plane = pixels;  // bytes per plane, per frame
+  for (std::size_t f = 0; f < frames; ++f) {
+    const unsigned char* p = raw + f * 3 * plane;
+    RgbaF* d = dst + f * pixels;
+    for (std::size_t i = 0; i < pixels; ++i) {
+      std::uint16_t rgb[3];
+      SwsYuvToRgb16(p[i], p[plane + i], p[2 * plane + i], rgb);
+      d[i].r = static_cast<float>(rgb[0]);
+      d[i].g = static_cast<float>(rgb[1]);
+      d[i].b = static_cast<float>(rgb[2]);
+      d[i].a = static_cast<float>(65535.0);
+    }
+  }
+}
+
+// The same conversion split across cores by frame -- the shape RawToFloatsParallel
+// already has, with the byte stride the planar layout actually has.
+void RawYuv444ToFloatsParallel(const unsigned char* raw, RgbaF* dst, std::size_t pixels,
+                               int frames, int threads) {
+  if (frames <= 1 || threads <= 1 || threads >= frames) {
+    RawYuv444ToFloats(raw, dst, pixels, static_cast<std::size_t>(frames));
+    return;
+  }
+  const int workers = std::max(1, std::min(threads, frames));
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  const int chunk = (frames + workers - 1) / workers;
+  for (int w = 1; w < workers; ++w) {
+    const int f0 = w * chunk;
+    if (f0 >= frames) break;
+    const int f1 = std::min(frames, f0 + chunk);
+    pool.emplace_back([=]() {
+      RawYuv444ToFloats(raw + static_cast<std::size_t>(f0) * pixels * 3,
+                        dst + static_cast<std::size_t>(f0) * pixels, pixels,
+                        static_cast<std::size_t>(f1 - f0));
+    });
+  }
+  const int f1 = std::min(frames, chunk);
+  RawYuv444ToFloats(raw, dst, pixels, static_cast<std::size_t>(f1));
+  for (std::thread& t : pool) t.join();
+}
+
 void FloatsToRaw(const RgbaF* src, std::uint16_t* dst, std::size_t pixels) {
   for (std::size_t i = 0; i < pixels; ++i) {
     dst[4 * i + 0] = static_cast<std::uint16_t>(src[i].r);
@@ -352,13 +444,45 @@ void FloatsToYuv444(const RgbaF* src, unsigned char* dst, std::size_t pixels) {
 
 void FloatsToYuv444Parallel(const RgbaF* src, unsigned char* dst,
                             std::size_t pixels, int frames, int threads) {
+  // Every path below converts ONE FRAME at a time, and that is the whole point.
+  //
+  // FloatsToYuv444 uses its `pixels` argument as the PLANE STRIDE as well as the pixel
+  // count, so it is correct only for a single frame.  Handed `count` pixels spanning
+  // several frames it writes every frame's Y, then every frame's U, then every frame's
+  // V -- batch-planar -- where the encoder is told to expect each frame's Y, U and V
+  // together.  The two layouts disagree about where frame f's chroma lives, and the
+  // result fails silently: right frame count, right palette, plausible picture, wrong
+  // pixels, drifting brighter the further into the clip you get.
+  //
+  // This function did exactly that.  The parallel path stepped dst by f0 * pixels * 3
+  // (per-frame layout) while passing `count` as the helper's plane stride (batch-planar
+  // layout), and those agree only while a chunk is a single frame.  The two serial
+  // early-returns were wrong for ANY frames > 1.  Because writer_convert_threads is
+  // capped at 3, every --batch-frames above 3 took a multi-frame chunk -- which is the
+  // default of 16, so the host path was wrong by default and right only by accident at
+  // 1, 2 and 3.
+  //
+  // Measured on 320x180 against the CUDA engine as reference: host output was
+  // byte-identical at --batch-frames 1, 2 and 3 and wrong at 4, 5, 6, 7, 8, 9, 10, 11,
+  // 15, 16, 17 and 30.  With RD_YUV444_OUT=0 the interleaved writer is used instead
+  // and was batch-invariant throughout, which is what localised it here: the dithered
+  // floats were identical at every batch size, so nothing upstream of this call was
+  // involved.  Nothing in the suite could see it -- probe-video-exact compares two
+  // DEVICE engines, and the host path is only ever checked for determinism, which this
+  // failure is.
+  const auto convert_frames = [=](int f0, int f1) {
+    for (int f = f0; f < f1; ++f) {
+      FloatsToYuv444(src + static_cast<std::size_t>(f) * pixels,
+                     dst + static_cast<std::size_t>(f) * pixels * 3, pixels);
+    }
+  };
   if (frames <= 1 || threads <= 1) {
-    FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(frames));
+    convert_frames(0, frames);
     return;
   }
   const int workers = std::max(1, std::min(threads, frames));
   if (workers == 1) {
-    FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(frames));
+    convert_frames(0, frames);
     return;
   }
   // Split by FRAME, not by byte.  A frame is three contiguous planes, so a
@@ -374,13 +498,9 @@ void FloatsToYuv444Parallel(const RgbaF* src, unsigned char* dst,
     const int f0 = w * chunk;
     if (f0 >= frames) break;
     const int f1 = std::min(frames, f0 + chunk);
-    const std::size_t count = static_cast<std::size_t>(f1 - f0) * pixels;
-    pool.emplace_back([=]() {
-      FloatsToYuv444(src + static_cast<std::size_t>(f0) * pixels,
-                     dst + static_cast<std::size_t>(f0) * pixels * 3, count);
-    });
+    pool.emplace_back([=]() { convert_frames(f0, f1); });
   }
-  FloatsToYuv444(src, dst, pixels * static_cast<std::size_t>(first));
+  convert_frames(0, first);
   for (std::thread& t : pool) t.join();
 }
 
@@ -2391,6 +2511,21 @@ bool VideoProcess(const std::string& in, const std::string& out,
   const bool want_opencl = opt.gpu_engine == VideoOptions::GpuEngine::kOpenCL;
   const bool use_gpu = opt.use_gpu &&
                        (want_opencl ? OpenCLAvailable(nullptr, nullptr) : CudaAvailable());
+  // 4:2:0 on the host has no chroma reconstruction, and the alternative is worse than
+  // useless: it was being handed to the rgba64le converter, which strides by
+  // pixels * 4 uint16 over a buffer holding pixels * 1.5 bytes, so it read past the
+  // frame into the next one and off the end of the allocation.  The device has a real
+  // bilinear reconstruction (BlkGatherYuv420Kernel); porting it is a second piece of
+  // work and not the same shape as the 4:4:4 fix above, so until it exists this
+  // refuses rather than emitting plausible garbage.  The rule the codebase already
+  // follows twice over, for the 4:4:4 plane stride and the input/output size collision.
+  if (use_yuv420 && (!use_gpu || opt.gpu_float_out)) {
+    *error =
+        "[video] --input-mode yuv420 needs a GPU engine to reconstruct chroma; this\n"
+        "        run has the host doing the conversion, which does not implement it.\n"
+        "        Use --input-mode yuv444 (the default) or rgba64, or build with CUDA.\n";
+    return false;
+  }
   if (opt.use_gpu && !use_gpu) {
     if (want_opencl) {
       std::string why;
@@ -2706,8 +2841,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // it where it *is* required leaves b.pixels at its zero-initialised value and
         // the whole clip comes out black, so the condition is explicit.
         if (!use_gpu || opt.gpu_float_out) {
-          RawToFloatsParallel(b.in(), b.pixels.data(), pixels, filled,
-                              reader_convert_threads, dec_channels);
+          if (use_yuv444) {
+            // Planar 8-bit, three BYTES per pixel.  RawToFloats would read this as
+            // uint16 and land on frame f-1's chroma planes, which is right for frame 0
+            // and nonsense for every frame after it.
+            RawYuv444ToFloatsParallel(
+                reinterpret_cast<const unsigned char*>(b.in()), b.pixels.data(),
+                pixels, filled, reader_convert_threads);
+          } else {
+            RawToFloatsParallel(b.in(), b.pixels.data(), pixels, filled,
+                                reader_convert_threads, dec_channels);
+          }
         }
         b.frames = filled;
         {

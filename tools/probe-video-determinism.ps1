@@ -147,11 +147,13 @@ $cases = @(
   #  * --engine blocks FALLS BACK TO THE HOST when there is no CUDA device -- measured,
   #    on a -DRD_WITH_CUDA=OFF build -- so this case was never blocked by the missing
   #    engine in the first place.  The change was not what let it run.
-  #  * This case is the one carrying the known host-path non-determinism, and the
-  #    KNOWN DEFECT reporting is keyed to the case NAME at line ~207.  Renaming the
-  #    engine silently moved that defect out of "reported, not failed" and into a hard
-  #    failure -- and --engine cpu is deterministic, so the case that failed was a
-  #    different code path than the one being reported on.
+  #  * This case was the one carrying the host-path faults, and the KNOWN DEFECT
+  #    reporting used to be keyed to the case NAME.  Renaming the engine would have
+  #    silently moved those defects out of "reported, not failed" and into a hard
+  #    failure -- and --engine cpu is deterministic, so the case that failed would have
+  #    been a different code path than the one being reported on.  All of those faults
+  #    are fixed and the bypass is gone, so the case name no longer carries that weight;
+  #    the note is kept because the fragility was real, not because it still applies.
   #
   # So it stays.  The real gap is that `--engine blocks` falling back to the host with
   # no diagnostic is its own defect: rd_video.cpp refuses exactly that fallback for
@@ -169,11 +171,13 @@ $total = 0
 
 foreach ($c in $cases) {
   $total++
-  # The CPU case is a KNOWN, UNFIXED BUG and is reported rather than failed, so that
-  # the rest of the sweep stays usable while it is open.  It is not suppressed: the
-  # numbers are printed, the word DEFECT is printed, and the summary says so.
+  # The `cpu` case was a KNOWN, UNFIXED BUG and was reported rather than failed so the
+  # rest of the sweep stayed usable while it was open.  It is FIXED and the bypass is
+  # GONE: a divergence in this case is now a hard failure, which is the only way the
+  # check can catch the next one.  The comment below used to say "if this case starts
+  # PASSING, remove the bypass" -- it does, so it was removed.
   #
-  # What it is.  THREE defects, not one, and separating them was the hard part --
+  # What it WAS.  THREE defects, not one, and separating them was the hard part --
   # fixing the first exposed the other two rather than clearing the case.
   #
   # 1. OUTPUT FORMAT (FIXED).  `--no-gpu` never implemented the host-side
@@ -182,34 +186,31 @@ foreach ($c in $cases) {
   #    measured the frame with `out_frame_bytes = out_yuv444 ? pixels * 3 : ...`
   #    and spawned the encoder with `-pix_fmt yuv444p`, which is 3.  The host pushed
   #    8 into a pipe declared as 3; the encoder read rgba64le as planar YUV and the
-  #    stream desynchronised, so a red band came out green.  FloatsToYuv444 in
-  #    rd_video.cpp now does the conversion, transliterated from `d_rgb_to_yuv444`
-  #    so the three engines agree bit for bit.  Verified: on the rgba64le path, where
-  #    the output format is 8 bytes per pixel on both sides, `--no-gpu` and CUDA are
-  #    now **AE 0** against each other.
+  #    stream desynchronised, so a red band came out green.
   #
-  # 2. INPUT FORMAT (NOT FIXED).  The mirror image, and it is why the default
-  #    yuv444p path still shows AE 294,054.  `RawToFloatsParallel` takes a
-  #    `const std::uint16_t*`, but on the default path the decoder delivers **8-bit
-  #    planar** yuv444p -- `in_frame_bytes` is `pixels * 3`, a byte count, while the
-  #    converter reads 16-bit elements.  So it consumes twice the data that was
-  #    written and the tail is whatever the buffer held before.  The fix is the
-  #    matching host-side swscale YCbCr -> RGB, transliterated from
-  #    `sws_yuv_to_rgb16`; not written.
+  # 2. INPUT FORMAT (FIXED).  `RawToFloatsParallel` took a `const std::uint16_t*`, but
+  #    the decoder delivers **8-bit planar** yuv444p -- `in_frame_bytes` is `pixels * 3`
+  #    bytes while the converter read 16-bit elements, consuming twice what was written
+  #    and leaving the tail as whatever the buffer held.  The device's
+  #    `d_sws_yuv_to_rgb16` is now transliterated to the host as `SwsYuvToRgb16` so the
+  #    engines agree bit for bit.
   #
-  # 3. NON-DETERMINISM (NOT FIXED, and independent of both).  Two runs of the
-  #    identical rgba64le command -- where every format agrees and neither of the
-  #    mismatches above can apply -- still differ by AE 376,067.  So there is a
-  #    genuine race or uninitialised read in the host pipeline, and it is the one that
-  #    matters most, because it would survive both of the other fixes.  Not yet
-  #    localised.
+  # 3. NON-DETERMINISM (FIXED).  Frames were written to the encoder in worker-completion
+  #    order: `done` was a deque of slot indices carrying no position, so the writer took
+  #    `done.front()`.  With one batch that was correct by accident; with several it
+  #    interleaved them.  `Batch::first_frame` now carries the position and the writer
+  #    waits for its turn.
   #
-  # The two-format mismatch defects together accounted for the 48.7% figure and the
-  # red-becomes-green symptom.  The comment above `out_frame_bytes` in rd_video.cpp
-  # records this bug class being found once before -- "sharing one meant a 605-frame
-  # render came out as 226" -- and that fix covered the GPU path, where the device
-  # writes 4:4:4 and the two counts agree.  The host path is not the default, which
-  # is why nothing noticed.
+  # A FOURTH surfaced while fixing the second, and it was the worst of them: the
+  # host writer's plane stride was the whole BATCH rather than one frame, so
+  # `FloatsToYuv444Parallel` wrote every frame's Y then every frame's U then every
+  # frame's V.  `writer_convert_threads` is capped at 3, so every `--batch-frames` above
+  # 3 was wrong -- including the default of 16.  A wrong-but-STABLE result, so nothing
+  # here could ever have seen it.
+  #
+  # Verified after the fix: `--no-gpu` and CUDA agree BYTE FOR BYTE on video at every
+  # --batch-frames from 1 to 30, in yuv444, yuv444-prepass and rgba64, at 1920x1080 as
+  # well as 320x180.  The writeups are in docs/DESIGN.md.
   #
   # Ruled out by measurement along the way, each of which was a wrong guess first:
   # the palette (identical -- 3 colours, 100% mean saturation, both engines), the
@@ -224,11 +225,6 @@ foreach ($c in $cases) {
   # 60, and conclusions drawn from them about magnitude were wrong.  Count bytes
   # over the whole decode instead -- and do not byte-loop 500 MB in PowerShell, which
   # is slow enough to time out.
-  #
-  # Downgrading the case here is a reporting decision, not a judgement that it is
-  # acceptable.  If this case starts PASSING, remove the bypass: that is the signal
-  # it was fixed.
-  $known = ($c.name -eq 'cpu')
 
   if ($c.env) { Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue }
   else { $env:RD_YUV444_OUT = '0' }
@@ -258,12 +254,10 @@ foreach ($c in $cases) {
       break
     }
     # A case named for an engine must not report a result for an engine it did not
-    # use.  `--engine blocks` on a build with no CUDA device FALLS BACK TO THE HOST
-    # with no diagnostic, so on the CI runner the case named `cuda` was quietly
-    # measuring the host -- and then failing for exactly the reason the `cpu` case is
-    # already reported as a KNOWN DEFECT.  The same bug, counted twice, once failed
-    # and once excused, which is how this was found: the run went red on a defect the
-    # suite had already decided how to report.
+    # use.  `--engine blocks` on a build with no CUDA device used to FALL BACK TO THE
+    # HOST with no diagnostic, so on the CI runner the case named `cuda` was quietly
+    # measuring the host.  That is how the host faults below were first noticed: the
+    # same bug, counted twice, once failed and once excused.
     #
     # rdither now REFUSES that fallback rather than making it, so the refusal message
     # above normally catches this case first.  This check is kept as a backstop rather
@@ -301,12 +295,8 @@ foreach ($c in $cases) {
   }
 
   if ($null -ne $verdict) {
-    if ($known) {
-      "  $tag  KNOWN DEFECT (reported, not failed)  $($verdict[3])"
-    } else {
-      $fail++
-      "  $tag  $($verdict[2])  $($verdict[0]) of $($verdict[1]) $($verdict[3])"
-    }
+    $fail++
+    "  $tag  $($verdict[2])  $($verdict[0]) of $($verdict[1]) $($verdict[3])"
   } else {
     $n = ($counts.Keys)[0]
     $mb = [math]::Round((($hashes.GetEnumerator())[0].Value) / 1MB, 1)
@@ -324,24 +314,6 @@ Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
 ''
 if ($fail -eq 0) {
   "{0} of {1} cases deterministic." -f ($total - $fail), $total
-  if ($true) {
-    ''
-    'KNOWN DEFECT, still open, two parts of it:'
-    ''
-    '  * --no-gpu video does not reproduce run to run, and this survives --cpu-threads'
-    '    1, so it is not a worker race.  Two runs of the same rgba64le command, where'
-    '    every pixel format agrees, still differ.  A genuine race or uninitialised'
-    '    read in the host pipeline.  Not localised yet.'
-    ''
-    '  * --input-mode yuv444 on the host path is still wrong: the converter reads'
-    '    16-bit elements from a buffer the decoder filled with 8-bit planar data.'
-    '    The output side of that mismatch IS fixed -- on the rgba64le path, where the'
-    '    formats agree, --no-gpu and CUDA are now AE 0.'
-    ''
-    'Reported and deliberately not failed so the rest of the sweep stays usable, but'
-    'both are real and unfixed, and --no-gpu cannot be used to check the GPU on video'
-    'the way the README claims.  The header comment has the measurements.'
-  }
   exit 0
 }
 # "2 of 3 cases FAILED" was printed when 2 of 3 cases PASSED: the count was
