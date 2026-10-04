@@ -2223,6 +2223,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
                  : use_yuv444 ? pixels * 3
                               : pixels * static_cast<std::size_t>(dec_channels) *
                                     sizeof(std::uint16_t);
+  // The pageable `in16` fallback was sized `batch * pixels * dec_channels`, treating
+  // dec_channels as if it were a byte count for every mode.  It is a uint16 CHANNEL
+  // count, correct only for rgba64le.  In planar 4:4:4 -- the default -- that is 6
+  // bytes per pixel where the frame is 3, so the vector held twice what it needed:
+  // 759.4 MiB across a 16-frame batch at queue depth 8.  Size it from the byte
+  // figure the reader actually strides by, and round UP, because pixels*3/2 is not
+  // integral for an odd pixel count and truncating would leave the last frame's
+  // final byte outside the allocation.
+  const auto in16_elems_for = [&](int frames) {
+    return (static_cast<std::size_t>(frames) * in_frame_bytes + 1) / 2;
+  };
   // What the encoder is fed.  Planar 8-bit 4:4:4 by default: the device does the
   // RGB->YUV, which is 3 bytes per pixel against rgba64le's 8, and ffmpeg then has
   // nothing to convert.  Both halves matter -- the encode stage was measured blocked
@@ -2722,15 +2733,13 @@ bool VideoProcess(const std::string& in, const std::string& out,
       // the buffer was allocated on the requested engine rather than the resolved one,
       // here it is sized on the requested branch rather than the one that was taken.
       if (b.in16_pin == nullptr) {
-        b.in16.resize(static_cast<std::size_t>(batch) * pixels *
-                      static_cast<std::size_t>(dec_channels));
+        b.in16.resize(in16_elems_for(batch));
       }
       if (b.out16_pin == nullptr) {
         b.out16.resize(static_cast<std::size_t>(batch) * pixels * 4);
       }
     } else {
-      b.in16.resize(static_cast<std::size_t>(batch) * pixels *
-                    static_cast<std::size_t>(dec_channels));
+      b.in16.resize(in16_elems_for(batch));
       b.out16.resize(static_cast<std::size_t>(batch) * pixels * 4);
     }
   }

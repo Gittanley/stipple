@@ -13,6 +13,17 @@ namespace rd {
 namespace {
 
 // A scratch file that deletes itself when the handle closes.
+//
+// The handle is opened FILE_FLAG_DELETE_ON_CLOSE, so the name is released when the
+// LAST handle to the file goes away -- which is not this destructor.  PixelStore
+// keeps a second handle open for the file-mapping object, so the delete is deferred
+// to ~PixelStore, which is what we want: the bytes stay readable for the whole
+// lifetime of the mapping.  `spill_path_` may therefore name a file that does not
+// exist yet, and nothing may assume otherwise.
+//
+// The explicit DeleteFileA is redundant on that path and is kept for the failure
+// returns in Create that construct no PixelStore: there ~SpillFile is the only
+// destructor that runs.
 struct SpillFile {
   HANDLE handle = INVALID_HANDLE_VALUE;
   std::string path;
@@ -26,8 +37,15 @@ struct SpillFile {
 bool MakeSpillFile(SpillFile* out, std::string* error) {
   char temp_dir[MAX_PATH + 1] = {0};
   DWORD n = ::GetTempPathA(MAX_PATH, temp_dir);
-  if (n == 0 || n > MAX_PATH) {
-    *error = "GetTempPath failed";
+  // MAX_PATH bounds the BUFFER, not the prefix.  GetTempPathA returns the length
+  // excluding the NUL, so a temp directory using all MAX_PATH characters passes
+  // `n > MAX_PATH` while leaving no room for what GetTempFileNameA appends:
+  // an optional separator, the 3-char prefix, 4 random characters, ".tmp" and a
+  // NUL -- 13 bytes.  That wrote up to 271 bytes into the 261-byte `name` below.
+  // Only a long %TEMP% (deep profile paths, a redirected TEMP) reaches it.
+  constexpr std::size_t kTempFileNameSuffix = 1 + 3 + 4 + 4 + 1;
+  if (n == 0 || static_cast<std::size_t>(n) + kTempFileNameSuffix > MAX_PATH) {
+    *error = "the temporary directory path is too long for a spill file";
     return false;
   }
   char name[MAX_PATH + 1] = {0};
@@ -36,9 +54,13 @@ bool MakeSpillFile(SpillFile* out, std::string* error) {
     return false;
   }
   out->path = name;
+  // FILE_SHARE_DELETE, so the name can be marked delete-on-close below rather than
+  // relying on a destructor that runs while the mapping still holds a section.
   out->handle = ::CreateFileA(name, GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_TEMPORARY, nullptr);
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                              CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                              nullptr);
   if (out->handle == INVALID_HANDLE_VALUE) {
     *error = "CreateFile failed for spill file";
     return false;
