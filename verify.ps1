@@ -13,8 +13,34 @@ param(
   [string]$Rdither   = ".\build\Release\rdither.exe",
   [string]$Magick    = "magick",
   [int[]] $Colors    = @(2, 4, 16, 64, 256),
-  [string]$ImageDir  = "tests"
+  [string]$ImageDir  = "tests",
+  # Skip the stages that need a 1080p clip.  The full run is dominated by exactly those
+  # two, and they are also the only checks that can exercise the faults found this week:
+  # four of them needed 1080p video and the image suite would never have seen them.  But
+  # equally the image suite catches octree and curve regressions and needs no video at
+  # all, so paying 25-35 minutes for the union on every edit is the wrong trade.  -Fast
+  # is the inner loop; the default is still the full sweep, which is what CI runs.
+  [switch]$Fast
 )
+
+# Per-stage wall clock, printed at the end.  A slow run used to be reported only as a
+# total, with no attribution, so the obvious next step was to guess which stage to make
+# faster.  Each stage records its own time and the summary names them, so the next slow
+# run says where the time went.
+$stageTimes = [System.Collections.Generic.List[object]]::new()
+function Add-Stage([string]$Name, [double]$Ms) {
+  $stageTimes.Add([pscustomobject]@{ Name = $Name; Ms = $Ms })
+}
+function Stage([string]$Name, [scriptblock]$Body) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  try { & $Body } finally { $sw.Stop(); Add-Stage $Name $sw.Elapsed.TotalMilliseconds }
+}
+
+# Wall clock for the whole run, so the summary can attribute time to stages that have
+# no timer of their own rather than quietly dropping it.  On -Fast the named stages came
+# to 77s against a 145s wall clock, which is the kind of unattributed remainder that
+# makes a timing report worse than none: it looks like the answer.
+$swTotal = [Diagnostics.Stopwatch]::StartNew()
 
 # `magick compare -metric AE` reports its metric on stderr, which PowerShell
 # would otherwise promote to a terminating error under Stop.
@@ -35,6 +61,7 @@ $fixtures = @{
 }
 
 New-Item -ItemType Directory -Force $ImageDir | Out-Null
+$swBitExact = [Diagnostics.Stopwatch]::StartNew()
 foreach ($name in $fixtures.Keys) {
   $path = Join-Path $ImageDir "$name.png"
   if (-not (Test-Path $path)) {
@@ -130,6 +157,7 @@ if ($skipped -gt 0) {
   Write-Host "bit-exact cases: $pass passed, $fail failed"
 }
 if ($fail -gt 0) { exit 1 }
+$swBitExact.Stop(); Add-Stage 'bit-exact cases' $swBitExact.Elapsed.TotalMilliseconds
 
 # Bit-exactness against ImageMagick is a comparison between two implementations, so
 # it is structurally unable to see a fault that BOTH have.  The unfilled-pixel-channel
@@ -162,7 +190,15 @@ if (Test-Path $oclGen) {
     if ($line -match '^FIXTURE_DIR=(.+)$') { $oclFx = $Matches[1].Trim() }
     elseif ($line.Trim()) { Write-Host "  $($line.TrimEnd())" }
   }
-  if ($gCode -ne 0) { $oclFx = '' }
+  # A failed generator is NOT a skip.  Degrading it to one used to clear $oclFx,
+  # let the probe fall back to a default directory it may not have, and exit 2 --
+  # which this suite reports as SKIPPED and then still exits 0.  So a broken
+  # generator produced a green run with a stage silently absent, which is the one
+  # outcome a tally must never be able to express.  Fail here, where the cause is.
+  if ($gCode -ne 0) {
+    Write-Host "fixture generator failed (exit $gCode) -- refusing to report the stage as skipped" -ForegroundColor Red
+    exit 1
+  }
 }
 
 $det = Join-Path $PSScriptRoot 'tools\probe-determinism.ps1'
@@ -201,8 +237,12 @@ if (Test-Path $det) {
 # someone assume the video path is now fully covered.
 $genClip = ''
 $genAudio = ''
-$needFixtures = -not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920.mp4')) -or
-                -not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920_audio.mkv'))
+# -Fast skips the two stages that need a 1080p clip, so it must not spend the time
+# generating one either.  The fixture generator is not free -- it renders and verifies
+# two clips through ffmpeg -- and on the fast path nothing would consume the result.
+$needFixtures = (-not $Fast) -and (
+    (-not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920.mp4'))) -or
+    (-not (Test-Path (Join-Path $PSScriptRoot 'tests\clip1920_audio.mkv'))))
 if ($needFixtures) {
   $mk = Join-Path $PSScriptRoot 'tools\make-video-fixtures.ps1'
   if (Test-Path $mk) {
@@ -215,17 +255,23 @@ if ($needFixtures) {
       } elseif ($line.Trim()) { Write-Host "  $($line.TrimEnd())" }
     }
     if ($fxCode -ne 0) {
-      # Not fatal.  The probes keep their own defaults, hit the missing clip, and exit
-      # 2, which is reported as SKIPPED -- the same honest outcome as before, and the
-      # message above has already said why.
-      $genClip = ''
-      $genAudio = ''
+      # Not fatal in the sense of "skip the stage": the probes keep their own
+      # defaults, hit the missing clip and exit 2, which is reported as SKIPPED.
+      # But that is only honest if the reason is a missing fixture.  If OUR
+      # generator is what failed, the stage is not un-runnable, we broke it, and
+      # the suite must not come back green.  So distinguish the two.
+      Write-Host "video fixture generator failed (exit $fxCode)" -ForegroundColor Red
+      exit 1
     }
   }
 }
 
 $vid = Join-Path $PSScriptRoot 'tools\probe-video-exact.ps1'
-if (Test-Path $vid) {
+$swVid = [Diagnostics.Stopwatch]::StartNew()
+if ($Fast) {
+  Write-Host ""
+  Write-Host "video exactness: SKIPPED (-Fast: needs a 1080p clip; run without -Fast before committing)" -ForegroundColor Yellow
+} elseif (Test-Path $vid) {
   Write-Host ""
   $vidArgs = @('-Rdither', $Rdither)
   if ($genClip) { $vidArgs += @('-Clip', $genClip) }
@@ -242,6 +288,7 @@ if (Test-Path $vid) {
     default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
+$swVid.Stop(); Add-Stage 'video exactness' $swVid.Elapsed.TotalMilliseconds
 
 # And a fourth, which is the odd one out: it does not compare two engines, it
 # compares the output against the SOURCE.  That is deliberate, and it is the only
@@ -268,7 +315,11 @@ if (Test-Path $unv) {
 # would not have been caught by anything: probe-video-exact compares the engines
 # against each other, and both would drop the same frames.
 $vdet = Join-Path $PSScriptRoot 'tools\probe-video-determinism.ps1'
-if (Test-Path $vdet) {
+$swVdet = [Diagnostics.Stopwatch]::StartNew()
+if ($Fast) {
+  Write-Host ""
+  Write-Host "video determinism: SKIPPED (-Fast: the slowest stage by far; run without -Fast before committing)" -ForegroundColor Yellow
+} elseif (Test-Path $vdet) {
   Write-Host ""
   $vdetArgs = @('-Rdither', $Rdither)
   if ($genAudio) { $vdetArgs += @('-Clip', $genAudio) }
@@ -279,6 +330,7 @@ if (Test-Path $vdet) {
     default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
+$swVdet.Stop(); Add-Stage 'video determinism' $swVdet.Elapsed.TotalMilliseconds
 # And a sixth, and the one that closes a gap four faults lived in: does the video
 # pipeline give the same ANSWER at different batch sizes, and does the host give the
 # same answer as the device?  probe-video-exact compares two DEVICE engines, and
@@ -297,5 +349,38 @@ if (Test-Path $vinv) {
     2 { Write-Host "video invariance: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "video invariance: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+}
+
+# ---- where the time went --------------------------------------------------------
+#
+# Printed unconditionally, and attributed per stage, because "the suite takes 25-35
+# minutes" is not actionable on its own -- the only thing you can do with a total is
+# guess which stage to make faster.  On -Fast this is the number that matters: it is
+# the cost of the inner loop, and it should be small enough that nobody is tempted to
+# skip it.
+$swTotal.Stop()
+$totalMs = $swTotal.Elapsed.TotalMilliseconds
+$namedMs = ($stageTimes | Measure-Object Ms -Sum).Sum
+Write-Host ""
+if ($Fast) { Write-Host "stage times (-Fast; the two video stages are NOT included):" -ForegroundColor Cyan }
+else      { Write-Host "stage times:" -ForegroundColor Cyan }
+foreach ($s in $stageTimes) {
+  $pct = if ($totalMs -gt 0) { 100.0 * $s.Ms / $totalMs } else { 0 }
+  Write-Host ("  {0,-28} {1,7:N1}s  {2,5:N1}%" -f $s.Name, ($s.Ms / 1000), $pct)
+}
+# Whatever the named stages do not cover.  Printed rather than dropped: the image
+# determinism probe, the unvisited-pixel probe, the OpenCL fixture generation and the
+# invariance probe all live in here, and an unattributed remainder is exactly the thing
+# that sends you looking in the wrong place.
+$otherMs = $totalMs - $namedMs
+if ($otherMs -gt 500) {
+  Write-Host ("  {0,-28} {1,7:N1}s  {2,5:N1}%   (determinism, unvisited-pixel," -f 'other stages', ($otherMs / 1000), (100.0 * $otherMs / $totalMs))
+  Write-Host ("  {0,-28} {1,19}    OpenCL fixtures, video invariance, startup)" -f '', '')
+}
+Write-Host ("  {0,-28} {1,7:N1}s" -f 'TOTAL', ($totalMs / 1000))
+if ($Fast) {
+  Write-Host ""
+  Write-Host "This was -Fast: the two 1080p video stages were skipped. Run WITHOUT -Fast" -ForegroundColor Yellow
+  Write-Host "before committing anything that touches src\, the video pipeline, or a probe." -ForegroundColor Yellow
 }
 exit 0
