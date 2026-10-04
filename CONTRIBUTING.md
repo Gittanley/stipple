@@ -73,7 +73,7 @@ which one is missing rather than only reporting "not found". When it finds no SD
 it lists every directory it searched, so the failure is diagnosable from the build output
 alone.
 
-**Verified:** the engine is bit-identical to the CUDA engine on 54 of 54 comparison cells
+**Verified:** the engine is bit-identical to the CUDA engine on 36 of 36 comparison cells
 (`tools\probe-opencl-exact.ps1` — four images × colour counts × three block sizes),
 measured from a clean clone on an NVIDIA driver. **Not verified:** Intel and AMD
 hardware. [docs/OPENCL.md](docs/OPENCL.md) covers what that gap means and what to run.
@@ -100,7 +100,7 @@ never as a failure. From a clean clone you should expect:
 | 135 bit-exact cases vs ImageMagick | runs — `verify.ps1` generates its own fixtures with `magick` |
 | unvisited-pixel provenance, 9 geometries | runs — also generates its own fixtures |
 | image determinism | **skipped** — needs fixtures from `tools\probe-opencl-exact.ps1` |
-| OpenCL-vs-CUDA, 54 image cells | **skipped** — same reason |
+| OpenCL-vs-CUDA, 36 image cells | **skipped** — same reason |
 | video, both data paths + determinism | **skipped** — needs a video clip, which is not committed |
 
 Run `tools\probe-opencl-exact.ps1` once to generate the image fixtures and the first two

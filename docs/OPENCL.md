@@ -7,7 +7,7 @@ is bit-identical to `--engine blocks` (CUDA) everywhere this project can measure
 
 | | probe | result |
 |---|---|---|
-| images, 54 cells | `tools\probe-opencl-exact.ps1` | 54/54 identical |
+| images, 36 cells | `tools\probe-opencl-exact.ps1` | 36/36 identical |
 | images, 135 cases vs ImageMagick | `verify.ps1` | 135/135 |
 | run-to-run stability | `tools\probe-determinism.ps1` | 6/6, 12 runs each |
 | video, 60 frames of 1080p lossless, **both** data paths | `tools\probe-video-exact.ps1` | 2/2 identical — `rgba64le` and `yuv444p` |
@@ -197,7 +197,7 @@ scattered, last-bit divergence visible only as compression noise in an encoded f
 `RD_OCL_CHECK_U16=1` runs the pipeline twice over the same input and diffs the
 results: 36/36 cases exact (six images × three palette sizes × two block lengths).
 The float path is the reference because it is *already* verified bit-identical to
-CUDA on all 54 cells, so the check needs no new fixture and no new reference.
+CUDA on all 36 cells, so the check needs no new fixture and no new reference.
 
 Getting that check right took three attempts, and the failures are the useful part,
 because all three reported a *kernel* bug and all three were the instrument:
@@ -557,7 +557,7 @@ driver and says nothing about an iGPU.
 
 Two things make this cheap to answer rather than a research project:
 
-- The engine is **bit-identical to CUDA on every cell measured** (54/54 images, 2/2
+- The engine is **bit-identical to CUDA on every cell measured** (36/36 images, 2/2
   video data paths). There is no porting work to do first. If your card is fast
   enough, it is already correct.
 - `tools\probe-opencl.exe` reports your devices and their `cl_khr_fp64` support

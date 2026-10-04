@@ -19,7 +19,7 @@ defects survived in, each one a build path nobody had ever run.
 | clean clone builds at all | every push | the check that would have caught all five defects |
 | CPU-only build, 100 bit-exact cases vs ImageMagick | every push | 50 further cases report SKIPPED, not passed |
 | CUDA build compiles and links | every push | 12.8 toolkit unpacked from redist archives; no GPU on the runner |
-| OpenCL-vs-CUDA, 54 cells | manual | no GPU on the runner |
+| OpenCL-vs-CUDA, 36 cells | manual | no GPU on the runner |
 | video probes | manual | no GPU, and no clip is committed |
 
 A skipped check is never counted as a pass, and the CPU job asserts that at least 90
@@ -67,7 +67,7 @@ faster CPU, RAM or disk makes it faster with the same GPU.
 >   came from running the code on the machine it was written on. None of it is
 >   estimated or illustrative.
 > - **The verification is real too, and it is the point.** 150 bit-exact cases against
->   ImageMagick, a 54-cell cross-engine bit-exactness sweep, a run-to-run determinism
+>   ImageMagick, a 36-cell cross-engine bit-exactness sweep, a run-to-run determinism
 >   probe, and a video frame-accounting check. See [Correctness](#correctness).
 > - **Expect some things to be wrong.** An AI will confidently report work as finished
 >   before the check that would prove it has run. That happened repeatedly during
@@ -243,7 +243,7 @@ is identical to `blocks` on the same frame:
 rdither --colors 16 --engine opencl photo.png out.png
 ```
 
-**That identity is measured, not asserted: 54 of 54 comparison cells are
+**That identity is measured, not asserted: 36 of 36 comparison cells are
 bit-identical to CUDA** — four images × colour counts × three block sizes, via
 `tools\probe-opencl-exact.ps1`. It is also the only path for a non-NVIDIA GPU, and
 it now works from a clean clone: download the 1.1 MB Khronos SDK, unpack it beside
@@ -435,7 +435,7 @@ engines here and false of others, and the difference is not a detail.
 | `--engine cpu` | sequential walk, on the CPU | **bit-exact** | 150 cases, `verify.ps1` |
 | `--engine cuda` | sequential walk, on the GPU | **bit-exact** | 150 cases, `verify.ps1` |
 | `--engine blocks` | block-parallel walk, CUDA | **not exact** — 1.7% of pixels differ | determinism only |
-| `--engine opencl` | block-parallel walk, OpenCL | **not exact** — 1.7% too, being identical to `blocks` | `blocks` on 54 cells + determinism |
+| `--engine opencl` | block-parallel walk, OpenCL | **not exact** — 1.7% too, being identical to `blocks` | `blocks` on 36 cells + determinism |
 | `--engine approx` | iterative solver | **not exact**, by design | not covered |
 | `--video` (any engine) | block-parallel, always | **not exact** | frame accounting, cross-engine |
 | `--dither bayer\|atkinson\|jarvis\|floyd-steinberg\|clustered-dot` | their own kernels | **not exact**, and not trying to be | determinism only |
@@ -670,7 +670,7 @@ Beyond that suite, `verify.ps1` also runs:
 | Check | What it proves | Result |
 |---|---|---|
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
-| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
+| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 36 image cells | 36/36 |
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
 | `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count, on each of the three engines | 3/3 |
 | `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
@@ -724,7 +724,7 @@ video in a `-DRD_WITH_CUDA=OFF` build" need two builds and a real GPU to find.
 optimisation rounds, the real bugs found in this codebase's own new code, the
 measurements, and a table of everything that was tried and did not work.
 
-[docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 54 image cells
+[docs/OPENCL.md](docs/OPENCL.md) — the OpenCL engine: what it covers, the 36 image cells
 and 60 video frames that verify it against CUDA, the four bugs the port actually had
 (including one that turned out not to be in OpenCL at all), and where its remaining
 cost is — which turned out **not** to be the engine.
