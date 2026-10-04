@@ -1192,7 +1192,10 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     const std::size_t bytes_in = in_bytes_for(pixel_used);
     if (in_yuv_any) {
       cudaMemcpyAsync(d_in_yuv, in_u16, bytes_in, cudaMemcpyHostToDevice, stream);
-      // Checked here rather than left to the next launch check: a failed copy used to`r`n      // surface as "invalid argument" from the gather, hundreds of lines away from`r`n      // its cause.`r`n      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("yuv H2D failed: ") + cudaGetErrorString(e); }
+      // Checked here rather than left to the next launch check: a failed copy used to
+      // surface as "invalid argument" from the gather, hundreds of lines away from
+      // its cause.
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("yuv H2D failed: ") + cudaGetErrorString(e); }
     } else if (options.in_u16_pinned) {
       // The caller deposited the frames straight into page-locked memory, so there is
       // nothing to stage.  This is the path the video pipeline uses; without it every

@@ -1114,7 +1114,22 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   }
   if (out_yuv444) {
     b_out_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE, yuv_bytes, nullptr, &e);
-    if (e != CL_SUCCESS || b_out_yuv == nullptr) return "clCreateBuffer(out yuv444)";
+    if (e != CL_SUCCESS || b_out_yuv == nullptr) {
+      // This is the one bare return in the function.  `all[]`, release_all() and fail()
+      // are declared further down, because `all[]` is initialised from the pointers
+      // after they are assigned -- so fail() cannot be called from here, and the bare
+      // return that used to be here leaked the input buffer created immediately above:
+      // up to 506 MiB at 1920x1080 with --batch-frames 16.  Reachable on the DEFAULT
+      // configuration (--input-mode yuv444, RD_YUV444_OUT unset => out_yuv444) if this
+      // second allocation returns CL_MEM_OBJECT_ALLOCATION_FAILURE or
+      // CL_OUT_OF_RESOURCES.  The three input buffers are mutually exclusive branches
+      // above, so at most one is non-null here.
+      if (b_in_yuv != nullptr) clReleaseMemObject(b_in_yuv);
+      if (b_in16 != nullptr) clReleaseMemObject(b_in16);
+      if (b_pix != nullptr) clReleaseMemObject(b_pix);
+      return std::string("opencl: clCreateBuffer(out yuv444) failed (") +
+             ClErrorName(e) + ")";
+    }
   } else if (want_u16) {
     b_out16 = clCreateBuffer(g_context, CL_MEM_READ_WRITE, u16_bytes, nullptr, &e);
   } else if (b_pix == nullptr) {
