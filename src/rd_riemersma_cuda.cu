@@ -191,8 +191,22 @@ __global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
                                     double diffusion, int assoc,
                                     int* __restrict__ cache, int cache_entries,
                                     double* __restrict__ error_state,
-                                    int* __restrict__ frame_state) {
+                                    int* __restrict__ frame_state,
+                                     int frames) {
   const int frame_id = blockIdx.x * blockDim.x + threadIdx.x;
+  // `frames` is a parameter, and this test is why.  The launch rounds the grid up to a
+  // whole number of 256-thread blocks, so for frames == 300 it starts 512 threads while
+  // only 300 have scratch carved for them.  The kernel used to take `frames` as no
+  // argument at all and guard on `level <= 0` only, so the 212 surplus threads formed
+  // pointers past the end of all three scratch allocations and then WROTE through them:
+  //   error_state +108,512 B,  frame_state +162,048 B,  cache +221,249,536 B
+  // The cache write is 1 MiB per surplus thread, so it will usually run off the mapping
+  // and surface as "an illegal memory access was encountered" -- but the two small ones
+  // can land in slack and corrupt silently.  It needs frames > 256 and not a multiple of
+  // 256: at frames <= 256 the grid is one block of exactly `frames` threads, and at a
+  // multiple of 256 the rounding is exact.  257 is the smallest failing value, and no
+  // test anywhere in the repo passes --frames at all.
+  if (frame_id >= frames) return;
   if (level <= 0) return;
 
   // Per-thread scratch, carved out of the batch allocations.
@@ -502,7 +516,7 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
       scratch.pixels, static_cast<int>(width), static_cast<int>(height), level,
       scratch.nodes, scratch.palette, palette.count, scratch.weights,
       params.diffusion, palette.associate_alpha ? 1 : 0, scratch.cache,
-      cache_entries, scratch.error_state, scratch.frame_state);
+      cache_entries, scratch.error_state, scratch.frame_state, frames);
 
   const cudaError_t launch = cudaGetLastError();
   if (launch != cudaSuccess) {
