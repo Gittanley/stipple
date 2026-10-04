@@ -54,6 +54,15 @@ bool ImReferenceDither(const LoadedImage& image, int colors, PixelStore* out,
 
 // Pixel-absolute-error comparison of two same-geometry stores.
 struct DiffResult {
+  // False when the two stores could not be compared at all -- currently only on a
+  // geometry mismatch.  Without it there is no way to say "incomparable", so a
+  // mismatch returned a default-initialised result, and every caller read
+  // differing_pixels == 0 as success.  A --verify file check comparing a re-loaded
+  // file against the reference therefore reported "AE=0/0 pixels ... BIT-EXACT" and
+  // exited 0 for a file of the WRONG SIZE, which is the exact class of failure the
+  // check exists to catch, printed indistinguishably from a genuinely empty
+  // comparison.  Zero differing pixels out of zero comparable pixels is not a pass.
+  bool comparable = true;
   std::size_t differing_pixels = 0;
   std::size_t total_pixels = 0;
   int max_channel_delta = 0;  // in 16-bit code values

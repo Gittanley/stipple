@@ -263,7 +263,13 @@ bool ImReferenceDither(const LoadedImage& loaded, int colors, PixelStore* out,
 DiffResult CompareStores(const PixelStore& a, const PixelStore& b,
                          bool compare_alpha) {
   DiffResult result;
-  if ((a.width() != b.width()) || (a.height() != b.height())) return result;
+  // Different geometry is not a zero-difference result; it is no result.  See the note
+  // on DiffResult::comparable -- callers used to read the default-initialised
+  // differing_pixels == 0 here as "identical" and exit 0.
+  if ((a.width() != b.width()) || (a.height() != b.height())) {
+    result.comparable = false;
+    return result;
+  }
   double sum_sq = 0.0;
   long long samples = 0;
   for (std::size_t y = 0; y < a.height(); ++y) {
@@ -656,6 +662,10 @@ bool ImWriteRgbaF(const RgbaF* pixels, std::size_t width, std::size_t height,
   info = DestroyImageInfo(info);
   return true;
 }
+// Defined further down, next to the long note explaining what it is for.  Declared here
+// because ImAdoptPaletteFromColormap needs it and sits above it.
+static void AdoptTreeColormap(Palette* palette, const ColorTree* tree);
+
 // Adopts the colormap of an already-quantized image as the palette, instead of
 // building one.  This is the seam that lets ImageMagick own palette generation
 // while rdither owns the dithering:
@@ -777,6 +787,19 @@ bool ImAdoptPaletteFromColormap(const LoadedImage& image, int colors,
     }
   }
   tree->Build(swatch.data(), w, h, n_col, /*associate_alpha=*/false, grayscale);
+  // Reconcile the palette's order with the tree's, or the engines index
+  // palette.entries[] with a color_number that refers to a position in the TREE's
+  // order.  DefineImageColormap emits entries in child-id order, and child ids come
+  // from scale_quantum_to_char bit extraction -- the Morton order of the colours'
+  // 8-bit RGB.  Where the swatch laid a colour out is irrelevant to that, so for any
+  // palette not already in Morton order palette->entries[i] != tree->colormap()[i], and
+  // the walk writes palette[i] for a colour_number the tree assigned elsewhere: every
+  // pixel still gets a palette colour, the count is still right, and the picture is
+  // quietly wrong.  See the long note on ORDER above AdoptTreeColormap -- it is exactly
+  // this case.  ImReadPalette calls it on both of its paths; this one did not, so
+  // `--palette-from x.png` and `--palette-import x.png` on video dithered to permuted
+  // indices while `--palette-from x.txt` (same flag, same file contents) was correct.
+  AdoptTreeColormap(palette, tree);
   return true;
 }
 

@@ -227,6 +227,17 @@ void ColorTree::Build(const RgbaF* pixels, std::size_t width, std::size_t height
     colors >>= 2;
   }
   if (depth > 2) --depth;  // a dither method is always in play here
+  // quantize.c:3306 -- and one level again when the image carries alpha:
+  //   if ((image->alpha_trait != UndefinedPixelTrait) && (depth > 5)) depth--;
+  // This was missing, so --colors >= 1024 on alpha input built a tree one level deeper
+  // than the reference's.  On the image path the per-run colormap check at rd_cli.cpp
+  // caught it (exit 4, "colormap entry N differs"); on the video path there is no such
+  // check, so the palette came from IM's depth-5 tree while the colour_numbers and the
+  // subtree partition came from a depth-6 tree, and the dither output was quietly
+  // non-conformant.  verify.ps1 sweeps --colors (2,4,16,64,256); the largest of those
+  // gives depth 6, which is exactly 5 after the decrement above -- so the alpha rule
+  // could not fire in any test, even though an alpha fixture exists.
+  if (associate_alpha_ && depth > 5) --depth;
   if (grayscale) depth = kMaxTreeDepth;
   if (depth > kMaxTreeDepth) depth = kMaxTreeDepth;
   if (depth < 2) depth = 2;

@@ -1501,7 +1501,29 @@ int main(int argc, char** argv) {
       // an AMD or Intel GPU gets the same pixels the CUDA path would have given
       // it, and the two are comparable in a test rather than merely similar.
       params.use_cache = false;
-      opt.blocks.frames = opt.frames;
+      // The store holds exactly ONE frame -- rd_source.cpp sizes it
+      // width*height*sizeof(RgbaF) and rd_cli.cpp allocated it from image.width/height --
+      // but both engines size every host transfer by `frames`:
+      //   rd_blocks_cuda.cu  bytes = width*height*frames*sizeof(float4), memcpy at :1209,
+      //                       H2D at :1212, D2H at :1341
+      //   rd_opencl.cpp      pix_bytes = npix*frames*16, COPY_HOST_PTR at :1113,
+      //                       clEnqueueReadBuffer at :1523
+      // So --frames 4 reads and writes 3 frames' worth past the allocation on each side
+      // (~100 MB each way at 1080p).  The comment above this block excused the GPU
+      // engines on the grounds that they "run several frames concurrently from their
+      // own device buffers and never touch this constraint" -- true of the device
+      // buffers, false of the host transfers, which are exactly where the overread is.
+      // The plugin path a few lines below already refuses --frames and says so; this
+      // does the same rather than silently handing over a pointer to 4x its memory.
+      if (opt.frames != 1) {
+        std::fprintf(stderr,
+                     "[dither] --frames %d does not apply to --engine %s on a single "
+                     "image; the store holds one frame. Running 1 frame.\n",
+                     opt.frames, is_blocks ? "blocks" : "opencl");
+        opt.blocks.frames = 1;
+      } else {
+        opt.blocks.frames = opt.frames;
+      }
       if (is_blocks) {
         cuda_error = rd::RiemersmaBlocksCuda(*palette, params, *tree, image.width,
                                              image.height, store->data(),
@@ -1640,8 +1662,10 @@ int main(int argc, char** argv) {
       std::printf(
           "verify     : AE=%zu/%zu pixels, max channel delta=%d, RMSE=%.8f -> %s\n",
           diff.differing_pixels, diff.total_pixels, diff.max_channel_delta,
-          diff.rmse, diff.differing_pixels == 0 ? "BIT-EXACT" : "MISMATCH");
-      if (diff.differing_pixels != 0) status = 3;
+          diff.rmse, !diff.comparable ? "INCOMPARABLE (geometry mismatch)"
+                                      : (diff.differing_pixels == 0 ? "BIT-EXACT"
+                                                                    : "MISMATCH"));
+      if (!diff.comparable || diff.differing_pixels != 0) status = 3;
     }
 
     // The comparison above proves the STORE matches ImageMagick.  It says nothing
@@ -1686,11 +1710,18 @@ int main(int argc, char** argv) {
         // coder -- that mistake shows up as thousands of differing pixels, which is
         // exactly what the JPEG-as-PNG bug produced.
         constexpr int kOne8BitStep = 257;
-        const bool file_ok = fd.max_channel_delta < kOne8BitStep;
+        // An incomparable pair is not a pass.  `roundtrip` is sized from what ImLoad
+        // made of the written file and `reference` from the image, so a coder or file
+        // that decodes to a different size used to yield max_channel_delta 0 -- printed
+        // as "AE=0/0 pixels ... BIT-EXACT (8-bit)" and exit 0, for a file of entirely
+        // the wrong dimensions.  That is the class of defect this second comparison was
+        // added to catch, so it must not be one of the ways it passes.
+        const bool file_ok = fd.comparable && fd.max_channel_delta < kOne8BitStep;
         std::printf(
             "verify file: AE=%zu/%zu pixels, max channel delta=%d, RMSE=%.8f -> %s\n",
             fd.differing_pixels, fd.total_pixels, fd.max_channel_delta, fd.rmse,
-            file_ok ? "BIT-EXACT (8-bit)" : "MISMATCH");
+            !fd.comparable ? "INCOMPARABLE (geometry mismatch)"
+                            : (file_ok ? "BIT-EXACT (8-bit)" : "MISMATCH"));
         if (!file_ok) {
           std::printf(
               "verify     : the store was correct but the written file is not.\n"
