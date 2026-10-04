@@ -184,13 +184,26 @@ if ($r1.rc -ne 0 -or -not $r1.made) {
     $rf = FramesOf $ref
     $line = "    $($rf) frames, $(HashOf $ref)"
     $bad = @()
-    if ($srcFrames -gt 0 -and $rf -ne $srcFrames) { $bad += "frame count $rf != source $srcFrames" }
+    # Only claim the checks that actually RAN.  This used to print "differs from the
+    # source, not constant, count matches" unconditionally -- including when ffprobe was
+    # unavailable and the whole source-comparison block had been skipped -- so the
+    # control announced a verification it had not performed.
+    $checked = @()
+    if ($srcFrames -gt 0) {
+      $checked += 'frame count matches the source'
+      if ($rf -ne $srcFrames) { $bad += "frame count $rf != source $srcFrames" }
+    } else {
+      $bad += 'source frame count unavailable (ffprobe?), so the count was NOT checked'
+    }
     if ($srcW -gt 0 -and $bad.Count -eq 0) {
       # The decoded stream must NOT equal the source: that is what "dithered nothing"
       # would look like.  Sampled, because a byte loop over the whole clip is slow.
       & $ffmpeg -v error -i $clipPath -f rawvideo -pix_fmt rgb24 (Join-Path $tmp 'src.rgb') 2>&1 | Out-Null
       $srcRaw = Join-Path $tmp 'src.rgb'
-      if (Test-Path $srcRaw) {
+      if (-not (Test-Path $srcRaw)) {
+        $bad += 'could not decode the source, so "differs from the source" was NOT checked'
+      } else {
+        $checked += 'differs from the source'
         $sb = [IO.File]::ReadAllBytes($srcRaw)
         $n = [Math]::Min($sb.Length, $ref.bytes.Length)
         $same = $true
@@ -198,6 +211,7 @@ if ($r1.rc -ne 0 -or -not $r1.made) {
         if ($same) { $bad += 'output is byte-identical to the source, so nothing was dithered' }
       }
       # And it must not be constant, or a zero-filled buffer would match itself.
+      $checked += 'not constant'
       $first = $ref.bytes[0]; $const = $true
       for ($i = 0; $i -lt $ref.bytes.Length; $i += 1013) { if ($ref.bytes[$i] -ne $first) { $const = $false; break } }
       if ($const) { $bad += 'every sampled pixel is identical, so the buffer looks empty' }
@@ -207,12 +221,23 @@ if ($r1.rc -ne 0 -or -not $r1.made) {
       $fail++
       $ref = $null
     } else {
-      "    ok    $line -- differs from the source, not constant, count matches"
+      # Name the checks that ran, from the list built above -- not a fixed phrase.
+      "    ok    $line -- verified: $($checked -join ', ')"
     }
   }
 }
 
 # ---------------------------------------------------------------- part A
+if ($null -eq $ref) {
+  # The control did not produce a reference, so Part A cannot run.  It used to simply
+  # not appear: no heading, no count, no line.  The batch half is the one that needs no
+  # GPU and therefore the only half that can run on CI, so its disappearance has to be
+  # visible rather than inferred from a missing section.
+  ''
+  '  part A: does --batch-frames 16 give the same pixels as 1?'
+  '    SKIP  no reference render, so there is nothing to compare against'
+  $skipped++
+}
 if ($null -ne $ref) {
   ''
   "  part A: does --batch-frames $BatchBig give the same pixels as 1?"
@@ -229,22 +254,33 @@ if ($null -ne $ref) {
     } elseif ($big.hash -eq $ref.hash) {
       "    ok    identical to batch 1 ($(HashOf $ref))"
     } else {
-      # Name the first frame that differs.  A whole-clip AE is a single number that
-      # says nothing about the SHAPE of the disagreement, and shape is what
-      # distinguishes a layout fault from a rounding one.
+      # A frame-count difference is its OWN fault, not a pixel one.  The lengths are
+      # compared first because the loop below clamps to the shorter of the two, so a
+      # dropped frame used to print "0 of N frames differ" -- a verdict that named the
+      # wrong fault while still failing.  Shape is what distinguishes a layout fault
+      # from a rounding one, so it is worth getting right.
       $fb = $ref.frameBytes
-      $firstBad = -1; $badFrames = 0
-      $n = [Math]::Min($big.bytes.Length, $ref.bytes.Length) / $fb
-      for ($f = 0; $f -lt [int]$n; $f++) {
-        $o = $f * $fb; $eq = $true
-        for ($i = 0; $i -lt $fb; $i++) { if ($big.bytes[$o+$i] -ne $ref.bytes[$o+$i]) { $eq = $false; break } }
-        if (-not $eq) { $badFrames++; if ($firstBad -lt 0) { $firstBad = $f } }
+      if ($big.bytes.Length -ne $ref.bytes.Length) {
+        "    FAIL  $(HashOf $ref) vs $(HashOf $big): FRAME COUNT differs --" +
+          " $(FramesOf $ref) frames against $(FramesOf $big)."
+        "          --batch-frames must not change how many frames are written."
+        $fail++
+      } else {
+        # Name the first frame that differs.  A whole-clip AE is a single number that
+        # says nothing about the SHAPE of the disagreement.
+        $firstBad = -1; $badFrames = 0
+        $n = [int]($big.bytes.Length / $fb)
+        for ($f = 0; $f -lt $n; $f++) {
+          $o = $f * $fb; $eq = $true
+          for ($i = 0; $i -lt $fb; $i++) { if ($big.bytes[$o+$i] -ne $ref.bytes[$o+$i]) { $eq = $false; break } }
+          if (-not $eq) { $badFrames++; if ($firstBad -lt 0) { $firstBad = $f } }
+        }
+        "    FAIL  $(HashOf $ref) vs $(HashOf $big): $badFrames of $n frames differ" +
+          $(if ($firstBad -ge 0) { ", first at frame $firstBad" } else { "" })
+        "          --batch-frames changes the ANSWER, not just the schedule.  The dither"
+        "          is per-frame and the palette is built once, so it must not."
+        $fail++
       }
-      "    FAIL  $(HashOf $ref) vs $(HashOf $big): $badFrames of $([int]$n) frames differ" +
-        $(if ($firstBad -ge 0) { ", first at frame $firstBad" } else { "" })
-      "          --batch-frames changes the ANSWER, not just the schedule.  The dither"
-      "          is per-frame and the palette is built once, so it must not."
-      $fail++
     }
   }
 }
@@ -255,8 +291,26 @@ if ($null -ne $ref) {
 $devOut = Join-Path $tmp 'dev.mkv'
 $rd = Render $devOut @('--engine','blocks')
 if ($rd.rc -ne 0 -or -not $rd.made) {
-  "    SKIP  no CUDA device in this build -- this is the half CI cannot run"
-  $skipped++
+  # Read what the run SAID, not merely that it exited non-zero.  This branch used to
+  # report EVERY failure as "no CUDA device", which turned a driver fault, a crash, an
+  # out-of-memory or a bad flag into a skip -- and the probe exited 0.  Demonstrated
+  # with a stub that succeeded for --no-gpu and returned 255 with
+  # CUDA_ERROR_LAUNCH_FAILED here: the output read
+  #     SKIP  no CUDA device in this build
+  #     video invariance: ok      EXITCODE=0
+  # which is the same mistake probe-video-determinism.ps1 and probe-video-exact.ps1
+  # already avoid by grepping stderr for the refusal strings.  This file was written
+  # after both of them and dropped the check.
+  if ($rd.text -match 'no CUDA device' -or $rd.text -match 'requested for video but') {
+    "    SKIP  no CUDA device in this build -- this is the half CI cannot run"
+    $skipped++
+  } else {
+    $fail++
+    "    FAIL  the device render failed (exit $($rd.rc)) and it is NOT a missing device:"
+    foreach ($dl in ($rd.text -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -First 3)) {
+      "            $($dl.Trim())"
+    }
+  }
 } elseif ($rd.text -match 'gpu=no') {
   # Defence in depth: a case named for the device must not report for the device.
   "    SKIP  --engine blocks fell back to the host, so this tests nothing new"
@@ -289,6 +343,14 @@ Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
 ''
 if ($skipped -gt 0 -and $fail -eq 0) {
   "$($skipped) part(s) SKIPPED for want of a device or engine.  Skips are not passes."
+}
+# Nothing ran is not a clean sweep.  $fail -eq 0 cannot tell "both halves agreed" from
+# "both halves were skipped", and verify.ps1 maps exit 0 to an empty branch, so the
+# driver contributes no line and the log cannot be distinguished from a good run.  This
+# probe had no floor; probe-unvisited-pixel.ps1 and probe-video-exact.ps1 both do.
+if ($skipped -ge 2 -and $fail -eq 0) {
+  "video invariance: cannot run -- every part was skipped, so nothing was checked."
+  exit 2
 }
 if ($fail -eq 0) { "video invariance: ok"; exit 0 }
 "video invariance: $fail FAILED"

@@ -232,6 +232,7 @@ foreach ($c in $cases) {
   $hashes = @{}
   $counts = @{}
   $bad = 0
+  $fcFail = 0
   $unavailable = ''
   for ($i = 1; $i -le $Runs; $i++) {
     $out = Join-Path $tmp "det_$($c.name)_$i.mkv"
@@ -273,7 +274,18 @@ foreach ($c in $cases) {
     $d = Get-DecodedHash $out
     if ($null -eq $d) { $bad++; continue }
     $hashes[$d.hash] = $d.bytes
-    $counts[(Get-FrameCount $out)] = 1
+    # A -1 here means ffprobe FAILED, not that the clip has one frame or minus one
+    # frames.  Folding the sentinel into the tally made every failing run report the
+    # same "count", so $counts.Count stayed 1, the frame-count check passed, and the
+    # probe exited 0 having verified NONE of the thing it exists to verify.  Measured
+    # with a stub ffprobe that exits 0 printing nothing: all three cases reported
+    # "(-1 frames)" and "3 of 3 cases deterministic", exit 0.
+    #
+    # This is precisely the -shortest frame-deleting class the probe was written for,
+    # and probe-video-exact.ps1 already guards the same sentinel two hundred lines
+    # away.  One probe handled it; the other did not.
+    $fc = Get-FrameCount $out
+    if ($fc -lt 0) { $fcFail++ } else { $counts[$fc] = 1 }
     Remove-Item -EA SilentlyContinue $out
   }
   Remove-Item Env:\RD_YUV444_OUT -EA SilentlyContinue
@@ -289,6 +301,9 @@ foreach ($c in $cases) {
     $verdict = @($bad, $Runs, "FAIL", "runs produced no output")
   } elseif ($hashes.Count -ne 1) {
     $verdict = @($hashes.Count, $Runs, "FAIL", "distinct decoded pixel sets -- NOT DETERMINISTIC")
+  } elseif ($fcFail -gt 0) {
+    $verdict = @($fcFail, $Runs, "FAIL",
+                "frame count could not be read from the file (ffprobe?) -- the frame count is one of the three things this probe exists to check, so this is a failure and not a skip")
   } elseif ($counts.Count -ne 1) {
     $verdict = @($counts.Count, $Runs, "FAIL",
                 "pixels stable but frame count varies: $((($counts.Keys) | Sort-Object) -join ', ')")

@@ -200,6 +200,14 @@ function Compare-Pair($img, $colors, $block, $tag) {
 
 $imgs = @('c_flat', 'c_ramp', 'c_noise', 'c_plasma', 'c_alpha50', 'c_ashape')
 $blocks = @(16, 64, 512)
+# Distinct colour counts, deduplicated.  This used to be `@(2, 4, $Cols)` with $Cols
+# defaulting to 2 -- the literal array (2, 4, 2).  Every --colors 2 cell was therefore
+# computed TWICE, the tag collided so the second run overwrote the first render, and
+# both copies counted: the summary printed "54 of 54 comparisons identical" when 36
+# distinct cells had been compared, and 18 of those 54 were a re-run of a cell already
+# counted.  README.md and docs\OPENCL.md quoted the 54.  A duplicated cell is worse
+# than a missing one, because it reads as corroboration.
+$colourCounts = @(2, 4, $Cols) | Where-Object { $_ -gt 0 } | Sort-Object -Unique
 $fail = 0
 $total = 0
 ''
@@ -220,4 +228,11 @@ foreach ($img in $imgs) {
 }
 ''
 '{0} of {1} comparisons identical; {2} not.' -f ($total - $fail), $total, $fail
+# An empty sweep is not a perfect sweep.  $fail -eq 0 alone cannot tell "everything
+# matched" from "nothing ran", and the deduplication above makes an accidentally empty
+# $colourCounts a live possibility rather than a theoretical one.
+if ($fail -eq 0 -and $total -eq 0) {
+  Write-Host 'cannot run: zero comparison cells -- refusing to report an empty sweep as a pass.'
+  exit 2
+}
 if ($fail -gt 0) { exit 1 }
