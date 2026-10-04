@@ -39,6 +39,38 @@
 // while `-cl-fast-relaxed-math` and `-cl-mad-enable` stay off.  BuildOpenClProgram
 // below passes neither, and says so in the build log; that is the whole reason
 // the log line exists.
+//
+// I/O BYTES ARE COUNTED, IN FIVE BUCKETS, ON PURPOSE.  Set RD_OCL_IO to get one
+// `[io]` line per call naming the engine, geometry, frames, batch, block size,
+// palette size and input path, and a second giving the transfer counts:
+//
+//     h2d        host -> device   explicit clEnqueueWriteBuffer
+//     d2h        device -> host   the readback the caller actually needs
+//     host_copy  host -> device with no counted transfer (implicit create-time
+//                copy).  Always 0; a non-zero value is a hard error, not a warning.
+//     d2d        device -> device clEnqueueCopyBuffer, not host traffic
+//     dump       diagnostic readbacks (RD_OCL_DUMP, RD_OCL_CHECK_U16)
+//
+// WHY NOT ONE "BYTES" NUMBER.  These are not interchangeable, and collapsing them
+// is what produced a documented disagreement -- the same traffic reported as 1.26
+// GB/s in one place and 0.63 GB/s in another, read as a driver difference rather
+// than as two directions.  A single number cannot tell bytes going to the device
+// from bytes coming back.
+//
+// WHY THE UPLOAD IS EXPLICIT.  It used not to be.  Every buffer was created with
+// CL_MEM_COPY_HOST_PTR, so the host-to-device copy happened inside clCreateBuffer
+// and a counter wrapped around clEnqueueReadBuffer / clEnqueueWriteBuffer
+// reported ZERO H2D bytes for an engine moving 31.6 MiB per 1080p frame.  All
+// allocations now go through one helper that strips the flag and issues a real
+// blocking clEnqueueWriteBuffer, in the same place in the sequence, so the
+// bytes on the wire are unchanged -- only the accounting is new.
+//
+// THE CONSERVATION ASSERTION.  With RD_OCL_IO set, the measured input upload is
+// printed next to `width * height * frames * bytes_per_pixel(input_path)`,
+// computed from the arguments the run used.  A non-zero delta is a HARD ERROR and
+// the run fails.  It is grounded in arithmetic the counter cannot influence, which
+// is the only kind of check that survives its author wanting a different answer;
+// if it ever fires, the formula is what is wrong, not the tolerance.
 #ifndef RD_OPENCL_H_
 #define RD_OPENCL_H_
 

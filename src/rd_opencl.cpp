@@ -657,6 +657,187 @@ std::string ClErrorName(cl_int e) {
   return b;
 }
 
+// ---------------------------------------------------------------------------
+// Byte accounting, and why the upload goes through MakeBuffer at all.
+//
+// THE PROBLEM THIS SOLVES.  Every buffer in this file used to be created with
+// CL_MEM_COPY_HOST_PTR, which makes the driver copy the host bytes into the fresh
+// allocation as part of clCreateBuffer.  That copy is real bus traffic and it is
+// completely invisible to a wrapper around clEnqueueReadBuffer /
+// clEnqueueWriteBuffer -- a counter built the obvious way reports ZERO host-to-
+// device bytes for an engine that moves 31.6 MiB per 1080p frame.  A zero reads
+// as "nothing to fix here", which is worse than no counter at all.
+//
+// So the copy is made explicit.  MakeBuffer below is the only door host bytes
+// reach the device through in this file: it strips CL_MEM_COPY_HOST_PTR and
+// issues a real clEnqueueWriteBuffer, and the count happens inside it.  One
+// mechanism, so the count cannot miss one.
+//
+// THE BUCKETS ARE NOT INTERCHANGEABLE, which is the other half of it.  A single
+// "bytes" number cannot tell bytes going to the device from bytes coming back, and
+// collapsing them is what produced a documented disagreement: the same traffic
+// reported as 1.26 GB/s in one place and 0.63 GB/s in another, read as a driver
+// difference rather than as two directions (see
+// artifacts/measurement_design_summary_20261004_094615.md).  Five buckets, each
+// with its own transfer count, printed separately and never summed:
+//
+//     h2d        host -> device, explicit clEnqueueWriteBuffer.  The whole point.
+//     d2h        device -> host, the readback the caller actually needs.
+//     host_copy  host -> device with NO counted transfer, i.e. an implicit
+//                create-time copy.  Zero by construction after this rewrite, and
+//                kept precisely because a bucket that cannot go non-zero is not a
+//                check: this is the one that fires if CL_MEM_COPY_HOST_PTR comes
+//                back.  Non-zero means a call site needs updating, not that bytes
+//                went missing -- the explicit write moves exactly the same ones.
+//     d2d        device -> device, clEnqueueCopyBuffer.  Not host traffic at all,
+//                and it doubles a batch's worth of frames on some paths.
+//     dump       diagnostic readbacks (RD_OCL_DUMP, RD_OCL_CHECK_U16).  Real
+//                transfers, never part of a render's cost, and never counted
+//                against the render they are inspecting.
+//
+// `h2d_input` is the production image payload inside h2d, held separately because
+// it is the only one of these with an expected value worth stating: the derived
+// uploads (curve, owner, tree, palette, weights) have no arithmetic to check
+// against, so folding them in would make the conservation assertion below
+// unfalsifiable.
+//
+// WHY A GATE AT ALL, AND WHY IT IS READ ONCE.  The counters are a handful of
+// integer adds per batch, not per byte, so they are nearly free; the gate is on
+// the OUTPUT, which is noisy on a long render and would otherwise be in every
+// video log.  The environment is read into a function-local static on first use
+// because a getenv per call was measured at 2.5x in this codebase when it was
+// last tried, and the measurement is worth more than the two lines it would save.
+bool IoAccounting() {
+  static const bool on = std::getenv("RD_OCL_IO") != nullptr;
+  return on;
+}
+
+// One call's transfers.  Deliberately local rather than global: the conservation
+// assertion below is about THIS call, and a process-wide counter would let a
+// concurrent worker on the other state slot move the number it is checked
+// against.
+struct IoTally {
+  std::uint64_t h2d = 0;
+  std::uint64_t h2d_input = 0;
+  std::uint64_t d2h = 0;
+  std::uint64_t host_copy = 0;
+  std::uint64_t d2d = 0;
+  std::uint64_t dump = 0;
+  std::uint64_t h2d_calls = 0;
+  std::uint64_t d2h_calls = 0;
+  std::uint64_t host_copy_calls = 0;
+  std::uint64_t d2d_calls = 0;
+  std::uint64_t dump_calls = 0;
+};
+
+// A transfer count alongside its byte count, because "31.6 MiB" and "31.6 MiB in
+// one transfer" are different facts about a pipeline and only the first is
+// visible in a bandwidth figure.
+inline void CountBytes(std::uint64_t* bytes, std::uint64_t* calls, std::size_t n) {
+  *bytes += static_cast<std::uint64_t>(n);
+  ++*calls;
+}
+
+// THE ONLY WAY HOST BYTES REACH THE DEVICE IN THIS FILE.  Ten call sites used to
+// say CL_MEM_COPY_HOST_PTR themselves; all ten come through here now.
+//
+// `host` non-null means "initialise from these bytes".  The flag is stripped and
+// a real clEnqueueWriteBuffer issued instead.  BLOCKING, deliberately:
+// CL_MEM_COPY_HOST_PTR's copy is effectively synchronous with the clCreateBuffer
+// call that requested it, so an asynchronous write would be a semantic change --
+// and one that a caller reusing its host buffer the instant this returns could
+// not see.  Preserving the old ordering costs a wait that the old path was paying
+// anyway, inside the driver's allocation.
+//
+// `is_input` marks the production image payload, which is the one thing the
+// conservation assertion can be computed from.  Everything else here is derived
+// structure the caller cannot independently state the size of.
+//
+// `err` is written ONLY on failure.  The call sites below check for a null handle
+// several lines later, after other allocations that succeed and would otherwise
+// reset the shared `e` to CL_SUCCESS -- so "write on failure only" is what keeps
+// the error message naming the allocation that actually failed.
+cl_mem MakeBuffer(cl_context ctx, cl_command_queue queue, cl_mem_flags flags,
+                  std::size_t bytes, const void* host, bool is_input, IoTally* io,
+                  cl_int* err) {
+  // Recorded before it is stripped: a caller still passing this is asserting that
+  // an implicit upload is acceptable, which is the thing this rewrite exists to
+  // stop.  See the host_copy note above.
+  const bool wanted_implicit = (flags & CL_MEM_COPY_HOST_PTR) != 0;
+  const cl_mem_flags clean =
+      static_cast<cl_mem_flags>(flags & ~CL_MEM_COPY_HOST_PTR);
+
+  cl_mem buf = clCreateBuffer(ctx, clean, bytes, nullptr, err);
+  if (buf == nullptr) return nullptr;
+
+  if (host != nullptr) {
+    const cl_int we = clEnqueueWriteBuffer(queue, buf, CL_TRUE, 0, bytes, host, 0,
+                                           nullptr, nullptr);
+    if (we != CL_SUCCESS) {
+      clReleaseMemObject(buf);
+      *err = we;
+      return nullptr;
+    }
+    if (io != nullptr) {
+      CountBytes(&io->h2d, &io->h2d_calls, bytes);
+      if (is_input) io->h2d_input += static_cast<std::uint64_t>(bytes);
+    }
+  }
+  if (io != nullptr && wanted_implicit) {
+    CountBytes(&io->host_copy, &io->host_copy_calls, bytes);
+  }
+  return buf;
+}
+
+// The other two doors, so a transfer cannot be counted by one door and issued
+// outside it.  Both blocking, as every call they replace was.
+cl_int ReadBytes(cl_command_queue queue, cl_mem buf, std::size_t offset,
+                 std::size_t bytes, void* dst, bool diagnostic, IoTally* io) {
+  const cl_int e =
+      clEnqueueReadBuffer(queue, buf, CL_TRUE, offset, bytes, dst, 0, nullptr, nullptr);
+  if (e == CL_SUCCESS && io != nullptr) {
+    if (diagnostic) {
+      CountBytes(&io->dump, &io->dump_calls, bytes);
+    } else {
+      CountBytes(&io->d2h, &io->d2h_calls, bytes);
+    }
+  }
+  return e;
+}
+
+cl_int CopyBytes(cl_command_queue queue, cl_mem src, cl_mem dst, std::size_t src_off,
+                 std::size_t dst_off, std::size_t bytes, IoTally* io) {
+  const cl_int e = clEnqueueCopyBuffer(queue, src, dst, src_off, dst_off, bytes, 0,
+                                       nullptr, nullptr);
+  if (e == CL_SUCCESS && io != nullptr) CountBytes(&io->d2d, &io->d2d_calls, bytes);
+  return e;
+}
+
+// Bytes per pixel the INPUT buffer holds, which is what the conservation
+// assertion multiplies out.  Three values, and the third is the whole reason the
+// engine was 2.2x behind CUDA on video:
+//
+//     rgba32f   4 channels x 4 bytes = 16   the single-image path
+//     rgba64le  4 channels x 2 bytes =  8   rgb48le is ALSO 8, and deliberately:
+//     the buffer is allocated four channels wide regardless (see u16_bytes) and
+//     gather_u16 strides by `channels`, so a 3-channel source occupies a
+//     4-channel allocation.  Using 3 here would report a false delta.
+//     yuv444                3 bytes =  3   three planes, one byte each
+std::size_t InputBytesPerPixel(bool want_in_u16, bool in_yuv444) {
+  if (in_yuv444) return 3;
+  if (want_in_u16) return 4 * sizeof(std::uint16_t);
+  return 4 * sizeof(float);
+}
+
+// The data path's name for the [io] line, derived from the same two booleans the
+// kernel selection below uses, so the label cannot drift from what ran.
+const char* InputModeName(const BlockOptions& options, bool want_in_u16,
+                          bool in_yuv444) {
+  if (in_yuv444) return "yuv444";
+  if (want_in_u16) return options.in_channels == 3 ? "rgb48le" : "rgba64le";
+  return "rgba32f";
+}
+
 std::string g_build_log;
 std::mutex g_log_mu;
 
@@ -1092,25 +1273,37 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     return "opencl: this device did not build the planar 4:4:4 scatter kernel";
   }
 
+  // Counters for this call.  `io_on` is the once-read gate; when it is off the
+  // tally stays zero and every CountBytes/ReadBytes/CopyBytes call below reduces
+  // to a null-pointer test.
+  const bool io_on = IoAccounting();
+  IoTally io;
+
   cl_mem b_pix = nullptr;    // float4, gather source and/or scatter destination
   cl_mem b_in16 = nullptr;   // rgba64le in
   cl_mem b_out16 = nullptr;  // rgba64le out
   cl_mem b_in_yuv = nullptr;  // planar 4:4:4 in
   cl_mem b_out_yuv = nullptr;  // planar 4:4:4 out
 
+  // The three input uploads.  All three used to be CL_MEM_COPY_HOST_PTR, which put
+  // the host-to-device copy inside clCreateBuffer where nothing could count it --
+  // and these are the ONLY byte volumes in this file that the conservation
+  // assertion below is about.  MakeBuffer issues a real, blocking
+  // clEnqueueWriteBuffer for the same bytes in the same place in the sequence,
+  // so the pixels the device sees are unchanged; only the accounting is new.
   if (in_yuv444) {
-    b_in_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                              yuv_bytes, const_cast<std::uint16_t*>(in_u16), &e);
+    b_in_yuv = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, yuv_bytes,
+                          in_u16, true, &io, &e);
     if (e != CL_SUCCESS || b_in_yuv == nullptr) return "clCreateBuffer(in yuv444)";
   } else if (want_in_u16) {
     // READ_WRITE, not READ_ONLY: the source is copied into the output buffer
     // below, so that the pixel the curve never visits keeps its SOURCE value
-    // rather than uninitialised memory.  See the fill below.
-    b_in16 = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                            u16_bytes, const_cast<std::uint16_t*>(in_u16), &e);
+    // rather than uninitialised memory.  See the copy below.
+    b_in16 = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, u16_bytes, in_u16,
+                        true, &io, &e);
   } else {
-    b_pix = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                           pix_bytes, batch, &e);
+    b_pix = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, pix_bytes, batch,
+                       true, &io, &e);
   }
   if (out_yuv444) {
     b_out_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE, yuv_bytes, nullptr, &e);
@@ -1139,6 +1332,13 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     b_pix = clCreateBuffer(g_context, CL_MEM_READ_WRITE, pix_bytes, nullptr, &e);
   }
 
+  // The derived uploads: the curve, the owner map, the mirrored tree, the flat
+  // search, the palette and the error weights.  Small next to the pixels -- a few
+  // hundred KB against 31.6 MiB at 1080p -- but they were COPY_HOST_PTR too, and
+  // they are the rest of the reason a counter built around clEnqueue* reported
+  // zero.  is_input is false for every one of them: none has an expected value
+  // that could be computed from anything but this file's own allocations.
+
   // b_cx and b_idx are created with no initial contents on purpose: both are
   // written in full by the gather and the walk before anything reads them.  That
   // was long asserted by inspection; it is now measured, via RD_OCL_DUMP.  A former
@@ -1149,18 +1349,18 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // settled question on every launch.
   cl_mem b_cx = clCreateBuffer(g_context, CL_MEM_READ_WRITE, cx_bytes, nullptr, &e);
   cl_mem b_idx = clCreateBuffer(g_context, CL_MEM_WRITE_ONLY, idx_bytes, nullptr, &e);
-  cl_mem b_curve = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                  curve->size() * sizeof(int), const_cast<int*>(curve->data()), &e);
-  cl_mem b_owner = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                  owner->size() * sizeof(int), const_cast<int*>(owner->data()), &e);
-  cl_mem b_nodes = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                  hnodes.size() * sizeof(ClNode), hnodes.data(), &e);
-  cl_mem b_search = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                   hsearch.size() * sizeof(ClSearch), hsearch.data(), &e);
-  cl_mem b_pal = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                hpal.size() * sizeof(double), hpal.data(), &e);
-  cl_mem b_w = clCreateBuffer(g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                              sizeof(hweights), hweights, &e);
+  cl_mem b_curve = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                              curve->size() * sizeof(int), curve->data(), false, &io, &e);
+  cl_mem b_owner = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                              owner->size() * sizeof(int), owner->data(), false, &io, &e);
+  cl_mem b_nodes = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                              hnodes.size() * sizeof(ClNode), hnodes.data(), false, &io, &e);
+  cl_mem b_search = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                               hsearch.size() * sizeof(ClSearch), hsearch.data(), false, &io, &e);
+  cl_mem b_pal = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                            hpal.size() * sizeof(double), hpal.data(), false, &io, &e);
+  cl_mem b_w = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY, sizeof(hweights),
+                          hweights, false, &io, &e);
 
   cl_mem all[13] = {b_pix, b_in16, b_out16, b_in_yuv, b_out_yuv,
                     b_cx, b_idx, b_curve, b_owner,
@@ -1339,9 +1539,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // straight device-to-device copy, no conversion and no rounding.  That is also
     // what the CUDA fill does on this path, so the two engines agree on it.
     if (in_yuv444) {
-      e = clEnqueueCopyBuffer(ctx->queue, b_in_yuv, b_out_yuv, 0, 0, yuv_bytes, 0,
-                              nullptr, nullptr);
-    } else {
+        e = CopyBytes(ctx->queue, b_in_yuv, b_out_yuv, 0, 0, yuv_bytes, &io);
+      } else {
       // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so fill
       // with neutral black (Y=0, and 128 for the chroma centre) rather than leave
       // the buffer undefined.
@@ -1395,8 +1594,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
       // The production combination: the source is the caller's rgba64le, so copy
       // it and let the scatter overwrite the visited pixels.  This makes the
       // uint16 path's unvisited pixel agree with the float path's exactly.
-      e = clEnqueueCopyBuffer(ctx->queue, b_in16, b_out16, 0, 0, u16_bytes, 0,
-                              nullptr, nullptr);
+      e = CopyBytes(ctx->queue, b_in16, b_out16, 0, 0, u16_bytes, &io);
     } else {
       // uint16 out from a float4 source: there is no rgba64le source to copy, so
       // define the unvisited pixel as opaque black rather than as garbage.  Not
@@ -1430,8 +1628,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // pass two's output against the input, which differs on every pixel the dither
     // actually changed.  That is exactly what it did for a while, and it reported
     // 18432 differences on a case whose kernels are correct.
-    e = clEnqueueReadBuffer(ctx->queue, b_pix, CL_TRUE, 0, pix_bytes, batch, 0,
-                            nullptr, nullptr);
+    e = ReadBytes(ctx->queue, b_pix, 0, pix_bytes, batch, true, &io);
     if (e != CL_SUCCESS) return fail("readback(check float)");
 
     std::vector<std::uint16_t> got16(check_src16.size());
@@ -1448,8 +1645,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // Upload the quantised input and run the uint16 gather and scatter for real.
     // b_cx and b_idx are reused, which is safe precisely because the first pass
     // has finished and clFinish has returned.
-    cl_mem chk_in = clCreateBuffer(g_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                   u16_bytes, check_src16.data(), &e);
+    cl_mem chk_in = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, u16_bytes,
+                              check_src16.data(), false, &io, &e);
     if (e != CL_SUCCESS || chk_in == nullptr) {
       return fail("clCreateBuffer(check in16)");
     }
@@ -1461,8 +1658,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // Same pre-fill the production path does, so the check validates the shipped
     // behaviour rather than a stricter one.  Without this the single never-visited
     // pixel would report as a difference and mask a real one.
-    e = clEnqueueCopyBuffer(ctx->queue, chk_in, chk_out, 0, 0, u16_bytes, 0,
-                            nullptr, nullptr);
+    e = CopyBytes(ctx->queue, chk_in, chk_out, 0, 0, u16_bytes, &io);
     if (e != CL_SUCCESS) {
       clReleaseMemObject(chk_in);
       clReleaseMemObject(chk_out);
@@ -1470,8 +1666,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     }
     msg = run_pipeline(ctx->k_gather_u16, chk_in, true, ctx->k_scatter_u16, chk_out);
     if (msg.empty()) {
-      e = clEnqueueReadBuffer(ctx->queue, chk_out, CL_TRUE, 0, u16_bytes,
-                              got16.data(), 0, nullptr, nullptr);
+      e = ReadBytes(ctx->queue, chk_out, 0, u16_bytes, got16.data(), true, &io);
       if (e != CL_SUCCESS) msg = "readback(check u16)";
     }
     clReleaseMemObject(chk_in);
@@ -1502,25 +1697,23 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // 3 bytes per pixel, not 8.  The caller's buffer is the encoder's input and is
     // sized for this format, so reading u16_bytes here would run four times past
     // the end of it.
-    e = clEnqueueReadBuffer(ctx->queue, b_out_yuv, CL_TRUE, 0, yuv_bytes,
-                            out_u16, 0, nullptr, nullptr);
+    e = ReadBytes(ctx->queue, b_out_yuv, 0, yuv_bytes, out_u16, false, &io);
     if (e != CL_SUCCESS) return fail("readback(yuv444)");
   } else if (want_u16) {
     // The uint16 result has to come back to the host: the encoder pipe consumes
     // it directly, so unlike the float path there is no COPY_HOST_PTR allocation
     // the scatter could have written into.
-    e = clEnqueueReadBuffer(ctx->queue, b_out16, CL_TRUE, 0, u16_bytes, out_u16, 0,
-                            nullptr, nullptr);
+    e = ReadBytes(ctx->queue, b_out16, 0, u16_bytes, out_u16, false, &io);
     if (e != CL_SUCCESS) return fail("readback(u16)");
   } else if (!want_in_u16 && !in_yuv444) {
-    // This download IS required, and the flags on b_pix's creation are why that is so
-    // easy to get wrong.  CL_MEM_COPY_HOST_PTR (below, at the clCreateBuffer for b_pix)
-    // tells the driver to seed the new buffer from `batch` at clCreateBuffer time.
-    // That is what it does, and all it does.  It is an initial-contents hint, NOT an
-    // alias: the kernels write device memory, `batch` is host memory, and nothing
-    // writes through.  So this read is the only path by which the dithered frames get
-    // back to the caller.  It is 506 MiB at 1920x1080 with --batch-frames 16, which is
-    // why the duplicate described below was worth finding.
+    // This download IS required, and it is required because the kernels write
+    // DEVICE memory: the upload seeded the device buffer from `batch` and nothing
+    // writes through, so the scatter's result has to come back.  That seed was
+    // CL_MEM_COPY_HOST_PTR until the MakeBuffer rewrite above, which is why it is
+    // now an ordinary counted clEnqueueWriteBuffer -- the read below is the only
+    // path by which the dithered frames get back to the caller.  It is 506 MiB at
+    // 1920x1080 with --batch-frames 16, which is why the duplicate described below
+    // was worth finding.
     //
     // A byte-for-byte duplicate of this read used to sit immediately underneath, under a
     // copy of the same wrong comment -- claiming "no download is needed" on the very
@@ -1534,9 +1727,10 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // one above, because in_yuv444 is defined as `want_in_u16 && ...` a few dozen lines
     // up, so `!want_in_u16` already implies `!in_yuv444`.  Equally, do not "optimise"
     // the remaining read away on the strength of the allocation flags -- it is
-    // load-bearing, and the comment that used to say otherwise was the trap.
-    e = clEnqueueReadBuffer(ctx->queue, b_pix, CL_TRUE, 0, pix_bytes, batch, 0,
-                            nullptr, nullptr);
+    // load-bearing, and the comment that used to say otherwise was the trap.  It is
+    // now visible as this call's d2h bucket, which is the cheapest guard available:
+    // a zero d2h on this path is a bug that used to hide behind a comment.
+    e = ReadBytes(ctx->queue, b_pix, 0, pix_bytes, batch, false, &io);
     if (e != CL_SUCCESS) return fail("readback");
   }
 
@@ -1546,14 +1740,18 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // same indices", which no amount of staring at the final image can tell apart.
   // Whichever buffer's hash is unstable is the one carrying the fault, and
   // everything downstream of it is exonerated.
+  //
+  // Every read below goes through ReadBytes with diagnostic=true, so it lands in
+  // the `dump` bucket and NOT in d2h.  That is the point of a separate bucket: on
+  // a run with RD_OCL_DUMP set, d2h still reports only the transfer the caller
+  // needed, so a dump cannot quietly inflate the number someone is reading as the
+  // render's cost.
   if (msg.empty()) {
     if (const char* prefix = std::getenv("RD_OCL_DUMP")) {
       std::vector<unsigned char> tmp_cx(cx_bytes);
       std::vector<unsigned char> tmp_idx(idx_bytes);
-      clEnqueueReadBuffer(ctx->queue, b_cx, CL_TRUE, 0, cx_bytes, tmp_cx.data(),
-                          0, nullptr, nullptr);
-      clEnqueueReadBuffer(ctx->queue, b_idx, CL_TRUE, 0, idx_bytes, tmp_idx.data(),
-                          0, nullptr, nullptr);
+      ReadBytes(ctx->queue, b_cx, 0, cx_bytes, tmp_cx.data(), true, &io);
+      ReadBytes(ctx->queue, b_idx, 0, idx_bytes, tmp_idx.data(), true, &io);
       const std::string cx_path = std::string(prefix) + ".cx.bin";
       const std::string idx_path = std::string(prefix) + ".idx.bin";
       FILE* f = std::fopen(cx_path.c_str(), "wb");
@@ -1569,12 +1767,9 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
         std::vector<unsigned char> tmp_owner(owner_bytes);
         std::vector<unsigned char> tmp_pal(pal_bytes);
         std::vector<unsigned char> tmp_pix(pix_bytes);
-        clEnqueueReadBuffer(ctx->queue, b_owner, CL_TRUE, 0, owner_bytes,
-                            tmp_owner.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(ctx->queue, b_pal, CL_TRUE, 0, pal_bytes,
-                            tmp_pal.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(ctx->queue, b_pix, CL_TRUE, 0, pix_bytes,
-                            tmp_pix.data(), 0, nullptr, nullptr);
+        ReadBytes(ctx->queue, b_owner, 0, owner_bytes, tmp_owner.data(), true, &io);
+        ReadBytes(ctx->queue, b_pal, 0, pal_bytes, tmp_pal.data(), true, &io);
+        ReadBytes(ctx->queue, b_pix, 0, pix_bytes, tmp_pix.data(), true, &io);
         f = std::fopen((std::string(prefix) + ".owner.bin").c_str(), "wb");
         if (f != nullptr) { std::fwrite(tmp_owner.data(), 1, tmp_owner.size(), f); std::fclose(f); }
         f = std::fopen((std::string(prefix) + ".pal.bin").c_str(), "wb");
@@ -1588,6 +1783,93 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
         f = std::fopen((std::string(prefix) + ".host.bin").c_str(), "wb");
         if (f != nullptr) { std::fwrite(batch, 1, pix_bytes, f); std::fclose(f); }
       }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The [io] line, and the conservation assertion under it.
+  //
+  // GATED, and the gate is a one-time getenv (IoAccounting).  One line per call,
+  // which on --video is one per batch -- opt-in rather than always-on, because a
+  // per-batch stderr line belongs in a log that asked for it and not in every
+  // run's output.
+  //
+  // `frames` and `batch` are printed separately because they are asked for
+  // separately, and they are the SAME number on this engine's API: BlockOptions
+  // defines `frames` as "distinct frames in the batch", so there is no second
+  // quantity to print.  Printed as one label would have hidden that; printed as
+  // two it is visible.
+  if (io_on) {
+    // THE EXPECTED SIDE IS ARITHMETIC THE COUNTER CANNOT TOUCH.  width, height,
+    // frames and the input path's byte width are the arguments this call was
+    // handed and the constant table in InputBytesPerPixel -- not a log line, not a
+    // previous run, not the counter being checked.  That is the whole reason it
+    // is worth having: a check whose expected side the author can also edit is a
+    // check that gets renegotiated the first time it is inconvenient.
+    const std::size_t bpp = InputBytesPerPixel(want_in_u16, in_yuv444);
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(npix) * static_cast<std::uint64_t>(frames) *
+        static_cast<std::uint64_t>(bpp);
+    const std::uint64_t uploaded = io.h2d_input;
+    const long long delta = static_cast<long long>(uploaded) -
+                            static_cast<long long>(expected);
+    std::fprintf(
+        stderr,
+        "[io] engine=opencl  %llux%llu  frames=%d  batch=%d  blocks=%d  "
+        "colours=%d  mode=%s  (%llu B/px in)\n"
+        "[io] h2d=%llu B in %llu xfer  |  d2h=%llu B in %llu xfer  |  "
+        "host_copy=%llu B in %llu xfer  |  d2d=%llu B in %llu xfer  |  "
+        "dump=%llu B in %llu xfer\n"
+        "[io] conservation: uploaded %llu B, expected %llu B "
+        "(%zux%zu x%d frames x %llu B/px)  delta=%lld B\n",
+        static_cast<unsigned long long>(width),
+        static_cast<unsigned long long>(height), frames, options.frames, nblocks,
+        palette.count, InputModeName(options, want_in_u16, in_yuv444),
+        static_cast<unsigned long long>(bpp),
+        static_cast<unsigned long long>(io.h2d),
+        static_cast<unsigned long long>(io.h2d_calls),
+        static_cast<unsigned long long>(io.d2h),
+        static_cast<unsigned long long>(io.d2h_calls),
+        static_cast<unsigned long long>(io.host_copy),
+        static_cast<unsigned long long>(io.host_copy_calls),
+        static_cast<unsigned long long>(io.d2d),
+        static_cast<unsigned long long>(io.d2d_calls),
+        static_cast<unsigned long long>(io.dump),
+        static_cast<unsigned long long>(io.dump_calls),
+        static_cast<unsigned long long>(uploaded),
+        static_cast<unsigned long long>(expected), width, height, frames,
+        static_cast<unsigned long long>(bpp), delta);
+
+    // A NON-ZERO DELTA IS A HARD ERROR, and not a warning to be triaged later.
+    // There are exactly two ways it happens and neither is a rounding question:
+    // this call moved a different number of input bytes than it was asked to, or
+    // InputBytesPerPixel is wrong about the layout it just ran.  The first is a
+    // silent data fault.  The second invalidates every number printed above it,
+    // including the conservation line -- which is why the fix in that case is the
+    // formula, not a widened tolerance.
+    //
+    // host_copy non-zero is the same kind of finding rather than an error: it
+    // means a call site still asks for CL_MEM_COPY_HOST_PTR, which is now a no-op
+    // flag (MakeBuffer strips it and issues the explicit write), so the bytes are
+    // counted twice in the reader's mental model and the call site is stale.
+    if (delta != 0) {
+      release_all();
+      return "opencl: byte conservation failed: uploaded " +
+             std::to_string(uploaded) + " B of input, expected " +
+             std::to_string(expected) + " B (" + std::to_string(width) + "x" +
+             std::to_string(height) + " x" + std::to_string(frames) +
+             " frames x " + std::to_string(bpp) + " B/px, mode=" +
+             InputModeName(options, want_in_u16, in_yuv444) + ").  See the [io] "
+             "line above.";
+    }
+    if (io.host_copy != 0) {
+      release_all();
+      return "opencl: " + std::to_string(io.host_copy) +
+             " B were requested through CL_MEM_COPY_HOST_PTR in " +
+             std::to_string(io.host_copy_calls) +
+             " allocation(s), which is the hidden upload this engine no longer "
+             "has; the bytes were counted as h2d anyway.  Route the allocation "
+             "through MakeBuffer without the flag.";
     }
   }
 
