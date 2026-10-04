@@ -609,13 +609,24 @@ bool VideoRunTool(const std::string& tool, const std::string& args,
 // happens on changes.
 void FloatsToRawParallel(const RgbaF* src, std::uint16_t* dst, std::size_t pixels,
                          int frames, int threads) {
+  // BOTH serial early-outs below convert the WHOLE batch, so they get frames * pixels.
+  // They used to pass `pixels`, which converts frame 0 only and leaves frames 1..N-1
+  // holding whatever was already in the output buffer -- zero on the first pass, and
+  // on every pass after, the PREVIOUS batch's dithered pixels.  Reachable whenever
+  // writer_convert_threads == 1, which is `max(1, min(3, hardware_concurrency() - 2))`
+  // on any machine reporting 3 or fewer logical CPUs (0 is permitted by the standard
+  // and does occur, which also yields 1) -- and the probes that set RD_YUV444_OUT=0
+  // all run on many-core boxes, so the suite could not see it.  Symptom: a correct
+  // frame count, the right palette, exit 0, and frames that jump backwards by a whole
+  // batch and then repeat.  The three sibling converters got this right; only this one
+  // dropped the factor.
   if (frames <= 1 || threads <= 1) {
-    FloatsToRaw(src, dst, pixels);
+    FloatsToRaw(src, dst, static_cast<std::size_t>(frames) * pixels);
     return;
   }
   const int workers = std::max(1, std::min(threads, frames));
   if (workers == 1) {
-    FloatsToRaw(src, dst, pixels);
+    FloatsToRaw(src, dst, static_cast<std::size_t>(frames) * pixels);
     return;
   }
   std::vector<std::thread> pool;
@@ -1956,6 +1967,14 @@ struct Batch {
     frames = o.frames;
     eof = o.eof;
     raw_ready = o.raw_ready;
+    // first_frame belongs here.  It was missing, and it is the one field the whole
+    // source-ordering scheme rests on -- HasTurn() decides which batch may be written
+    // next purely by comparing this against next_write.  A move that drops it does not
+    // corrupt anything by itself; it makes the moved-to batch unmatchable, so the
+    // writer waits for a turn that never comes.  No live symptom today only because
+    // NewBatch(), the one caller that would have moved a populated Batch, is itself
+    // dead.  Add the next field to this operator and this comment gets shorter.
+    first_frame = o.first_frame;
     return *this;
   }
   std::uint16_t* in() { return in16_pin ? in16_pin : in16.data(); }
