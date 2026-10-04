@@ -579,16 +579,29 @@ __global__ void BlkGatherYuv420Kernel(const unsigned char* __restrict__ planes,
   // and Cr at a quarter of it each.  Total 1.5 * pixel_pitch per frame, so frame f's
   // luma starts at f * 3 * pixel_pitch / 2 -- the same "planes per frame" stride rule
   // that the 4:4:4 gather got wrong once.
-  const std::size_t base =
-      static_cast<std::size_t>(frame) * 3 * static_cast<std::size_t>(pixel_pitch) / 2 +
-      static_cast<std::size_t>(pix);
+  //
+  // The frame stride was right; the index WITHIN each plane was not.  This used to
+  // compute one `base = frame_base + pix` and use it for all three planes, but `pix`
+  // is a FULL-RESOLUTION pixel index and the chroma planes hold a quarter as many
+  // samples.  So each chroma read was displaced by up to a whole luma plane, and for
+  // the last rows of the last frame it walked past the end of the allocation --
+  // measured at +2,073,598 bytes at 1920x1080 with --batch-frames 16.  The signature
+  // was three mutually different outputs at --batch-frames 1, 4 and 16, which only an
+  // allocation-relative read produces: a correct kernel is batch-invariant.
+  //
+  // Luma is indexed by `pix`; each chroma plane is indexed by its own coordinates,
+  // which is exactly what d_chroma_bilinear already receives as (x >> 1, y >> 1).
+  const std::size_t frame_base =
+      static_cast<std::size_t>(frame) * 3 * static_cast<std::size_t>(pixel_pitch) / 2;
   const int w2 = w >> 1, h2 = h >> 1;
   const std::size_t y_size = static_cast<std::size_t>(pixel_pitch);
   const std::size_t c_size = y_size / 4;
-  const unsigned yy = planes[base];
-  const unsigned cb = d_chroma_bilinear(planes + base + y_size, w2, x >> 1, y >> 1,
+  const std::size_t cb_plane = frame_base + y_size;
+  const std::size_t cr_plane = cb_plane + c_size;
+  const unsigned yy = planes[frame_base + static_cast<std::size_t>(pix)];
+  const unsigned cb = d_chroma_bilinear(planes + cb_plane, w2, x >> 1, y >> 1,
                                         x & 1, y & 1, w2, h2);
-  const unsigned cr = d_chroma_bilinear(planes + base + y_size + c_size, w2, x >> 1,
+  const unsigned cr = d_chroma_bilinear(planes + cr_plane, w2, x >> 1,
                                         y >> 1, x & 1, y & 1, w2, h2);
   std::uint16_t rgb[3];
   d_sws_yuv_to_rgb16(yy, cb, cr, rgb);

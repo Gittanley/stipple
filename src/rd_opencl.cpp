@@ -1330,9 +1330,29 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
       // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so fill
       // with neutral black (Y=0, and 128 for the chroma centre) rather than leave
       // the buffer undefined.
-      const cl_uchar zero[3] = {0, 128, 128};
-      e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, zero, 3, 0, yuv_bytes, 0,
+      //
+      // clEnqueueFillBuffer requires pattern_size to be 1, 2, 4, 8, ...  Passing 3 --
+      // one byte per plane -- is CL_INVALID_VALUE on any conformant runtime, so this
+      // call ALWAYS failed.  `--engine opencl --input-mode rgba64` with the default
+      // planar output exited 1 and left a 565-byte container ffprobe calls malformed.
+      // docs\OPENCL.md records that this combination needs RD_YUV444_OUT=0, but a
+      // documented caveat is not a check, and what the user saw was an internal OpenCL
+      // error string rather than anything they could act on.
+      //
+      // Three fills of one byte each instead.  The layout is Y, then U, then V, each
+      // yuv_bytes / 3, so the intent -- luma 0, chroma at the 128 centre -- is kept
+      // exactly and no byte-pattern trick is needed.
+      const std::size_t plane3 = yuv_bytes / 3;
+      const cl_uchar luma_fill = 0;
+      const cl_uchar chroma_fill = 128;
+      e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &luma_fill, 1, 0, plane3, 0,
                               nullptr, nullptr);
+      if (e == CL_SUCCESS)
+        e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &chroma_fill, 1, plane3,
+                                plane3, 0, nullptr, nullptr);
+      if (e == CL_SUCCESS)
+        e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &chroma_fill, 1, 2 * plane3,
+                                plane3, 0, nullptr, nullptr);
     }
     if (e != CL_SUCCESS) return fail("fill(yuv444 out)");
   } else if (want_u16) {

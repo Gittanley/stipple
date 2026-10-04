@@ -2840,7 +2840,16 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // Quantum is a float, and the decoder's uint16 maps onto it exactly.  Skipping
         // it where it *is* required leaves b.pixels at its zero-initialised value and
         // the whole clip comes out black, so the condition is explicit.
-        if (!use_gpu || opt.gpu_float_out) {
+        // `|| cpu_threads > 0` is the fix, and it is the same mistake as the two above:
+        // the condition named the GPU, but the CONSUMER of `b.pixels` is not the GPU.
+        // Host workers dither `b.pixels`, and they exist whenever cpu_threads > 0 --
+        // which on a GPU machine is exactly what `--cpu-threads N` asks for.  With a
+        // GPU present, gpu_float_out off, and `--cpu-threads 4`, none of the original
+        // three disjuncts held, so the reader never widened into `b.pixels` and the
+        // host workers dithered a zero-initialised buffer: measured mean R 56.37
+        // against 120.74 for the same clip with the default `--cpu-threads 0`, and
+        // byte-identical for N=1 and N=4.  Silently, deterministically, exit 0.
+        if (!use_gpu || opt.gpu_float_out || cpu_threads > 0) {
           if (use_yuv444) {
             // Planar 8-bit, three BYTES per pixel.  RawToFloats would read this as
             // uint16 and land on frame f-1's chroma planes, which is right for frame 0
@@ -2902,7 +2911,19 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // pool absorbs the slack.  This is the "dynamically" part -- the mix adapts to
   // whichever engine is actually the constraint, with no tuning knob.
   std::atomic<std::int64_t> gpu_taken{0};
-  std::atomic<int64_t> last_gpu_ms{0};
+  // Must start at NOW, not at 0.  `since = NowMs() - last_gpu_ms` measures the gap
+  // since the GPU last took a batch, and `NowMs()` is an ABSOLUTE steady_clock count
+  // -- large, not elapsed.  Initialised to 0, the first evaluation computed a `since`
+  // of roughly 2^61 ms, `since > budget` was trivially true, and every host worker
+  // broke out of its grace loop on its first turn and took a batch.  After that the
+  // flag would have worked -- except the host had usually already drained `ready`, so
+  // the GPU never got a look in.  Which is why `--cpu-threads N>0` on a GPU machine
+  // ran the HOST WALK for essentially the whole clip.
+  //
+  // Verified with the flag's own knob: `--host-grace-ms 100000` produced a
+  // BYTE-IDENTICAL file to the default 60 ms, which is what a setting that changes
+  // nothing looks like.  With this initialisation the two differ.
+  std::atomic<int64_t> last_gpu_ms{static_cast<int64_t>(NowMs())};
   const int host_grace_ms = opt.host_grace_ms > 0 ? opt.host_grace_ms : 60;
 
   // `gpu_index` is the device-state slot this worker owns; host workers pass -1 and
@@ -3136,10 +3157,22 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // `out16` itself, so this would be pure waste -- and it would overwrite correct
     // bytes with a float4 buffer that no longer holds the result.
     if (!b.raw_ready) {
-      if (out_yuv444 && !use_gpu) {
+      if (out_yuv444) {
         // The host has to do what the device does on the GPU path.  Without this the
         // writer would call FloatsToRaw, hand the encoder rgba64le, and the encoder
         // would read it as planar 4:4:4 -- see FloatsToYuv444 for what that cost.
+        //
+        // The `&& !use_gpu` this used to carry was wrong, and wrong in the direction
+        // that produces garbage rather than an error.  We are already inside
+        // `if (!b.raw_ready)`, which has answered the only question that matters: DID
+        // THE DEVICE WRITE THESE BYTES?  If it did not, the host must convert, and
+        // whether a GPU exists is irrelevant.  With `--gpu-float-out` a GPU is present
+        // and `raw_ready` is false -- the float path returns pixels instead of writing
+        // the scatter -- so the old condition took the else branch and pushed
+        // rgba64le at 8 bytes per pixel into a pipe the encoder was told is yuv444p at
+        // 3.  Measured: 97.1% of samples differed from the same render without the
+        // flag.  With RD_YUV444_OUT=0 the two runs were byte-identical, which is what
+        // isolated it to this branch rather than to the flag.
         FloatsToYuv444Parallel(b.pixels.data(),
                                reinterpret_cast<unsigned char*>(b.out()), pixels,
                                b.frames, writer_convert_threads);

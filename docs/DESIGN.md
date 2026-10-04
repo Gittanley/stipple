@@ -3596,3 +3596,94 @@ The next step, if anyone wants it, is to dump both rank fields directly and diff
 which a fixture that exposes the raw matrix would allow; the obstacle noted in the
 README stands, because with a 2-colour palette the two distances are equal exactly at the
 midpoint and the pattern cannot appear in the output at all.
+
+### Four faults found by asking a subagent which probe it trusted least
+
+Two audits were run against this tree with instructions to find faults, verify
+each by running something, and separate VERIFIED / SUSPECT / REFUTED.  The second
+one found three product faults and one tooling fault that no check here could see,
+and its coverage analysis is the most useful part:
+
+  * ab-input-mode.ps1 is the only tool that runs --input-mode yuv420, and it
+    compares FPS ONLY -- never pixels.  That is exactly why the 4:2:0 fault below
+    was invisible for as long as it existed.
+  * probe-video-exact.ps1 runs rgba64 only with RD_YUV444_OUT=0, so the OpenCL
+    fill fault below is never reached.
+  * Nothing in tools\ combines --gpu-float-out with the default output, or
+    --cpu-threads N>0 with a GPU present.
+
+All four are the SAME mistake wearing different clothes: a condition that names
+the wrong thing.  Two of them are keys on GPU presence where the question was
+who wrote or who reads a buffer.
+
+#### 1. `--input-mode yuv420` read chroma from the wrong address (and past the end)
+
+`rd_blocks_cuda.cu`, `BlkGatherYuv420Kernel`.  It computed one
+`base = frame_base + pix` and used it to address all three planes.  `pix` is a
+FULL-RESOLUTION pixel index; the chroma planes hold a quarter as many samples.  So
+each chroma read was displaced by up to a whole luma plane, and for the last rows
+of the last frame it walked past the end of the allocation -- measured at
++2,073,598 bytes at 1920x1080 with --batch-frames 16.
+
+The signature was three MUTUALLY DIFFERENT outputs at --batch-frames 1, 4 and 16,
+which only an allocation-relative read produces; a correct kernel is
+batch-invariant.  After the fix:
+
+| `--input-mode yuv420`, CUDA | before | after |
+|---|---|---|
+| distinct outputs over batch 1, 4, 16 | 3 | **1** |
+| MAE against `--input-mode yuv444` | 94+ (garbage) | **2.98** |
+
+Two *correct* reconstructions of the same source differ by about 2.7 MAE, so 2.98
+is where a right answer lands.
+
+#### 2. `--gpu-float-out` pushed rgba64le into a yuv444p pipe
+
+`rd_video.cpp`, the writer's conversion branch read `if (out_yuv444 && !use_gpu)`.
+The enclosing `if (!b.raw_ready)` has already answered the only question that
+matters -- DID THE DEVICE WRITE THESE BYTES? -- and if it did not, the host must
+convert, whether or not a GPU exists.  With `--gpu-float-out` a GPU is present and
+`raw_ready` is false, so the writer took the else branch and pushed 8 bytes per
+pixel into a pipe the encoder was told is 3.
+
+After: MAE 0 against the same render without the flag.  With RD_YUV444_OUT=0 the
+two runs were byte-identical even BEFORE the fix, which is what isolated it to
+this branch rather than to the flag itself.
+
+#### 3. `--cpu-threads N>0` with a GPU dithered an unwritten buffer
+
+The reader widened input into `b.pixels` only `if (!use_gpu || opt.gpu_float_out)`.
+The consumer of `b.pixels` is not the GPU -- HOST WORKERS dither it, and they exist
+whenever `cpu_threads > 0`, which is exactly what `--cpu-threads N` asks for on a
+GPU machine.  So the host workers dithered a zero-initialised buffer.
+
+| `--cpu-threads` | mean R before | mean R after |
+|---|---|---|
+| 0 (GPU only) | 120.74 | 120.74 |
+| 1 | **56.37** | **120.74** |
+| 4 | **56.37** | **120.74** |
+
+Silently, deterministically, exit 0.  The audit also found `--host-grace-ms` inert:
+`last_gpu_ms` is initialised to 0 and compared against an absolute steady_clock
+count, so the host worker never waits.  That is why the host workers won every
+batch rather than yielding to the GPU.
+
+#### 4. OpenCL + rgba64 + default planar output always failed
+
+`rd_opencl.cpp` called `clEnqueueFillBuffer(..., pattern, 3, ...)` -- three bytes,
+one per plane.  OpenCL requires `pattern_size` to be a power of two, so this
+returned CL_INVALID_VALUE every time, exited 1, and left a 565-byte container
+ffprobe calls malformed.  docs\OPENCL.md already said the combination needs
+RD_YUV444_OUT=0, but a documented caveat is not a check, and what the user saw was
+an internal OpenCL error string.  Fixed by filling each plane separately with a
+one-byte pattern; after: exit 0, 30 frames, 263,313 bytes.
+
+#### The blind spot all four shared
+
+probe-video-determinism.ps1 exercises --cpu-threads 1.  With fault 3 above it was
+exercising a corrupting path and PASSING, because the probe checks determinism
+and the corruption was deterministic.  This is the same shape as the four faults
+in the previous section: a check with the wrong shape cannot see the bug it was
+nearest to.  probe-video-invariance.ps1 does compare host against device and does
+pass -- because the default input mode is the one combination that was already
+correct.
