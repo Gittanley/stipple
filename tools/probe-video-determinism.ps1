@@ -105,22 +105,21 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 # stdout piped through PowerShell is re-encoded, which turns the binary into text and
 # destroys the thing being hashed.
 function Get-DecodedHash([string]$mkv) {
-  $raw = Join-Path $tmp 'frames.raw'
-  Remove-Item -EA SilentlyContinue $raw
-  cmd /c "magick ""$mkv"" -depth 8 ""rgba:$raw""" 2>$null | Out-Null
-  if (-not (Test-Path $raw)) { return $null }
-  # Guarded, and the guard matters more than it looks: a hash that throws here takes
-  # the whole probe down, and a probe that dies mid-sweep reports whatever it had
-  # printed so far -- which reads as "CUDA failed, OpenCL passed" rather than "this
-  # run is void".  A return of null is counted as a bad run, which is a statement about
-  # the data instead of about the instrument.
+  # ffmpeg streams the decoded frames into md5: no file, one frame held at a time.
+  # The obvious alternative, `magick "$mkv" -depth 8 "rgba:$raw"`, decodes EVERY frame
+  # into a host buffer first -- measured 1,865.7 MiB peak working set and a 449 MiB
+  # file for the 60-frame 1080p clip, and this probe calls it once per run per engine.
+  # It hashed every decoded sample, which md5 over the rawvideo stream also does.
+  $h = (& ffmpeg -v error -i $mkv -f rawvideo -pix_fmt rgba -f md5 - 2>$null | Out-String).Trim()
+  if (-not $h) { return $null }
+  # The md5 stream carries every decoded sample of every frame, which is exactly what
+  # hashing the raw file covered.  A frame count is reported alongside so a truncated
+  # decode cannot masquerade as a stable one.
+  $n = 0
   try {
-    $h = (Get-FileHash $raw -Algorithm SHA256 -ErrorAction Stop).Hash
-    $n = (Get-Item $raw).Length
-  } catch {
-    return $null
-  }
-  Remove-Item -EA SilentlyContinue $raw
+    $n = [int](& ffprobe -v error -select_streams v:0 -count_frames `
+                 -show_entries stream=nb_read_frames -of csv=p=0 $mkv 2>$null | Out-String).Trim()
+  } catch { $n = 0 }
   return @{ hash = $h; bytes = $n }
 }
 

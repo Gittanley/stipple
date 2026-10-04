@@ -22,9 +22,38 @@
 #   3. Still strips the two things dxc cannot parse at all: the `technique`
 #      block and the `ui_` annotations.  Both are Reshade effect syntax that
 #      dxc rejects outright, and both are checked by (1) instead.
+#
+# EXIT CODES
+#   0  both stages ran
+#   1  a violation, a missing file, or the shader did not compile
+#   2  no dxc.exe -- stage 1 ran and passed, stage 2 is UNVERIFIED.  This used
+#      to be 0, which is the one thing a "cannot run" must never be.
+#
+# NOTHING INVOKES THIS SCRIPT
+# ==========================
+# It is not in verify.ps1, not in .github\workflows\ci.yml, and not in any hook.
+# A green suite therefore says NOTHING about reshade\rdither_riemersma.fx, and
+# the paragraph above is the only thing suggesting otherwise.
+#
+# That is left as it is rather than quietly fixed, because wiring it in has a
+# cost that has to be paid deliberately: every CI run would come to depend on a
+# Windows SDK being present, and on a runner without one this file now exits 2
+# and turns a green pipeline red over a file that is not part of the build.  If
+# you wire it in, gate the CI step on a dxc-presence check and read 2 as
+# "unverified here", not as a failure.  A green pipeline that had silently
+# skipped this file would be exactly the problem the exit codes above exist to
+# prevent.
 
 param(
-  [string]$Dxc = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe',
+  # Empty means "search for it" -- see Find-Dxc below.  This used to be a hardcoded
+  # absolute path to one Windows SDK version:
+  #   C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe
+  # A machine with any other SDK has no dxc there, so stage 2 became a silent no-op;
+  # and installing a NEWER SDK never changed it, so this compiled against whatever
+  # that one pinned version shipped, indefinitely.  A named path that does not exist
+  # is now an error rather than a skip: a caller who asked for a compiler and got
+  # nothing has been told the wrong thing.
+  [string]$Dxc = '',
   [int]$Width = 1920,
   [int]$Height = 1080
 )
@@ -34,10 +63,6 @@ $root = Split-Path $PSScriptRoot -Parent
 $fx = Join-Path $root 'reshade\rdither_riemersma.fx'
 $fxh = Join-Path $root 'reshade\ReShade.fxh'
 
-if (-not (Test-Path $Dxc)) {
-  Write-Host "[check-fx] SKIP: dxc.exe not found at $Dxc"
-  exit 0
-}
 if (-not (Test-Path $fx)) { Write-Host "[check-fx] FAIL: $fx not found"; exit 1 }
 if (-not (Test-Path $fxh)) {
   Write-Host "[check-fx] FAIL: $fxh not found."
@@ -99,6 +124,71 @@ if ($violations.Count -gt 0) {
   exit 1
 }
 Write-Host '[check-fx] Reshade conventions OK (annotations, no compile, no bare sampler, no 2.x names).'
+Write-Host '          This half needs no compiler, so it ran whether or not a dxc was found.'
+
+# ---- locate dxc, now that stage 1 has run ----------------------------------
+#
+# Stage 1 deliberately runs FIRST.  The absent-compiler check used to sit above it and
+# exit the whole file, so on a machine with no Windows SDK the convention checks -- the
+# ones that catch the very errors dxc passed -- did not run either.  A missing compiler
+# should cost exactly the coverage that depends on it.
+#
+# Newest SDK first, not a pinned one.  The path this replaces was pinned to
+# 10.0.26100.0, which is a silent no-op on every machine without that exact SDK and a
+# stale compiler on every machine that has since installed a newer one.
+function Find-Dxc {
+  param([string]$Explicit)
+
+  if ($Explicit) {
+    if (-not (Test-Path $Explicit)) {
+      throw "-Dxc was given as '$Explicit' and no such file exists.  A named compiler that is not there is a mistake in the caller, not a reason to skip."
+    }
+    return [pscustomobject]@{ Path = (Resolve-Path $Explicit).Path; Source = '-Dxc' }
+  }
+  $onPath = Get-Command dxc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($onPath) { return [pscustomobject]@{ Path = $onPath.Source; Source = 'PATH' } }
+
+  $roots = @()
+  foreach ($pf in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+    if ($pf) { $roots += (Join-Path $pf 'Windows Kits\10\bin') }
+  }
+  $roots += 'C:\Program Files (x86)\Windows Kits\10\bin'
+  $roots += 'C:\Program Files\Windows Kits\10\bin'
+  $found = @()
+  foreach ($r in @($roots | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique)) {
+    $found += @(Get-ChildItem -Path $r -Recurse -Filter 'dxc.exe' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Directory.Name -eq 'x64' })
+  }
+  if ($found.Count -gt 0) {
+    $best = $found | Sort-Object `
+      @{ Expression = { if ($_.FullName -match 'bin\\([\d.]+)\\') { [version]$Matches[1] } else { [version]'0.0' } }; Descending = $true },
+      @{ Expression = { $_.FullName }; Descending = $false } | Select-Object -First 1
+    return [pscustomobject]@{ Path = $best.FullName; Source = 'Windows Kits search (newest x64)' }
+  }
+  return $null
+}
+
+$dxcInfo = $null
+try { $dxcInfo = Find-Dxc -Explicit $Dxc } catch { Write-Host "[check-fx] FAIL: $($_.Exception.Message)"; exit 1 }
+if (-not $dxcInfo) {
+  Write-Host ''
+  Write-Host '[check-fx] SKIP: no dxc.exe found.  Stage 1 above DID run; stage 2 did not.' -ForegroundColor Yellow
+  Write-Host '          Searched: PATH, then every x64\dxc.exe under' -ForegroundColor Yellow
+  Write-Host '            %ProgramFiles(x86)%\Windows Kits\10\bin\*\x64' -ForegroundColor Yellow
+  Write-Host '            %ProgramFiles%\Windows Kits\10\bin\*\x64' -ForegroundColor Yellow
+  Write-Host '          The HLSL compile against the real ReShade headers is therefore' -ForegroundColor Yellow
+  Write-Host '          UNVERIFIED.  Exiting 2, "cannot run", not 0: this used to exit 0' -ForegroundColor Yellow
+  Write-Host '          here, which is the inverse of the convention the rest of the suite' -ForegroundColor Yellow
+  Write-Host '          uses and reads in a log exactly like a pass.' -ForegroundColor Yellow
+  exit 2
+}
+$Dxc = $dxcInfo.Path
+Write-Host "[check-fx] stage 2: dxc via $($dxcInfo.Source)"
+Write-Host "          $Dxc"
+try {
+  $ver = (& $Dxc --version 2>&1 | Select-Object -First 1)
+  if ($ver) { Write-Host "          $ver" }
+} catch { Write-Host '          (dxc --version produced no output; continuing)' }
 
 # ---- 2. compile against the real ReShade headers --------------------------
 $tmp = Join-Path $env:TEMP 'rdither_fx_check'
@@ -185,4 +275,6 @@ if (-not $okPs) { exit 1 }
 Write-Host '[check-fx] OK: the shader compiles against the real ReShade 3.x headers.'
 Write-Host '          ReShade::BackBuffer usage validated. The technique block and the'
 Write-Host '          ui_ annotations are still checked by pattern only (stage 1).'
+Write-Host '          NOTE: nothing in this repository runs this script, so a green'
+Write-Host '          verify.ps1 says nothing about this file.  See the header.'
 exit 0

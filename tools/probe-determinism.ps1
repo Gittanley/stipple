@@ -153,6 +153,12 @@ if (-not $anyUsable) {
 
 $fail = 0
 $total = 0
+# Cases that were never run because the engine is not in this build.  Counted and
+# PRINTED, because the tally at the bottom excludes them from the denominator and
+# without a count a reader cannot tell "14 of 14 deterministic" from "14 of 20
+# deterministic, the other 6 silently dropped".  tools\probe-video-determinism.ps1
+# was fixed for exactly this and this one was left; the shape is copied from there.
+$skipped = 0
 ''
 "Determinism: $Runs runs per case, decoded pixels"
 ''
@@ -160,7 +166,11 @@ $total = 0
 foreach ($img in $imgs) {
   $src = "$FixtureDir\$img.png"
   foreach ($eng in $engines) {
-    if ($skipEngines.ContainsKey($eng)) { continue }
+    if ($skipEngines.ContainsKey($eng)) {
+      $skipped++
+      "  {0,-8} {1,-7} SKIPPED ({2})" -f $img, $eng, $skipEngines[$eng]
+      continue
+    }
     $total++
     $pixelHashes = @{}
     $strippedHashes = @{}
@@ -250,10 +260,26 @@ foreach ($algo in $algos) {
 }
 
 ''
-if ($fail -eq 0) {
-  "{0} of {1} cases deterministic." -f $total, $total
-  exit 0
+# A SKIPPED case is not a deterministic case, and the tally has to say so.  $total
+# deliberately excludes skips from its denominator -- that part was already right --
+# but it printed no skip count at all, so the single line a reader skims could not be
+# told apart from a full-coverage run.  On a build with no OpenCL, "14 of 14 cases
+# deterministic" was true and hid that 2 of the 16 engine cases had never run.
+# tools\probe-video-determinism.ps1 already prints this; see the note at its line 330
+# for the CI log where it was found.
+$ran = $total
+# $total counts the engine cases that ran PLUS the eight algorithms, so the number of
+# cases this probe was ASKED to run is $total plus the skips.  Getting that wrong is the
+# same class of error: the first version of this line divided the 14 that ran by the 6
+# engine cases alone and printed "14 of 6 cases deterministic".
+$asked = $total + $skipped
+if ($skipped -gt 0) {
+  "{0} of {1} cases deterministic, {2} SKIPPED for want of an engine.  Skips are not passes." -f `
+    $ran, $asked, $skipped
+} else {
+  "{0} of {1} cases deterministic." -f $ran, $asked
 }
+if ($fail -eq 0) { exit 0 }
 # $fail, NOT ($total - $fail).  This said "($total - $fail) of $total cases FAILED",
 # so a run with 2 of 14 cases failing printed "12 of 14 cases FAILED" -- it counted
 # every PASSING case as a failure, directly above a table showing 12 ok lines and
@@ -262,6 +288,7 @@ if ($fail -eq 0) {
 #
 # Line 193 above had the same expression and was only ever correct by accident:
 # it is reached solely when $fail -eq 0, where $total - 0 happens to equal $total.
-# Writing $fail in both places removes the coincidence.
+# Writing $fail in both places removes the coincidence.  The denominator is $total,
+# which excludes skips, so the FAILED line is about the cases that ran.
 "{0} of {1} cases FAILED." -f $fail, $total
 exit 1

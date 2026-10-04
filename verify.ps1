@@ -20,7 +20,14 @@ param(
   # equally the image suite catches octree and curve regressions and needs no video at
   # all, so paying 25-35 minutes for the union on every edit is the wrong trade.  -Fast
   # is the inner loop; the default is still the full sweep, which is what CI runs.
-  [switch]$Fast
+  [switch]$Fast,
+  # -Fast leaves two stages unrun, and "unrun" is not "passed".  It therefore exits 2
+  # (the suite's existing "cannot run / not covered" code) rather than 0, so that a
+  # caller which runs `verify.ps1 -Fast` and checks the exit code cannot mistake a
+  # partial run for a green one.  Nothing in the pipeline reads this automatically yet --
+  # CI runs the full sweep -- so the flag costs an inner-loop user one extra switch, and
+  # buys a distinction that used to exist only as prose at the bottom of the log.
+  [switch]$AllowPartial
 )
 
 # Per-stage wall clock, printed at the end.  A slow run used to be reported only as a
@@ -41,6 +48,18 @@ function Stage([string]$Name, [scriptblock]$Body) {
 # to 77s against a 145s wall clock, which is the kind of unattributed remainder that
 # makes a timing report worse than none: it looks like the answer.
 $swTotal = [Diagnostics.Stopwatch]::StartNew()
+
+# Stages this run did not execute, named.  -Fast used to skip two 1080p video stages,
+# print two yellow sentences about it, and then exit 0 -- so an automated caller reading
+# the exit code saw a pass, and a human reading the log had to notice prose to know that
+# a third of the suite never ran.  The list is printed in the summary, which makes the
+# gap greppable, and its non-emptiness decides the exit code below.
+$stagesSkipped = [System.Collections.Generic.List[string]]::new()
+function Skip-Stage([string]$Name, [string]$Why) {
+  $stagesSkipped.Add("$Name ($Why)")
+  Write-Host ""
+  Write-Host "$Name : SKIPPED ($Why)" -ForegroundColor Yellow
+}
 
 # `magick compare -metric AE` reports its metric on stderr, which PowerShell
 # would otherwise promote to a terminating error under Stop.
@@ -269,8 +288,7 @@ if ($needFixtures) {
 $vid = Join-Path $PSScriptRoot 'tools\probe-video-exact.ps1'
 $swVid = [Diagnostics.Stopwatch]::StartNew()
 if ($Fast) {
-  Write-Host ""
-  Write-Host "video exactness: SKIPPED (-Fast: needs a 1080p clip; run without -Fast before committing)" -ForegroundColor Yellow
+  Skip-Stage 'video exactness' '-Fast: needs a 1080p clip; run without -Fast before committing'
 } elseif (Test-Path $vid) {
   Write-Host ""
   $vidArgs = @('-Rdither', $Rdither)
@@ -317,8 +335,7 @@ if (Test-Path $unv) {
 $vdet = Join-Path $PSScriptRoot 'tools\probe-video-determinism.ps1'
 $swVdet = [Diagnostics.Stopwatch]::StartNew()
 if ($Fast) {
-  Write-Host ""
-  Write-Host "video determinism: SKIPPED (-Fast: the slowest stage by far; run without -Fast before committing)" -ForegroundColor Yellow
+  Skip-Stage 'video determinism' '-Fast: the slowest stage by far; run without -Fast before committing'
 } elseif (Test-Path $vdet) {
   Write-Host ""
   $vdetArgs = @('-Rdither', $Rdither)
@@ -362,7 +379,7 @@ $swTotal.Stop()
 $totalMs = $swTotal.Elapsed.TotalMilliseconds
 $namedMs = ($stageTimes | Measure-Object Ms -Sum).Sum
 Write-Host ""
-if ($Fast) { Write-Host "stage times (-Fast; the two video stages are NOT included):" -ForegroundColor Cyan }
+if ($Fast) { Write-Host "stage times (-Fast; the skipped stages below are NOT included):" -ForegroundColor Cyan }
 else      { Write-Host "stage times:" -ForegroundColor Cyan }
 foreach ($s in $stageTimes) {
   $pct = if ($totalMs -gt 0) { 100.0 * $s.Ms / $totalMs } else { 0 }
@@ -378,9 +395,36 @@ if ($otherMs -gt 500) {
   Write-Host ("  {0,-28} {1,19}    OpenCL fixtures, video invariance, startup)" -f '', '')
 }
 Write-Host ("  {0,-28} {1,7:N1}s" -f 'TOTAL', ($totalMs / 1000))
-if ($Fast) {
+
+# ---- coverage, before the exit code -------------------------------------------
+#
+# One line that says how many stages ran and how many did not, naming the ones that did
+# not.  This is the countable form of a warning that used to live only in prose, and it
+# is what the exit code below is derived from, so the two cannot disagree.
+Write-Host ""
+if ($stagesSkipped.Count -eq 0) {
+  Write-Host "coverage: every stage ran.  0 skipped." -ForegroundColor Cyan
+} else {
+  Write-Host ("coverage: {0} stage(s) SKIPPED and therefore NOT covered by this run:" -f $stagesSkipped.Count) -ForegroundColor Yellow
+  foreach ($s in $stagesSkipped) { Write-Host "    $s" -ForegroundColor Yellow }
+  Write-Host "A skipped stage is not a passing stage.  The bit-exact tally above does not" -ForegroundColor Yellow
+  Write-Host "include them and no number in this run covers them." -ForegroundColor Yellow
+}
+
+if ($stagesSkipped.Count -gt 0) {
   Write-Host ""
-  Write-Host "This was -Fast: the two 1080p video stages were skipped. Run WITHOUT -Fast" -ForegroundColor Yellow
-  Write-Host "before committing anything that touches src\, the video pipeline, or a probe." -ForegroundColor Yellow
+  if ($AllowPartial) {
+    Write-Host "Exiting 0 because -AllowPartial was given.  This run did NOT cover the" -ForegroundColor Yellow
+    Write-Host "stages listed above; do not read 0 as a full-suite pass." -ForegroundColor Yellow
+    exit 0
+  }
+  # 2, not 1: nothing failed, and 1 is reserved for that.  2 is this suite's existing
+  # "cannot run / not covered" code, which is exactly what a -Fast run is.  It was 0.
+  # $($stagesSkipped.Count), not $stagesSkipped.Count: inside a double-quoted string
+  # PowerShell interpolates the collection and then emits a literal ".Count", so the
+  # uncorrected form printed the whole skip list followed by ".Count".
+  Write-Host "Exiting 2: $($stagesSkipped.Count) stage(s) did not run.  This is not a pass and not a" -ForegroundColor Yellow
+  Write-Host "failure.  Use -AllowPartial if you need exit 0 from a deliberately partial run." -ForegroundColor Yellow
+  exit 2
 }
 exit 0

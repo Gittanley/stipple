@@ -160,17 +160,21 @@ foreach ($p in $paths) {
   $hashes = @{}
   foreach ($eng in $ran) {
     $mkv = Join-Path $tmp "clip_$eng.mkv"
-  $raw = Join-Path $tmp "clip_$eng.raw"
-  Remove-Item -EA SilentlyContinue $raw
-  cmd /c "magick ""$mkv"" -depth 8 ""rgba:$raw""" 2>$null | Out-Null
-  if (-not (Test-Path $raw)) {
-    "  $eng  decode FAILED (is ImageMagick on PATH?)"
+  # ffmpeg streams the decoded frames straight into md5.  The obvious alternative,
+  # `magick "$mkv" -depth 8 "rgba:$raw"`, decodes EVERY frame into a host buffer and
+  # writes it out: measured 1,865.7 MiB peak working set and a 449 MiB file for the
+  # 60-frame 1080p clip, repeated once per engine.  On a longer clip it is GB-scale --
+  # this is where an 8 GB spike came from.  This form writes no file and holds one
+  # frame.  It hashes every decoded sample of every frame, which is what the raw
+  # file was hashed for.
+  $h = (& ffmpeg -v error -i $mkv -f rawvideo -pix_fmt rgba -f md5 - 2>$null | Out-String).Trim()
+  if (-not $h) {
+    "  $eng  decode FAILED (is ffmpeg on PATH?)"
     $fail++
     continue
   }
-  $h = (Get-FileHash $raw -Algorithm SHA256).Hash
   $hashes[$eng] = $h
-  "  $eng  decoded $([math]::Round((Get-Item $raw).Length / 1MB, 1)) MB  sha256 $h"
+  "  $eng  decoded via ffmpeg md5  $h"
 }
 
   Remove-Item -EA SilentlyContinue (Join-Path $tmp 'clip_*.raw')

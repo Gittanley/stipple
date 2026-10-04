@@ -98,7 +98,11 @@ jobs:
     # No GPU on the runner, so this takes exactly the code path that failed to link.
     name: build + verify (no CUDA, no OpenCL SDK)
     runs-on: windows-2022
-    timeout-minutes: 25
+    # 40, for ONE full verify.ps1 run.  verify.ps1's own header documents the sweep at
+    # 25-35 min, so 25 was below its own documented floor even before this file ran the
+    # suite twice; two runs would need roughly 50-70.  Not measured on a runner, so this
+    # is headroom against a documented range rather than a measurement.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -135,22 +139,24 @@ jobs:
         shell: cmd
         run: build.cmd --no-cuda
 
-      - name: Verify
+      - name: Verify, and assert the skipped checks are the expected ones
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          # magick, MAGICK_HOME and the DLL directory are already set by the
-          # install step through GITHUB_ENV and GITHUB_PATH, so they are not
-          # re-derived here: in this layout magick.exe lives in Library\bin, not
-          # at the prefix root, so "$env:IM_ROOT\magick.exe" is not a file.
-          magick --version
-          & pwsh -NoProfile -File .\verify.ps1
-          $code = $LASTEXITCODE
-          Write-Host "verify.ps1 exit=$code"
-          if ($code -ne 0) { exit $code }
-
-      - name: Assert the skipped checks are the expected ones
-        shell: pwsh
+        # ONE run of the suite, not two.  This used to be two steps: a "Verify" step
+        # that ran verify.ps1 and checked its exit code, and an "Assert the skipped
+        # checks" step that ran it AGAIN and scraped the bit-exact tally out of a
+        # Tee-Object log of the second run.  Half the point of a tally is that it
+        # describes the run whose exit code you checked; a tally read from a different
+        # run than the one that was allowed to fail is a tally about nothing.
+        #
+        # The duplicate was also the reason this job could not fit its own timeout.
+        # verify.ps1's own header documents the full sweep at 25-35 min, and two full
+        # runs therefore need roughly 50-70 min against `timeout-minutes: 25` below.
+        # I have not measured a full verify.ps1 run on a runner, so I cannot say which
+        # of those two shapes was actually happening there -- only that the second run
+        # started with at most 25 minutes of budget left, and a suite slower than
+        # 25 minutes could not have completed twice.  The job now does it once, and the
+        # timeout has room for one.
+        #
         # Guards against a silent hole.  verify.ps1 reports a check it cannot run as
         # skipped, and a skipped check is not a pass -- but that convention also means
         # a suite could skip EVERYTHING and exit 0, which would be a green light that
@@ -169,12 +175,44 @@ jobs:
         # If someone later fixes the engine reporting, this number goes UP and the
         # assertion has to be updated -- which is the intended direction to be forced
         # into noticing.
+        #
+        # $LASTEXITCODE after `... *>&1 | Tee-Object` is the CHILD's exit code, not
+        # Tee-Object's: measured here with a child that exits 0, 1 and 2 respectively,
+        # and read back as 0, 1 and 2.  So the single run can be both tee'd and checked.
+        # The tally regex was also measured against a Tee-Object log of a nested
+        # `pwsh -File` child, which is the shape that actually matters here: Write-Host
+        # writes to the information stream, `*>&1` folds that into stream 1, and the
+        # regex matched.  It can match.  (2>&1 alone also captures it, but *>&1 also
+        # keeps the probes' stderr in the log, which is worth having.)
         run: |
+          $ErrorActionPreference = 'Continue'
+          # magick, MAGICK_HOME and the DLL directory are already set by the
+          # install step through GITHUB_ENV and GITHUB_PATH, so they are not
+          # re-derived here: in this layout magick.exe lives in Library\bin, not
+          # at the prefix root, so "$env:IM_ROOT\magick.exe" is not a file.
+          magick --version
           $log = 'verify.log'
           & pwsh -NoProfile -File .\verify.ps1 *>&1 | Tee-Object -FilePath $log
           $code = $LASTEXITCODE
+          Write-Host "verify.ps1 exit=$code"
           if ($code -ne 0) { Write-Host "verify.ps1 FAILED (exit $code)"; exit $code }
           $text = Get-Content $log -Raw
+
+          # No stage may have been skipped outright.  A probe that reports itself
+          # SKIPPED is a different thing -- the bit-exact tally below counts those --
+          # but a stage verify.ps1 did not RUN at all (its -Fast path) used to print
+          # one yellow line and exit 0.  verify.ps1 now prints a `coverage:` line and
+          # exits 2 when that happens; this asserts the line, so the two cannot drift
+          # and a future edit that reintroduces a silent skip fails here rather than
+          # being noticed in a log nobody reads.
+          $cov = [regex]::Match($text, 'coverage: every stage ran\.\s+0 skipped\.')
+          if (-not $cov.Success) {
+            Write-Host "verify.ps1 did not report 'coverage: every stage ran. 0 skipped.'"
+            Write-Host "A stage was skipped outright, which is not the same as a probe"
+            Write-Host "reporting itself SKIPPED, and this job does not run -Fast."
+            exit 1
+          }
+
           $m = [regex]::Match($text, 'bit-exact cases:\s*(\d+) passed,\s*(\d+) failed(?:,\s*(\d+) SKIPPED)?')
           if (-not $m.Success) { Write-Host "could not find the bit-exact tally in the output"; exit 1 }
           $passed = [int]$m.Groups[1].Value
