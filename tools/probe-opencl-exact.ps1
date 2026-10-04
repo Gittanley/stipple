@@ -214,7 +214,12 @@ $total = 0
 'OpenCL vs CUDA blocks, per-pixel'
 ''
 foreach ($img in $imgs) {
-  foreach ($c in @(2, 4, $Cols)) {
+  # $colourCounts, NOT @(2, 4, $Cols).  An earlier fix computed the deduplicated list
+  # above and then left this line iterating the raw array, so the variable was dead code
+  # and the sweep kept running every --colors 2 cell twice while still reporting 54 of
+  # 54.  Nothing about that showed up in the tally: 54 is 54 whether or not a third of
+  # it is a re-run.  Read the line, not the summary.
+  foreach ($c in $colourCounts) {
     foreach ($b in $blocks) {
       $tag = "{0}_{1}_{2}" -f $img, $c, $b
       $r = Compare-Pair "$FixtureDir\$img.png" $c $b $tag
