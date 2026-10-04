@@ -2538,7 +2538,18 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // work and not the same shape as the 4:4:4 fix above, so until it exists this
   // refuses rather than emitting plausible garbage.  The rule the codebase already
   // follows twice over, for the 4:4:4 plane stride and the input/output size collision.
-  if (use_yuv420 && (!use_gpu || opt.gpu_float_out)) {
+  //
+  // `cpu_threads > 0` is the THIRD disjunct, and it is here because the consumer of
+  // b.pixels is not only the GPU.  The reader's widening condition below tests
+  // `!use_gpu || opt.gpu_float_out || cpu_threads > 0` -- host workers dither b.pixels
+  // whenever cpu_threads > 0, which is exactly what --cpu-threads N asks for on a GPU
+  // machine.  This refusal enumerated only the first two, so fixing that condition (it
+  // used to omit the host-worker case, and every documented use of --cpu-threads on a
+  // GPU machine was dithering an unwritten buffer) made this combination reachable:
+  // RawToFloats then reads pixels*4 uint16 from a pixels*1.5 byte buffer, which at
+  // 1920x1080 with --batch-frames 16 is ~206 MiB past a 49.8 MB allocation.  Both
+  // conditions must name the same three things or one of them is a hole.
+  if (use_yuv420 && (!use_gpu || opt.gpu_float_out || cpu_threads > 0)) {
     *error =
         "[video] --input-mode yuv420 needs a GPU engine to reconstruct chroma; this\n"
         "        run has the host doing the conversion, which does not implement it.\n"
