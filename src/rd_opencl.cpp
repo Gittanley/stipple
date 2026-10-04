@@ -1498,25 +1498,31 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
                             nullptr, nullptr);
     if (e != CL_SUCCESS) return fail("readback(u16)");
   } else if (!want_in_u16 && !in_yuv444) {
-    // The pixel buffer was created with COPY_HOST_PTR and is read-write, so the
-    // three kernels have already left the dithered frames in `batch`.  No
-    // download is needed: the same allocation the reader filled is the one the
-    // scatter wrote.  That is the one thing this port does better than CUDA,
-    // where the uint16 path needs an explicit copy out of device memory.
+    // This download IS required, and the flags on b_pix's creation are why that is so
+    // easy to get wrong.  CL_MEM_COPY_HOST_PTR (below, at the clCreateBuffer for b_pix)
+    // tells the driver to seed the new buffer from `batch` at clCreateBuffer time.
+    // That is what it does, and all it does.  It is an initial-contents hint, NOT an
+    // alias: the kernels write device memory, `batch` is host memory, and nothing
+    // writes through.  So this read is the only path by which the dithered frames get
+    // back to the caller.  It is 506 MiB at 1920x1080 with --batch-frames 16, which is
+    // why the duplicate described below was worth finding.
+    //
+    // A byte-for-byte duplicate of this read used to sit immediately underneath, under a
+    // copy of the same wrong comment -- claiming "no download is needed" on the very
+    // lines that perform one.  It fired on the single-image path and pulled the whole
+    // pixel buffer across PCIe twice per batch.  It also called fail() without
+    // returning, so a failure there released every buffer once here and again at the
+    // single release_all() near the end of this function: clReleaseMemObject on a
+    // handle that was already freed, which is undefined behaviour.
+    //
+    // Do not reintroduce it.  Its predicate (`!want_in_u16 && !want_u16`) implies the
+    // one above, because in_yuv444 is defined as `want_in_u16 && ...` a few dozen lines
+    // up, so `!want_in_u16` already implies `!in_yuv444`.  Equally, do not "optimise"
+    // the remaining read away on the strength of the allocation flags -- it is
+    // load-bearing, and the comment that used to say otherwise was the trap.
     e = clEnqueueReadBuffer(ctx->queue, b_pix, CL_TRUE, 0, pix_bytes, batch, 0,
                             nullptr, nullptr);
     if (e != CL_SUCCESS) return fail("readback");
-  }
-
-  if (msg.empty() && !want_in_u16 && !want_u16) {
-    // The pixel buffer was created with COPY_HOST_PTR and is read-write, so the
-    // three kernels have already left the dithered frames in `batch`.  No
-    // download is needed: the same allocation the reader filled is the one the
-    // scatter wrote.  That is the one thing this port does better than CUDA,
-    // where the uint16 path needs an explicit copy out of device memory.
-    e = clEnqueueReadBuffer(ctx->queue, b_pix, CL_TRUE, 0, pix_bytes, batch, 0,
-                            nullptr, nullptr);
-    if (e != CL_SUCCESS) msg = fail("readback");
   }
 
   // RD_OCL_DUMP=<prefix> writes the gather's output and the walk's index buffer
