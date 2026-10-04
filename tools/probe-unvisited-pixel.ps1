@@ -113,7 +113,16 @@ $avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('blocks', 'cpu') 
 # caught the original bug: output against SOURCE, across nine geometries, including
 # the three that DO have an unvisited pixel.  The reduced scope is stated on stdout
 # rather than being discovered later by reading a tally.
-if ($avail['blocks']) { $engine = 'cpu' } else { $engine = 'blocks' }
+#
+# The line below used to read the other way round -- `if ($avail['blocks']) { $engine =
+# 'cpu' } else { $engine = 'blocks' }` -- which is the opposite of the comment directly
+# above it, and it meant the device path was NEVER chosen.  Measured on a
+# -DRD_WITH_CUDA=OFF build: all nine geometries printed "no unvisited pixel", $pass
+# reached 9, and the probe exited 0 having asserted nothing at all, because the cpu walk
+# never prints a marker.  A probe that cannot fail on the configuration CI runs is worse
+# than no probe, because it is counted.  Found by an audit that asked which probe it
+# trusted least; the answer was this one, for a reason nobody had read the code to check.
+if ($avail['blocks']) { $engine = 'blocks' } else { $engine = 'cpu' }
 if ($avail[$engine]) {
   Write-Host "cannot run: no usable engine -- $($avail[$engine])"
   exit 2
@@ -142,7 +151,7 @@ function Get-PixelYuv444([string]$Path, [int]$X, [int]$Y) {
   return @([int]$b[0], [int]$b[1], [int]$b[2])
 }
 
-$pass = 0; $fail = 0; $skipped = 0
+$pass = 0; $fail = 0; $skipped = 0; $none = 0
 $results = @()
 
 foreach ($g in $Geometries) {
@@ -192,12 +201,16 @@ foreach ($g in $Geometries) {
   # count, and the first index is printed after "First at index I (X,Y)".
   $m = [regex]::Match($text, 'the\s+(\d+)\s+it does not reach')
   if (-not $m.Success) {
-    # No unvisited pixel for this geometry.  That is legitimate (six of the nine
-    # are like it), so it is not a failure -- but it is recorded, because a
-    # geometry that used to report one and now does not would be a real change
-    # nobody asked for.
-    Write-Host ("  {0,-10} ok    no unvisited pixel" -f $g)
-    $pass++; $results += "$g : none"
+    # No unvisited pixel for this geometry.  That is legitimate -- most of the nine
+    # are like it -- so it is not a FAILURE.  But it is NOT A PASS EITHER, and counting
+    # it as one is what let this probe report "9 of 9 cases ok" on a build where it
+    # asserted nothing at all: the marker never appears, every geometry takes this
+    # branch, and $pass reaches 9.  A geometry with nothing to check is counted
+    # separately and named in the summary, so the denominator is the number of
+    # geometries actually asserted rather than the number tried.
+    Write-Host ("  {0,-10} info  no unvisited pixel -- nothing to assert here" -f $g)
+    $none++
+    $results += "$g : none"
     continue
   }
 
@@ -252,7 +265,9 @@ foreach ($g in $Geometries) {
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Host ("Unvisited-pixel provenance: {0} of {1} cases ok, {2} skipped." -f $pass, ($pass + $fail), $skipped)
+$summary = ("Unvisited-pixel provenance: {0} of {1} geometries asserted and ok," +
+            " {2} failed, {3} have no unvisited pixel to check, {4} skipped.")
+Write-Host ($summary -f $pass, ($pass + $fail), $fail, $none, $skipped)
 if ($fail -gt 0) {
   Write-Host ""
   foreach ($r in $results) { if ($r -like '*FAIL*') { Write-Host "  $r" } }
