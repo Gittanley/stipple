@@ -23,6 +23,13 @@
 namespace {
 
 struct Options {
+  // Every flag name the user actually typed, in order.  Recorded because "was this
+  // passed?" cannot be recovered from a field's value: --palette-budget-ms defaults
+  // to 60000 and --palette-tile to 128, both non-zero, so a check that asks
+  // `if (opt.video_opt.palette_budget_ms > 0)` can only ever fire when the user
+  // happened to set a value equal to the default.  That is the defect the existing
+  // `bypassed` diagnostic has: it names 5 knobs and can detect 2.
+  std::vector<std::string> seen_flags;
   std::string input;
   std::string output;
   std::string format;
@@ -732,6 +739,10 @@ int main(int argc, char** argv) {
   Options opt;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
+    // Record the flag before dispatch, so `--crf 20 in.png out.png` can be told it
+    // did nothing rather than being silently accepted.  Input and output positionals
+    // are not flags.
+    if (arg.size() > 1 && arg[0] == '-' && arg[1] == '-') opt.seen_flags.push_back(arg);
     if ((arg == "-h") || (arg == "--help")) {
       PrintUsage();
       return 0;
@@ -1227,6 +1238,45 @@ int main(int argc, char** argv) {
     const int status = RunVideo(opt.input, opt.output, opt.video_opt);
     rd::ImShutdown();
     return status;
+  }
+
+  // Flags that only mean something to the video pipeline.  They parse, they are
+  // stored, and on this path nothing reads them -- so `rdither --crf 20 in.png
+  // out.png` used to render an image and exit 0, having done nothing with --crf.
+  // Silent no-op is worse than a refusal: the user believes a setting took effect.
+  //
+  // Palette flags are deliberately NOT listed.  --palette-export, --palette-import,
+  // --im-palette and --palette-from are honoured for images too (see below), and the
+  // existing `bypassed` diagnostic already names the sampling knobs that an imported
+  // palette makes moot.
+  {
+    static const char* const kVideoOnly[] = {
+        "--crf", "--preset", "--video-codec", "--video-lossless", "--video-pix-fmt",
+        "--video-preserve-vfr", "--no-audio", "--segment-frames", "--resume",
+        "--reader-threads", "--decode-threads", "--encode-threads", "--no-hwaccel",
+        "--host-grace-ms", "--queue-depth", "--batch-frames", "--gpu-workers",
+        "--gpu-float-out", "--mem-fraction",
+    };
+    std::vector<std::string> ignored;
+    for (const char* f : kVideoOnly) {
+      for (const std::string& s : opt.seen_flags) {
+        if (s == f) { ignored.push_back(s); break; }
+      }
+    }
+    if (!ignored.empty()) {
+      std::string list;
+      for (std::size_t k = 0; k < ignored.size(); ++k) {
+        if (k != 0) list += ", ";
+        list += ignored[k];
+      }
+      std::fprintf(stderr,
+                   "error: %s %s video-only and cannot apply to an image; "
+                   "drop %s, or pass --video.\n",
+                   list.c_str(),
+                   ignored.size() == 1 ? "is" : "are",
+                   ignored.size() == 1 ? "it" : "them");
+      return 2;
+    }
   }
 
   std::string error;
