@@ -229,6 +229,22 @@ std::string RiemersmaApproxCuda(const Palette& palette, const DitherParams& para
                                 std::string* device_name) {
   if (!CudaAvailable()) return "no CUDA device available";
   if (palette.count < 1) return "empty palette";
+  // `q` is one unsigned char per curve position -- InitIndexKernel writes
+  // `static_cast<unsigned char>(index)` at :144 and the Jacobi sweep reads it back
+  // at :102 -- so indices 256..count-1 fold modulo 256 and alias onto the first 256.
+  // d_select_index returns an IN-RANGE index every time, so no lookup fails and the
+  // image simply comes out in the wrong colours with no error.  At 257 colours one
+  // entry aliases, at 300 forty-four, at 4096 3840 (93.75%).  Refuse rather than
+  // truncate.  Matches the blocks engine's wording exactly, so all three engines
+  // fail the same way.
+  if (palette.count > 256) {
+    return "the approx engine carries one palette index per byte, so " +
+           std::to_string(palette.count) +
+           " colours would alias onto the first 256 and the image would come out "
+           "in the wrong colours with no error; use --engine cuda, which is "
+           "bit-exact, carries no index buffer, and has no 256-colour limit, or "
+           "--colors 256 or fewer.";
+  }
   if (options.taps < 1 || options.taps > 4096) return "--approx-taps out of range";
 
   int device = 0;

@@ -841,9 +841,11 @@ std::string TimingDecimal(double v) {
 // ffprobe for the per-frame durations.  This is a DEMUX pass, not a decode: it
 // reads the container's packet index where there is one, so it is orders of
 // magnitude cheaper than the palette stage it runs alongside.
-bool ProbeFrameTiming(const std::string& path, const std::string& ffmpeg_bin,
-                      const std::string& ffprobe, FrameTiming* out,
-                      std::string* error) {
+//
+// `ffmpeg_bin` used to be a parameter and was never read: the query is an ffprobe
+// one.  Dropped rather than left as a second tool path nobody maintains.
+bool ProbeFrameTiming(const std::string& path, const std::string& ffprobe,
+                      FrameTiming* out, std::string* error) {
   Child child;
   const std::string args =
       "-v error -select_streams v:0 -show_entries packet=duration_time "
@@ -1018,6 +1020,84 @@ double ProbeAudioDuration(const std::string& path, const std::string& ffprobe) {
     return std::atof(value.c_str());
   }
   return -1.0;
+}
+
+// ---------------------------------------------------------------------------
+// Per-path memo for the two probes above
+// ---------------------------------------------------------------------------
+//
+// WHY, IN SPAWNS.  VideoProcess is called once per SEGMENT by the crash-safe loop in
+// rd_cli.cpp, always with the SAME input path, and it ran ProbeFrameTiming and
+// ProbeAudioDuration every time.  So an N-segment render spawned 2N ffprobe processes
+// where 2 suffice, plus one more per segment whenever the container reports "N/A" for
+// per-stream duration -- which Matroska routinely does, and which takes the
+// packet-summing fallback inside ProbeAudioDuration.  That is 3N on exactly the
+// container this repository's own test fixtures are in.
+//
+// It is latency, not throughput: both queries sit between the decoder spawn and the
+// reader thread starting, with nothing to overlap them, so on the first segment they
+// are pure serial prefix.
+//
+// WHY A PATH KEY AND NOT A static / call_once.  A bare static would be wrong for any
+// caller driving two inputs in one process: the second would silently be given the
+// first one's frame timing and audio duration, and both feed the OUTPUT -- the encoder
+// rate and the -shortest decision.  So this is keyed on the path, exactly like
+// VideoHasAudio's cache below, which is the same question asked of the same file.  It
+// is deliberately NOT shaped like FpsMode's call_once, which is correct there precisely
+// because its answer cannot vary.
+//
+// Only SUCCESSES are cached.  A failed probe must stay retryable: caching the failure
+// would turn one transient ffprobe hiccup into a permanent fallback for the whole
+// render, and the fallback (the container's declared rate) silently changes the output
+// length.  So a miss re-probes every time and only a definite answer is remembered.
+//
+// Thread safety: the same static mutex + map shape VideoHasAudio uses, for the same
+// reason -- VideoProcess is called from one thread at a time today, but the cache
+// outlives any single call and the cost of being wrong here is a wrong file.
+struct SourceProbeCache {
+  std::mutex mtx;
+  std::map<std::string, FrameTiming> timing;
+  std::map<std::string, double> audio;
+};
+
+SourceProbeCache& ProbeCache() {
+  static SourceProbeCache cache;
+  return cache;
+}
+
+bool ProbeFrameTimingCached(const std::string& path, const std::string& ffprobe,
+                            FrameTiming* out, std::string* error) {
+  SourceProbeCache& cache = ProbeCache();
+  {
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    const auto it = cache.timing.find(path);
+    if (it != cache.timing.end()) {
+      *out = it->second;
+      return true;
+    }
+  }
+  if (!ProbeFrameTiming(path, ffprobe, out, error)) return false;
+  std::lock_guard<std::mutex> lock(cache.mtx);
+  cache.timing[path] = *out;
+  return true;
+}
+
+double ProbeAudioDurationCached(const std::string& path,
+                                const std::string& ffprobe) {
+  SourceProbeCache& cache = ProbeCache();
+  {
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    const auto it = cache.audio.find(path);
+    if (it != cache.audio.end()) return it->second;
+  }
+  const double seconds = ProbeAudioDuration(path, ffprobe);
+  // A negative answer means "no audio, or ffprobe would not say", which is not a fact
+  // about the file worth remembering -- see the note on caching failures only.
+  if (seconds >= 0.0) {
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    cache.audio[path] = seconds;
+  }
+  return seconds;
 }
 
 bool VideoProbe(const std::string& path, VideoInfo* out, std::string* error) {
@@ -1972,8 +2052,13 @@ struct Batch {
     // next purely by comparing this against next_write.  A move that drops it does not
     // corrupt anything by itself; it makes the moved-to batch unmatchable, so the
     // writer waits for a turn that never comes.  No live symptom today only because
-    // NewBatch(), the one caller that would have moved a populated Batch, is itself
-    // dead.  Add the next field to this operator and this comment gets shorter.
+    // nothing moves a populated Batch: the slot pool is sized in place
+    // (`std::vector<Batch> slots(depth)` in VideoProcess) and every slot is filled by
+    // the reader and drained by the writer in the same object, so this operator has no
+    // caller at all.  It stays because a move-only type with a declared destructor
+    // needs one, and because removing it would make adding a field to Batch a
+    // double-free the first time somebody did use it.  Add the next field to this
+    // operator and this comment gets shorter.
     first_frame = o.first_frame;
     return *this;
   }
@@ -1989,61 +2074,69 @@ struct Batch {
 
 class Pipeline {
  public:
-  Pipeline(const VideoOptions& opt, const VideoInfo& info, const Palette& pal,
-           const ColorTree& tree)
-      : opt_(opt), info_(info), palette_(pal), tree_(tree) {
-    const std::size_t pixels =
-        static_cast<std::size_t>(info.width) * static_cast<std::size_t>(info.height);
-    const std::size_t frame_bytes = pixels * 4 * sizeof(std::uint16_t);
+  // The palette and the tree are NOT parameters.  They were, and nothing here has
+  // read them since the dither moved out of this class and into the worker lambda in
+  // VideoProcess -- which captures them by reference from its own arguments.  Three
+  // unused reference members is three dangling-reference hazards for a reader who
+  // assumes they matter, and removing them is what let the constructor shrink to the
+  // one option it actually reads.
+  explicit Pipeline(const VideoOptions& opt) {
     batch_ = std::max(1, opt.batch_frames);
 
-    // A batch slot holds up to three buffers: the float4 the host dither path works
-    // on, the rgba64le going to the device, and the rgba64le coming back.  On the pure
-    // GPU path the float one is never touched -- the device widens on upload and emits
-    // uint16 on download -- so it is not allocated, which is 16 bytes per pixel saved
-    // per slot (531 MiB at 1080p and 16 frames).  The budget below has to count
-    // exactly what is allocated, or the queue will be sized against a number the
-    // process does not honour, which is the failure mode this whole budget exists to
-    // prevent.
+    // A batch slot holds up to three buffers: the float4 `b.pixels`, the frame data
+    // going to the engine (`in16`, or the pinned pointer beside it), and the frame data
+    // coming back (`out16`, or its pinned pointer).  The budget below sizes the queue,
+    // so it has to count what is allocated rather than a second guess at it: the
+    // budget is the number a user reads to decide whether to lower --queue-depth, and
+    // a number that disagrees with the process is worse than no number at all.
     //
-    // It is needed whenever *any* host path can run, not just when the GPU is off:
-    // host workers dither from float4, so `--cpu-threads 1` alongside a GPU still
-    // dereferences this buffer.  Omitting that case leaves it empty and hands the
-    // worker a null pointer.
-    // float4_path is needed whenever ANY host path can run.
+    // `float_path_` is UNCONDITIONALLY true, so `b.pixels` is allocated on every video
+    // run at sizeof(RgbaF) = 16 bytes per pixel per slot -- 530,841,600 B, which is
+    // 506.25 MiB (not the 531 MiB an earlier comment here claimed), at 1080p with
+    // --batch-frames 16 -- including the default GPU runs where nothing reads it.
     //
-    // `opt.use_gpu` is what the user ASKED for; whether a GPU is actually present is
-    // resolved later, in RunVideo, and is not known here.  Reading the request instead
-    // of the resolved state is what made `--cpu-threads 0` crash on a machine with no
-    // GPU: 0 is documented as "GPU only", so with `--engine blocks` the request says
-    // use_gpu and gpu_float_out is false, the whole expression evaluated false, and the
-    // float4 buffer was never allocated -- while RunVideo, having found no device,
-    // launched a host worker that dereferences exactly that buffer.  Access violation,
-    // 0xC0000005, after a 577-byte container that ffprobe calls malformed.
+    // The unconditional form is deliberate and is not a simplification.  This used to
+    // be a condition over `opt.use_gpu`, `opt.gpu_float_out` and a host-worker count,
+    // and reading what the user REQUESTED rather than what the hardware turned out to
+    // be is what made `--cpu-threads 0` access-violate on a machine with no device:
+    // 0 is documented as "GPU only", the request says use_gpu and gpu_float_out is
+    // false, so the whole expression evaluated false and the float4 buffer was never
+    // allocated -- while RunVideo, having found no device, launched a host worker that
+    // dereferenced exactly that buffer.  0xC0000005, after a 577-byte container that
+    // ffprobe calls malformed.
     //
-    // So: allocate whenever the host might run, which is whenever the requested GPU
-    // path is not fully on-device, and whenever a host worker was requested at all.
-    // The cost when a GPU really is present is one float4 buffer per slot, already
-    // counted in the RAM budget below; the alternative is a crash whenever the request
-    // and the hardware disagree.
+    // What the field's being constant costs, and what would have to be proved before
+    // dropping the allocation, is written out at the `b.pixels.resize` in
+    // VideoProcess.
     float_path_ = true;
 
     // ---- RAM budget --------------------------------------------------------
     // The queue is the only allocation this budget governs, and it is not the only
-    // memory the process uses.  Three things sit outside it, and the first two
-    // cannot be paged back out if the machine runs short:
+    // memory the process uses.  Two things sit outside it, and the first cannot be
+    // paged back out if the machine runs short:
     //
-    //   * the CUDA pinned staging (cudaHostAlloc, one float4 buffer per GPU
-    //     worker), which by definition is not swappable;
     //   * ffmpeg's own decoder, which grows with its thread count and with the
     //     frame size;
     //   * Windows and everything else on the machine.
     //
-    // All three are subtracted below.  Previously the share was of *total* RAM,
+    // Both are subtracted below.  Previously the share was of *total* RAM,
     // which over-commits as soon as anything else is running: on a 16 GiB machine
     // with 3 GiB free the budget still claimed 5.3 GiB, so the queue would be paged
     // out mid-render or refused outright.  It is now the lesser of that share and
     // what is actually available, and it never aims to fill the machine.
+    //
+    // The CUDA pinned staging used to be the third item on that list, subtracted as
+    // `pixels * batch * sizeof(RgbaF) * gpu_workers`.  That was wrong in both
+    // directions and it could not be right by construction: the pinned buffers are
+    // `batch * (in_frame_bytes + out_frame_bytes)` PER SLOT, so they scale with the
+    // queue DEPTH and not with the worker count, and a depth is not known until after
+    // this budget has been divided -- so the term was subtracted once, whatever the
+    // depth turned out to be, for an amount that matches no allocation.
+    //
+    // It is now inside the per-slot figure, which is where it belongs: every byte of
+    // it is a queue slot's bytes.  The part that cannot be paged out is reported
+    // separately by in_flight_pinned_bytes(), which VideoProcess fills in once the
+    // depth is known.  Adding it to reserved() as well would count it twice.
     double fraction = opt.mem_fraction > 0.0 ? opt.mem_fraction : 0.33;
     if (fraction > 1.0) {
       std::fprintf(stderr,
@@ -2055,13 +2148,9 @@ class Pipeline {
     status.dwLength = sizeof(status);
     std::size_t budget = 0;
     std::size_t avail = 0;
-    const std::size_t pinned =
-        static_cast<std::size_t>(pixels) * static_cast<std::size_t>(batch_) *
-        sizeof(RgbaF) *
-        static_cast<std::size_t>(opt.gpu_workers > 0 ? opt.gpu_workers : 1);
     constexpr std::size_t kDecoderHeadroom = 768ull << 20;
     constexpr std::size_t kKeepFree = 1536ull << 20;
-    const std::size_t reserve = pinned + kDecoderHeadroom;
+    const std::size_t reserve = kDecoderHeadroom;
     if (GlobalMemoryStatusEx(&status)) {
       const std::size_t share = static_cast<std::size_t>(
           static_cast<double>(status.ullTotalPhys) * fraction);
@@ -2075,111 +2164,95 @@ class Pipeline {
     } else {
       budget = 2ull << 30;
     }
-    // in16 + out16 always; pixels only on the host dither path.  See float_path_.
-    const std::size_t per_batch_bytes =
-        (float_path_ ? sizeof(RgbaF) : 0) + 2 * sizeof(std::uint16_t) * 4;
-    const std::size_t per_batch = pixels * batch_ * per_batch_bytes;
-    std::size_t ram_batches = per_batch ? budget / per_batch : 2;
-    // The floor of two is a liveness requirement -- one slot in the dither and one
-    // in the writer -- not a throughput choice.  It is allowed to exceed the budget,
-    // because a pipeline that cannot run is worse than one that pages, but it is
-    // reported when it happens.
-    if (ram_batches < 2) {
-      if (per_batch * 2 > budget) {
-        std::fprintf(stderr,
-                     "warning: two batches need %.0f MiB but the RAM budget is "
-                     "%.0f MiB; the pipeline will page or fail\n",
-                     static_cast<double>(per_batch * 2) / (1024.0 * 1024.0),
-                     static_cast<double>(budget) / (1024.0 * 1024.0));
-      }
-      ram_batches = 2;
-    }
     ram_budget_ = budget;
-    per_batch_ = per_batch;
     reserved_ = reserve;
-    // Depth is the lesser of what RAM allows and what the workers can keep busy.
-    // RAM alone is the wrong limit: at 4K and batch 16 a 33% budget is many
-    // gigabytes, and holding a second of video in flight just adds latency
-    // without adding throughput.  VideoProcess trims this against the worker
-    // count once it knows it.
-    depth_ = static_cast<int>(std::min<std::size_t>(ram_batches, 64));
     avail_phys_ = avail;
+    // No depth, and no per-slot byte count, is derived here.  Both are made in
+    // VideoProcess, which is the only place the flags that decide them exist:
+    // `use_gpu` is resolved there, `in_frame_bytes` and `out_frame_bytes` are
+    // computed there, and the depth is trimmed against the worker count there.
+    // Deriving them here meant a second guess at the allocations, and there were
+    // three of them disagreeing by 32, 24 and 32-plus-the-input.
+    //
+    // The floor of two -- one slot in the dither and one in the writer -- is applied
+    // in VideoProcess, where the figure it applies to is real, and so is its warning.
   }
 
   int batch() const { return batch_; }
-  int depth() const { return depth_; }
   std::size_t ram_budget() const { return ram_budget_; }
+  // The reserve that is NOT the queue: ffmpeg's decoder.  Everything else the process
+  // allocates is a queue slot, including the page-locked staging, so this is the only
+  // thing that must be added to in_flight_bytes() to reach the peak.
   std::size_t reserved() const { return reserved_; }
   std::size_t avail_phys() const { return avail_phys_; }
-  std::size_t per_batch() const { return per_batch_; }
-  // Bytes per pixel a slot occupies, EXCLUDING the decoder's input, so the depth is
-  // derived from the same number the allocations use.  The input is excluded because
-  // it is not per-pixel: planar 4:4:4 is 3 bytes per pixel, and 4:2:0 is 1.5, so it
-  // has to be added as a whole-frame quantity.  `in_channels` is the decoder's output
-  // width, which is 3 (rgb48le) unless the source carries alpha.
-  std::size_t per_batch_bytes() const {
-    return (float_path_ ? sizeof(RgbaF) : 0) + 4 * sizeof(std::uint16_t);
-  }
   bool float_path() const { return float_path_; }
-  // Reports the depth actually allocated.  VideoProcess trims the constructor's
-  // RAM-derived value against the worker count, and reading the untrimmed number
-  // is how "queue 2" could be printed next to "5316 MiB in flight".
-  void set_depth(int depth) { depth_ = depth; }
-  std::size_t in_flight_bytes() const { return per_batch_ * depth_; }
 
-  std::vector<Batch>* NewBatch() {
-    const std::size_t pixels = static_cast<std::size_t>(info_.width) *
-                               static_cast<std::size_t>(info_.height);
-    Batch b;
-    b.frames = 0;
-    // Reserving up front keeps the workers from racing the allocator.
-    if (float_path_) b.pixels.resize(static_cast<std::size_t>(batch_) * pixels);
-    b.in16.resize(static_cast<std::size_t>(batch_) * pixels * 4);
-    b.out16.resize(static_cast<std::size_t>(batch_) * pixels * 4);
-    // Not vector<Batch>(1, std::move(b)): Batch owns pinned pointers and so is
-    // move-only, and the count/value constructor reaches for copy.
-    std::vector<Batch>* v = new std::vector<Batch>();
-    v->resize(1);
-    (*v)[0] = std::move(b);
-    return v;
+  // Bytes ONE queue slot occupies, and the part of that which cannot be paged out.
+  // A setter rather than a constructor constant because neither number can be computed
+  // here: the input and output frame sizes are VideoProcess's locals and the pinned
+  // staging depends on the depth, which is only known after this budget is divided.
+  void set_slot_bytes(std::size_t bytes, std::size_t pinned) {
+    slot_bytes_ = bytes;
+    slot_pinned_ = pinned;
   }
+  // Reports the depth actually allocated.  VideoProcess trims the RAM-derived value
+  // against the worker count, and reading the untrimmed number is how "queue 2" could
+  // be printed next to "5316 MiB in flight".
+  void set_depth(int depth) { depth_ = depth; }
+  std::size_t in_flight_bytes() const { return slot_bytes_ * depth_; }
+  // The page-locked part of in_flight_bytes().  Already inside that figure, so it is
+  // reported as a component and never ADDED to reserved(): doing that would count the
+  // same bytes twice in the peak -- which is what the ** OVER FREE ** flag is there to
+  // catch, so a double count in the number that drives the flag defeats its purpose.
+  std::size_t in_flight_pinned_bytes() const { return slot_pinned_ * depth_; }
 
  private:
-  const VideoOptions& opt_;
-  const VideoInfo& info_;
-  const Palette& palette_;
-  const ColorTree& tree_;
   int batch_ = 16;
   int depth_ = 4;
   std::size_t ram_budget_ = 0;
   bool float_path_ = true;
   std::size_t reserved_ = 0;
   std::size_t avail_phys_ = 0;
-  std::size_t per_batch_ = 0;
+  std::size_t slot_bytes_ = 0;
+  std::size_t slot_pinned_ = 0;
 };
 
 bool VideoProcess(const std::string& in, const std::string& out,
                   const VideoOptions& opt, const VideoInfo& info,
                   const Palette& palette, const ColorTree& tree,
                   VideoResult* result, std::string* error) {
+  // Both tools, once.  The second VideoFindTools further down used to ask for ffprobe
+  // only, having already been handed ffmpeg -- two walks of the same PATH search for
+  // two answers from the same two environment variables.  It is one lookup now, and it
+  // is a PATH search either way: ToolOnPath is SearchPathA, so this saves no process
+  // spawns.  The spawns it looked like it saved are item 3's, below.
   std::string ffmpeg;
-  if (!VideoFindTools(&ffmpeg, nullptr, error)) return false;
+  std::string ffprobe;
+  if (!VideoFindTools(&ffmpeg, &ffprobe, error)) return false;
 
   const std::size_t pixels =
       static_cast<std::size_t>(info.width) * static_cast<std::size_t>(info.height);
 
-  // Decoder output.  "rgba64" is the default and is exact: ffmpeg's yuv420p ->
-  // rgba64le and yuv420p -> rgb48le conversions do **not** produce the same RGB
-  // (4525709 of 6220800 samples differ on the bench clip), so the narrower
-  // interleaved format is not interchangeable and stays rejected.
+  // Decoder output.  "yuv444" is the DEFAULT (VideoOptions::input_mode), and it is
+  // exact: 3 bytes per pixel instead of 8, with the YCbCr->RGB conversion done in the
+  // gather kernel.  The reasoning that once made it opt-in does not apply to it.
+  // "rgba64" is the reference it is compared against, and it stays available by name:
+  // 3 bytes per pixel of pipe against 8 is 2.7x less traffic across the pipe and the
+  // H2D, and for a 4:4:4 source the two are bit-identical end to end (605 frames),
+  // because the colour matrix is swscale's own, ported exactly (see d_sws_yuv_to_rgb16).
   //
-  // "yuv444" is a different trade and is opt-in: 3 bytes per pixel instead of 8, with
-  // the YCbCr->RGB conversion done in the gather kernel.  Same reasoning against
-  // rgb48le does not apply, because the difference there was a rounding difference in
-  // what is otherwise the same algorithm.  Here the algorithm is genuinely different
-  // -- 4:2:0 carries half-resolution chroma that swscale interpolates, 4:4:4 carries
-  // the real thing -- so the output is *sharper* at edges and near-identical in flat
-  // areas.  Measured end to end; see the README.
+  // On a 4:2:0 source they are NOT identical: letting ffmpeg reconstruct 4:4:4 and then
+  // converting applies a different chroma reconstruction than swscale's fused 4:2:0 ->
+  // RGBA path, which moves 0.67% of output components (34.3 dB) once the dither has
+  // amplified the difference through its own error feedback.  --input-mode rgba64 is
+  // that reference and remains the thing to compare against.  See the README.
+  //
+  // (The "4525709 of 6220800 samples differ" figure in an earlier version of this
+  // comment was a comparison of ffmpeg's yuv420p->rgba64le against yuv420p->rgb48le.
+  // Both of those are swscale conversions of the same input, and neither is a mode
+  // this pipeline can select: dec_pix_fmt below is one of yuv420p, yuv444p or
+  // rgba64le.  It is kept here because it is the measurement that justifies treating
+  // the interleaved formats as distinct, not because it describes a code path.)
   const bool use_yuv444 = opt.input_mode == "yuv444" || opt.input_mode == "yuv444-prepass";
   // 4:2:0 needs no chroma reconstruction by ffmpeg at all: the decoder emits the
   // source format and the device does the interpolation.  That is the smallest input
@@ -2212,12 +2285,12 @@ bool VideoProcess(const std::string& in, const std::string& out,
   const char* dec_pix_fmt = use_yuv420 ? "yuv420p"
                                        : use_yuv444 ? "yuv444p" : "rgba64le";
   // Input and output frame sizes are NOT the same and must not share a variable.
-  // Reading is 3 bytes per pixel in planar 4:4:4, but writing is always 4 uint16 per
-  // pixel, because that is what the scatter emits and what the encoder is told to
-  // expect.  Sharing one name meant the writer handed the encoder 37.5% of each
-  // frame's bytes, it desynchronised, and a 605-frame render came out as 226 -- with
-  // an "encode" time that had collapsed to 2.5 s and a throughput number that looked
-  // like a win.  Both symptoms, one wrong constant.
+  // Reading is 3 bytes per pixel in planar 4:4:4 (1.5 in 4:2:0, 8 in rgba64le); writing
+  // is 3 bytes per pixel for the default planar yuv444p output and 8 for rgba64le.
+  // Sharing one name meant the writer handed the encoder 37.5% of each frame's bytes,
+  // it desynchronised, and a 605-frame render came out as 226 -- with an "encode" time
+  // that had collapsed to 2.5 s and a throughput number that looked like a win.  Both
+  // symptoms, one wrong constant.
   const std::size_t in_frame_bytes =
       use_yuv420 ? (pixels * 3) / 2
                  : use_yuv444 ? pixels * 3
@@ -2231,6 +2304,19 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // figure the reader actually strides by, and round UP, because pixels*3/2 is not
   // integral for an odd pixel count and truncating would leave the last frame's
   // final byte outside the allocation.
+  //
+  // NOTE there is no rgb48le path in the VIDEO pipeline, and a note above this used to
+  // claim one.  dec_pix_fmt above is exactly one of yuv420p, yuv444p or rgba64le, so
+  // `dec_channels` is 3 only for planar yuv444 -- and 3 there means three BYTES per
+  // pixel, not three uint16 channels.  For rgba64le it is 4, so that branch is 8 bytes
+  // per pixel.  Both are already in in_frame_bytes above, which is why the pageable
+  // size must come from that and not from dec_channels.
+  //
+  // rgb48le itself is a real format in the codebase (rd_riemersma.h's BlockOptions
+  // documents in_channels = 3 as rgb48le, and rd_opencl.cpp names it) -- it is the
+  // IMAGE path that asks for it, via ImLoad.  The comment that was here was reading
+  // that as a video decoder option and budgeting 6 bytes per pixel for a format the
+  // decoder is never asked to produce.
   const auto in16_elems_for = [&](int frames) {
     return (static_cast<std::size_t>(frames) * in_frame_bytes + 1) / 2;
   };
@@ -2242,11 +2328,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // RD_YUV444_OUT=0 goes back to rgba64le for comparison.
   const char* yuv_out_env = std::getenv("RD_YUV444_OUT");
   const bool out_yuv444 = yuv_out_env == nullptr || yuv_out_env[0] != '0';
-  // Reading is 3 bytes per pixel in planar 4:4:4, writing is 4 uint16 per pixel for
-  // rgba64le or 3 bytes for planar 4:4:4.  Input and output frame sizes are NOT the
-  // same and must not share a variable: sharing one meant a 605-frame render came out
-  // as 226, with an "encode" time that had collapsed to 2.5 s and a throughput number
-  // that looked like a win.  Both symptoms, one wrong constant.
+  // Reading is 3 bytes per pixel in planar 4:4:4, writing is 3 bytes per pixel for
+  // planar yuv444p and 4 uint16 (8 bytes) for rgba64le.  Input and output frame sizes
+  // are NOT the same and must not share a variable: sharing one meant a 605-frame
+  // render came out as 226, with an "encode" time that had collapsed to 2.5 s and a
+  // throughput number that looked like a win.  Both symptoms, one wrong constant.
   const std::size_t out_frame_bytes =
       out_yuv444 ? pixels * 3 : pixels * 4 * sizeof(std::uint16_t);
 
@@ -2316,28 +2402,38 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // demux pass over the container's packet index, not a decode, and it runs on
   // every input including constant-rate ones -- where it establishes that the rate
   // is constant, which is the cheapest possible answer to "is this VFR".
+  //
+  // Both queries below are memoised per PATH, because VideoProcess is called once per
+  // SEGMENT by the crash-safe loop in rd_cli.cpp with the SAME input path, and each
+  // call re-ran both.  That is 2N ffprobe spawns where 2 suffice -- 3N on a Matroska,
+  // which routinely reports "N/A" for per-stream duration and so takes
+  // ProbeAudioDuration's packet-summing fallback.  All of it is SERIAL-PREFIX latency:
+  // it sits after the decoder has been spawned and before the reader thread starts,
+  // with nothing to overlap it.
+  //
+  // Keyed on the path, deliberately, rather than a bare static or std::call_once.  A
+  // bare static is wrong for any caller driving two inputs in one process, and this
+  // file already holds both precedents: FpsMode caches an answer that cannot change
+  // (ffmpeg's own option list) under call_once, and VideoHasAudio keys its cache on
+  // the path.  These two are per-path facts about a FILE, so they take the second
+  // shape.
   FrameTiming timing;
   double audio_duration = -1.0;
   {
-    std::string ffmpeg_bin;
-    std::string ffprobe;
-    std::string ignored;
-    if (VideoFindTools(nullptr, &ffprobe, &ignored)) {
-      std::string terr;
-      if (!ProbeFrameTiming(in, ffmpeg_bin, ffprobe, &timing, &terr)) {
-        // A timing probe that fails must not fail the render.  Fall back to the
-        // previous behaviour and say so, because "silently produced a file of the
-        // wrong length" is precisely the bug being fixed.
-        std::fprintf(stderr,
-                     "[video] warning: could not read frame timing (%s); falling back"
-                     " to the container's declared rate, which makes a variable-frame"
-                     " -rate output the wrong length.\n",
-                     terr.c_str());
-      }
-      // The audio length decides whether -shortest is safe, and it is a second
-      // cheap query on a file already being statted.
-      audio_duration = ProbeAudioDuration(in, ffprobe);
+    std::string terr;
+    if (!ProbeFrameTimingCached(in, ffprobe, &timing, &terr)) {
+      // A timing probe that fails must not fail the render.  Fall back to the
+      // previous behaviour and say so, because "silently produced a file of the
+      // wrong length" is precisely the bug being fixed.
+      std::fprintf(stderr,
+                   "[video] warning: could not read frame timing (%s); falling back"
+                   " to the container's declared rate, which makes a variable-frame"
+                   " -rate output the wrong length.\n",
+                   terr.c_str());
     }
+    // The audio length decides whether -shortest is safe, and it is a second
+    // cheap query on a file already being statted.
+    audio_duration = ProbeAudioDurationCached(in, ffprobe);
   }
 
   // The rate the dithered frames are FED at is the source's true average, not
@@ -2516,7 +2612,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
   enc_args += " -pix_fmt " + pix_fmt + " " + Quote(out);
   if (!encoder.Start(ffmpeg, enc_args, false, true, error, "video-encode")) return false;
 
-  Pipeline pipe(opt, info, palette, tree);
+  Pipeline pipe(opt);
   const int batch = pipe.batch();
 
   // Worker count first: the queue depth depends on it, and the slot array has to
@@ -2645,24 +2741,124 @@ bool VideoProcess(const std::string& in, const std::string& out,
   }
 
   // A worker with no slot to work on is worth nothing, so a slot is the unit of
-  // currency: 1080p at batch 16 is 759 MiB per slot, and at a 1/3-of-16 GB budget
-  // only seven slots exist.  Asking for ten host workers plus the GPU therefore
-  // cannot work -- the extra workers just block on the free-slot queue while the
-  // GPU starves for want of a batch.
+  // currency.  Asking for ten host workers plus the GPU therefore cannot work -- the
+  // extra workers just block on the free-slot queue while the GPU starves for want of
+  // a batch.
   //
   // So the queue is sized first, and the worker count is trimmed to fit it.  A
   // deep queue with fewer workers beats a shallow queue with more, and this way
   // the two can never disagree.
-  // The slot's *input* buffer is dec_channels wide, not always 4: the decoder is asked
-  // for rgb48le when the source has no alpha, which is 6 bytes per pixel instead of 8.
-  // Budgeting it at 4 would over-reserve by a third and quietly cost a slot.
+  //
+  // ---- ONE bytes-per-pixel constant, from the allocations below ----------------
+  //
+  // Four sites used to disagree on this number.  One of them fed the [ram] peak and one
+  // fed the depth divisor, so the queue was sized against a figure the process did not
+  // honour and the peak was reported against a different one again.
+  //
+  // THE PER-SLOT TRUTH, straight off the resize/alloc calls in the loop below, at
+  // 1920x1080 and --batch-frames 16 (33,177,600 batch-pixels per slot):
+  //
+  //     buffer   bytes/pixel    per slot (B)      condition
+  //     pixels        16       530,841,600      always -- float_path_ is the constant true
+  //     input          3        99,532,800      pinned branch, yuv444p
+  //                    8       265,420,800      pinned branch, rgba64le
+  //                  1.5        49,766,400      pinned branch, yuv420p
+  //     output         3        99,532,800      pinned branch, out yuv444p (the default)
+  //                    8       265,420,800      pinned branch, out rgba64le
+  //                    8       265,420,800      pageable branch, either output
+  //
+  // So, per pixel and per slot:
+  //
+  //              input  output   total B/px   per slot (B)     per slot (MiB)
+  //     GPU yuv444    3       3            22      729,907,200        696.09
+  //     GPU rgba64    8       3            27      895,795,200        854.30
+  //     host yuv444   3       8            27      895,795,200        854.30
+  //     host rgba64   8       8            32    1,061,683,200      1,012.50
+  //
+  // And here is where the four old sites went wrong, each in a DIFFERENT direction --
+  // which is the whole reason none of them looked broken on its own:
+  //
+  //   * The [ram] peak's per_batch_ used a FLAT 32 for all four, so it OVER-stated
+  //     every GPU configuration: 1,012.50 MiB reported against 696.09 MiB held on the
+  //     default, 45.5% too high, and 18.5% too high on GPU rgba64.  A constant 32 is
+  //     what made the *default* configuration look like the most memory-hungry one
+  //     when it is the cheapest of the four.
+  //   * The depth divisor used `pixels * batch * 24 + batch * in_frame_bytes`: the 24
+  //     is pixels 16 plus a flat 8 for the output, and in_frame_bytes was added but
+  //     out_frame_bytes WAS NOT.  On the default that is 16 + 8 + 3 = 27 against a
+  //     real 22 -- 22.7% too high, so `affordable` is 22.7% too LOW.  Note the
+  //     asymmetry with the line above: the peak over-counted and the divisor
+  //     over-counted TOO, but by different amounts, which is why they disagreed.
+  //   * in_flight_bytes() multiplied that same flat-32 per_batch_ by depth, so it
+  //     reported the same 1,012.50 MiB per slot that [ram] printed -- 45.5% above the
+  //     696.09 MiB the default path actually holds.  Worth being precise about what
+  //     this one got wrong, because they are easy to conflate: it omitted NOTHING,
+//     it multiplied a wrong constant.  The site that added in_frame_bytes while
+  //     omitting out_frame_bytes was the depth divisor above; the site that used a flat
+  //     32 for every configuration was this one and the [ram] print.  Both numbers fed
+//     the ** OVER FREE ** flag, and neither was a figure the process held.
+  //
+  //   * And the ctor's own `pinned` reserve, subtracted from the budget before any of
+  //     that, was a fifth number: pixels * batch * sizeof(RgbaF) * gpu_workers, i.e.
+  //     float4 bytes per GPU *worker*.  No allocation has that shape.  The pinned
+  //     buffers are per SLOT (the loop below does one CudaAllocPinned pair per slot)
+  //     and are the in and out FRAME buffers, not a float4 batch -- so it was both the
+  //     wrong quantity and, being subtracted once regardless of depth, the wrong
+  //     amount at every depth except 1.
+  //
+  // THE DIRECTION MATTERS, and it is the reassuring way round: fixing the divisor
+  // RECOVERS depth.  The queue was throttled by an over-estimate, not permitted to
+  // spend memory it did not have, so the corrected figure is shallower-per-slot and
+  // therefore DEEPER for the same budget.  The [ram] peak moves the other way, down,
+  // by the 45.5% above -- which is why the two have to be fixed together: fixing the
+  // peak alone would look like the process had started leaking.
+  //
+  // The 4:2:0 input is 1.5 bytes per pixel, which is why the input and output terms
+  // stay whole-frame byte counts (in_frame_bytes / out_frame_bytes, already computed
+  // above from dec_pix_fmt) rather than being folded into an integer B/px constant
+  // that would have to round.  Same reason the reader's comment round up.
+  //
+  // The pinned term is only real when the pinned allocation is attempted at all,
+  // which is `use_gpu && !opt.gpu_float_out` -- the same condition as the branch in
+  // the loop below, and for the same reason: on the float-out path the device neither
+  // DMAs from the reader's buffer nor writes a pinned output, so the pageable vectors
+  // are the only buffers that exist.  This is also why the figure cannot live in
+  // Pipeline's constructor: `use_gpu` is resolved further DOWN, in this function, and
+  // the depth is not known until after the budget has been divided.
+  const bool pinned_slots = use_gpu && !opt.gpu_float_out;
   const std::size_t per_batch =
-      pixels * static_cast<std::size_t>(batch) * pipe.per_batch_bytes() +
-      static_cast<std::size_t>(batch) * in_frame_bytes;
+      static_cast<std::size_t>(batch) *
+      (pixels * sizeof(RgbaF) + in_frame_bytes +
+       (pinned_slots ? out_frame_bytes
+                     : pixels * 4 * sizeof(std::uint16_t)));
+  // The page-locked part of that, for the reserve report.  Zero when the allocation is
+  // not attempted.  Reported rather than subtracted from the budget, because it IS the
+  // queue: subtracting it here as well as counting it per slot is the double count that
+  // made the old figure (a flat `pinned` sized in float4 bytes per GPU *worker*, not
+  // per slot) both wrong and untraceable.
+  const std::size_t per_batch_pinned =
+      pinned_slots ? static_cast<std::size_t>(batch) *
+                        (in_frame_bytes + out_frame_bytes)
+                   : 0;
+  pipe.set_slot_bytes(per_batch, per_batch_pinned);
   int depth;
   {
     std::size_t affordable = per_batch ? pipe.ram_budget() / per_batch : 2;
-    if (affordable < 2) affordable = 2;
+    // The floor of two is a LIVENESS requirement -- one slot in the dither and one in
+    // the writer -- not a throughput choice.  It is allowed to exceed the budget,
+    // because a pipeline that cannot run is worse than one that pages, but it is
+    // reported when it happens, and it is what makes the ** OVER FREE ** flag on the
+    // [ram] line reachable.
+    if (affordable < 2) {
+      if (per_batch * 2 > pipe.ram_budget()) {
+        std::fprintf(stderr,
+                     "warning: two batches need %.0f MiB but the RAM budget is "
+                     "%.0f MiB; the pipeline will page or fail\n",
+                     static_cast<double>(per_batch * 2) / (1024.0 * 1024.0),
+                     static_cast<double>(pipe.ram_budget()) / (1024.0 * 1024.0));
+      }
+      affordable = 2;
+    }
     if (affordable > 64) affordable = 64;
     depth = static_cast<int>(affordable);
 
@@ -2697,18 +2893,81 @@ bool VideoProcess(const std::string& in, const std::string& out,
   pipe.set_depth(depth);
   std::vector<Batch> slots(static_cast<std::size_t>(depth));
   for (Batch& b : slots) {
-    // The float4 buffer is only allocated when a host path will use it; see
-    // Pipeline::float_path_ and the note there on why the budget has to agree.
+    // RESEARCH ONLY -- DO NOT MAKE THIS CONDITIONAL YET.  Not edited below.
+    //
+    // `float_path_` is the constant true, so this runs on EVERY video run and costs
+    // sizeof(RgbaF) = 16 B/px per slot: 530,841,600 B = 506.25 MiB per slot at
+    // 1920x1080 with --batch-frames 16, and 4,050 MiB at a queue depth of 8, which is
+    // 72.7% of that configuration's whole queue (5,568.7 MiB at the real 22 B/px).
+    // On the default video path nothing below reads it:
+    //
+    //   * the reader's widening at :3210 is gated on
+    //     `!use_gpu || opt.gpu_float_out || cpu_threads > 0`, which is false for a
+    //     default run (GPU present, float-out off, cpu_threads auto-resolved to 0);
+    //   * the writer's convert at :3517 is gated on `!raw_ready`, and the GPU sets
+    //     raw_ready whenever upload_u16 && emit_u16, which is the default;
+    //   * the CUDA blocks engine allocates no device pixel buffer when upload_u16 (so
+    //     d_pixels_buf is not even cudaMalloc'd -- rd_blocks_cuda.cu:1001) and passes
+    //     d_pixels_out = nullptr to the scatter when emit_u16 (:1180), so the host
+    //     buffer is neither uploaded nor downloaded on that path.
+    //
+    // WHAT WOULD HAVE TO HOLD for the allocation to be droppable.  Every consumer must
+    // either be unreachable under the same condition the allocation would be gated on,
+    // or tolerate a null/empty b.pixels.  The set of consumers in these two files is:
+    //
+    //   1. RawYuv444ToFloatsParallel / RawToFloatsParallel -- the reader's widening,
+    //      rd_video.cpp:3216 and :3219, both writing b.pixels.data() as a
+    //      non-null destination.  Already gated on `!use_gpu || gpu_float_out ||
+    //      cpu_threads > 0`.  DROPPABLE only if that gate and the allocation gate are
+    //      the SAME predicate -- the exact lesson of the 0xC0000005 recorded on
+    //      float_path_ and of the --input-mode yuv420 refusal above.
+    //   2. FloatsToYuv444Parallel / FloatsToRawParallel -- the writer's convert,
+    //      rd_video.cpp:3534 and :3538, reading b.pixels.data().  Already gated on
+    //      `!b.raw_ready`.
+    //   3. RiemersmaBlocksCpu -- the host worker, rd_video.cpp:3392, writing
+    //      b.pixels.data().  Reached whenever cpu_threads > 0, i.e. --cpu-threads N
+    //      on a GPU machine.  MUST keep the buffer whenever any host worker can run.
+    //   4. RiemersmaBlocksCuda / RiemersmaBlocksOpencl -- rd_video.cpp:3377 and
+    //      :3372, passing b.pixels.data() as the `batch` argument.  THE ONE THAT IS
+    //      NOT SETTLED.  Passing nullptr is safe only if the engine never dereferences
+    //      it, and the two engines demonstrably differ: CUDA does not touch it under
+    //      upload_u16, but OpenCL's check_u16 path reads AND WRITES batch[i]
+    //      (rd_opencl.cpp:1517-1531, 1631, 1639) and its float-upload path does
+    //      MakeBuffer(..., batch, ...) at :1305.
+    //
+    // WHAT WOULD SETTLE THE OPENCL QUESTION.  Not inspection of the flags; a run.
+    // `RD_OCL_CHECK_U16=1` exists precisely to run the float and uint16 paths against
+    // each other on one input (rd_opencl.cpp:1483-1511) and it dereferences `batch` on
+    // the float pass, so it is the instrument already in the tree.  What is needed is
+    // one `--engine opencl --video` run with b.pixels allocated (today's behaviour)
+    // and the same run with it not allocated, over the same fixture, comparing the
+    // output files byte-for-byte -- plus one run with RD_OCL_CHECK_U16=1 under each.
+    // If they match, the allocation is droppable for OpenCL; if the CHECK_U16 run
+    // differs, it is not, and that is a NULL DEREFERENCE risk rather than a slow path,
+    // which is why this stays a note.
     if (pipe.float_path()) b.pixels.resize(static_cast<std::size_t>(batch) * pixels);
-    if (use_gpu && !opt.gpu_float_out) {
+    if (pinned_slots) {
       // Page-locked, so the reader writes straight into memory the copy engine DMAs
-      // from.  These bytes cannot be paged out, and per_batch_bytes already counts
-      // them, so the budget and the allocations still agree.
+      // from.  These bytes cannot be paged out.  `per_batch` above already counts them,
+      // which is why nothing is subtracted for them here: the old code did both, and
+      // the [ram] peak counted the same bytes twice.
       //
-      // The input is dec_channels wide, or 3 bytes per pixel in planar 4:4:4, or 1.5
-      // in planar 4:2:0 -- hence in_frame_bytes as a whole-frame figure rather than a
-      // per-pixel one.  The output is always 4 uint16, because that is what the
-      // encoder consumes and what the scatter writes.
+      // The input is 3 bytes per pixel in planar 4:4:4, 1.5 in planar 4:2:0 and 8 in
+      // rgba64le -- hence in_frame_bytes as a whole-frame figure rather than a per-pixel
+      // one, since 1.5 is not an integer and truncating it desynchronises the reader
+      // by a byte a frame.  The output is out_frame_bytes: 3 per pixel for the default
+      // planar yuv444p, 8 for rgba64le.
+      //
+      // NOTE the pinned size here is not the size of the buffer the reader strides by
+      // when the allocation FAILS: the pageable fallback below is sized in whole
+      // pixels * 4 uint16 (8 B/px) regardless of out_frame_bytes.  On the default
+      // yuv444 output that fallback is 2.67x larger than the pinned buffer it stands
+      // in for, so the budget's 3 B/px under-states it.  That is safe in the direction
+      // that matters -- a failed pinned allocation happens when memory is already short,
+      // and b.pixels' 16 B/px dominates -- but it is a real gap and the honest fix is
+      // to size the fallback from out_frame_bytes too.  Left alone because it changes
+      // an allocation size on a path that has already produced one silent zero-frame
+      // bug (see the comment below).
       const std::size_t in_bytes = static_cast<std::size_t>(batch) * in_frame_bytes;
       const std::size_t out_bytes =
           static_cast<std::size_t>(batch) * out_frame_bytes;
@@ -2770,6 +3029,37 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // segment came out as a bare container header.
   int segment_read = 0;
   std::int64_t segment_written = 0;
+  // THE THREE STAGE TIMERS ARE NOT CPU TIME AND NOT A PARTITION OF THE WALL CLOCK.
+  // They are summed worker-thread intervals, and that has three consequences the
+  // summary line in rd_cli.cpp currently hides:
+  //
+  //   * dither_ms is accumulated by EVERY dither worker (see the `dither_ms += dt`
+  //     below, inside the per-worker loop), so with N workers it counts N threads'
+  //     elapsed time and can exceed the wall clock by nearly N.  It is a measure of
+  //     work done, not of how long anything took.
+  //   * decode_ms is accumulated inside the reader's per-frame loop, so it is a sum
+  //     over frames of time blocked in Read -- it measures the decoder's supply rate
+  //     and is not the reader's cost either.
+  //   * encode_ms is a sum over batches on the single writer thread, and is split into
+  //     convert_ms and pipe_ms, which DO partition it (convert_ms + pipe_ms ==
+  //     encode_ms to within a NowMs() call).
+  //
+  // So the summary's "palette | decode | dither | encode | wall" line adds four
+  // incommensurable quantities: palette_ms is real wall clock (VideoBuildPalette is
+  // single-threaded and measures NowMs() - t0), total_ms is real wall clock, and the
+  // three middle ones are per-thread sums that need not add to anything.  The file's
+  // own design notes say this twice -- "stage times are not CPU" and "the naive
+  // reading is misleading" -- and then the printed line invites exactly the naive
+  // reading, by putting them in a row under a single label.
+  //
+  // The producers are correct and unchanged; they are measuring what they claim to.
+  // What is wrong is the LABEL, and it lives in PrintVideoSummary at rd_cli.cpp:271,
+  // which this file does not own.  See the request at the end of this file's changes.
+  // What the consumer needs, precisely: the line should not present the three as
+  // components of `wall`.  Either sum only the quantities that partition the wall
+  // (palette + a genuine wall-clock pipeline figure), or label the middle three as
+  // summed worker time and say so in the label itself rather than in a comment nobody
+  // reading the output will see.
   double decode_ms = 0.0, dither_ms = 0.0, encode_ms = 0.0;
   double convert_ms = 0.0, pipe_ms = 0.0;
   // Leave the reader a core; the writer is the only other busy host thread here.
@@ -2782,7 +3072,24 @@ bool VideoProcess(const std::string& in, const std::string& out,
   DitherParams params;
   params.colors = opt.colors;
   params.diffusion = opt.diffusion;
-  params.use_cache = false;
+  // `use_cache` is deliberately left at DitherParams' own default.  It was explicitly
+  // false here, which read as a decision and was not one.  The only reader of the field
+  // is RiemersmaWalkCpu -- the memo table is allocated at rd_riemersma_cpu.cpp:334-336
+  // and consulted at :71 and :85 inside Visit, and Visit is called only from
+  // RiemersmaWalkCpu (:346, :356, :364).  This file never calls it: the video path
+  // calls RiemersmaBlocksCpu (:396), whose inner loop walks the tree inline and is
+  // cache-free on both the host and the device precisely so the two agree
+  // ("Cache-free on both paths, so the two agree", rd_riemersma_cpu.cpp:488).
+  //
+  // So the assignment set a flag no code in the video path could observe, and the
+  // default already said the same thing.  Zero behavioural difference: `false` and
+  // `DitherParams::use_cache`'s `true` are only distinguishable through the memo table,
+  // and RiemersmaBlocksCpu never builds one.
+  //
+  // The day this WOULD matter is a future engine that grows a memo table inside
+  // RiemersmaBlocksCuda or RiemersmaBlocksOpencl -- both take `params` and both already
+  // hand params.diffusion down to the kernel.  Then it should be set explicitly, and
+  // deliberately rather than by inheriting whichever default.
 
   if (!opt.quiet) {
     std::fprintf(stderr,
@@ -2793,21 +3100,33 @@ bool VideoProcess(const std::string& in, const std::string& out,
                  static_cast<double>(pipe.ram_budget()) / (1024.0 * 1024.0),
                  cpu_threads, use_gpu ? "yes" : "no", gpu_workers);
     // Print the ceiling, not just the plan.  The queue is the part the budget
-    // governs; the reserve is pinned CUDA staging plus ffmpeg's decoder, and the
-    // sum is the real peak.  This is the number to check before raising
-    // --mem-fraction or --queue-depth on a machine that is already busy.
+    // governs; the reserve is what the queue does not cover, and the sum is the real
+    // peak.  This is the number to check before raising --mem-fraction or
+    // --queue-depth on a machine that is already busy -- so it has to be the number
+    // the allocations add up to.
+    //
+    // The reserve used to also carry a flat `pinned` term, sized as
+    // pixels * batch * sizeof(RgbaF) * gpu_workers: float4 bytes per GPU *worker*.
+    // The real page-locked buffers are per SLOT and are the input and output frame
+    // buffers, not a float4 batch, so that term matched no allocation -- and since
+    // the per-slot figure already counted the same memory, adding it here as well
+    // counted it twice.  It is now reported separately, as the page-locked COMPONENT
+    // of the queue, because that is the fact worth knowing (it cannot be paged out)
+    // and it is already inside queue_mb.
     {
       const double queue_mb =
           static_cast<double>(pipe.in_flight_bytes()) / (1024.0 * 1024.0);
+      const double pinned_mb =
+          static_cast<double>(pipe.in_flight_pinned_bytes()) / (1024.0 * 1024.0);
       const double reserve_mb =
           static_cast<double>(pipe.reserved()) / (1024.0 * 1024.0);
       const double avail_mb =
           static_cast<double>(pipe.avail_phys()) / (1024.0 * 1024.0);
       const double ceiling = queue_mb + reserve_mb;
       std::fprintf(stderr,
-                   "[ram]    %.0f MiB of %.0f MiB free at start; queue %.0f + "
-                   "reserve %.0f = ~%.0f MiB peak%s\n",
-                   avail_mb, avail_mb, queue_mb, reserve_mb, ceiling,
+                   "[ram]    %.0f MiB of %.0f MiB free at start; queue %.0f "
+                   "(%.0f of it page-locked) + reserve %.0f = ~%.0f MiB peak%s\n",
+                   avail_mb, avail_mb, queue_mb, pinned_mb, reserve_mb, ceiling,
                    avail_mb > 0.0 && ceiling > avail_mb ? "  ** OVER FREE **"
                                                        : "");
     }
@@ -3341,13 +3660,37 @@ bool VideoProcess(const std::string& in, const std::string& out,
     result->dither_ms = dither_ms;
     result->encode_ms = encode_ms;
   result->convert_ms = convert_ms;
-  result->pipe_ms = pipe_ms;
+    result->pipe_ms = pipe_ms;
     result->decode_ms = decode_ms;
     // t_start is the pipeline's own start.  Adding palette_ms makes this the time the
-  // user actually waited for, which is what "55 fps" is supposed to mean.  The
-  // palette is a serial prefix: VideoBuildPalette has returned before VideoProcess is
-  // entered, so no dithering overlapped it and none of it can be discounted.
-  result->total_ms = (NowMs() - t_start) + result->palette_ms;
+    // user actually waited for, which is what "55 fps" is supposed to mean.  The
+    // palette is a serial prefix: VideoBuildPalette has returned before VideoProcess is
+    // entered, so no dithering overlapped it and none of it can be discounted.
+    //
+    // WHAT THIS INTERVAL IS NOT, because the summary prints a rate against it and the
+    // progress bar prints a DIFFERENT one against a different interval.  The bar is
+    // constructed at :3448, after VideoBuildPalette has returned, so its rate EXCLUDES
+  // the palette; this figure INCLUDES it.  On the published 18001-frame run -- palette
+  // 28677 ms, wall 352507 ms -- the bar would print 18001 / (352507 - 28677) =
+  // 55.6 frames/s and the summary would print 18001 / 352507 = 51.1 frames/s, on
+  // screen at the same time, ~8% apart, and neither labelled.
+  //
+  // The summary's interval is the correct one and should stay inclusive: the palette
+  // is serial, the user waited through it, and a throughput figure that excludes a
+  // stage the user sat and watched is not throughput.  What has to change is the
+  // reader's ability to tell which interval a number covers.  Both the fix and the
+  // label are in rd_cli.cpp (PrintVideoSummary) and rd_progress.cpp, neither of which
+  // this file owns -- the requests are in the note above PrintVideoSummary there.
+  // The bar's own start clock is Progress' start_ms_, set in its constructor at :3448
+  // and not settable afterwards, so seeding it with the palette's cost needs a
+  // Progress API change and not a call-site one.
+    result->total_ms = (NowMs() - t_start) + result->palette_ms;
+    // in_flight_mb is the QUEUE, from the same per-slot figure the depth was derived
+    // from, so the number printed next to "queue=N" is N times what one slot actually
+    // holds.  It used to be 32 bytes per pixel per slot for every configuration --
+    // 1,012.50 MiB per slot at 1080p/batch 16 -- while the real figure ranges from
+    // 696.09 MiB (GPU yuv444, the default) to 1,012.50 MiB (host rgba64).  See the
+    // table above set_slot_bytes.
     result->cpu_frames = cpu_frames;
     result->gpu_frames = gpu_frames;
     result->in_flight_mb = static_cast<double>(pipe.in_flight_bytes()) / (1024.0 * 1024.0);
@@ -3358,5 +3701,54 @@ bool VideoProcess(const std::string& in, const std::string& out,
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Requests for files this one does not own
+// ---------------------------------------------------------------------------
+//
+// Recorded here rather than left in a review, because each one is a number or a label
+// a user reads and each is wrong now.
+//
+// 1. src/rd_cli.cpp:271, PrintVideoSummary.  The line reads
+//
+//        busy time  : palette %.0f | decode %.0f | dither %.0f | encode %.0f | wall %.0f
+//
+//    and presents four quantities as if they decomposed `wall`.  They do not:
+//    palette_ms and total_ms are wall clock, while decode_ms, dither_ms and
+//    encode_ms are summed worker-thread intervals (dither_ms in particular is summed
+//    once per dither worker, so it scales with the worker count and can exceed the
+//    wall clock).  Only convert_ms and pipe_ms partition anything -- they split
+//    encode_ms.  Please either drop the three from the wall arithmetic or rename the
+//    label so it says "summed worker time", and if the second line about the writer
+//    is kept, say that those two ARE a partition of the encode figure.  The producers
+//    here are correct and are not asking to change.
+//
+// 2. src/rd_cli.cpp:266, PrintVideoSummary, and the Progress bar in
+//    src/rd_progress.cpp.  Two throughput numbers are printed on screen at the same
+//    time and they cover different intervals.  The summary's fps divides by
+//    total_ms, which includes the palette (result->total_ms above adds palette_ms to
+//    the pipeline's own elapsed time).  The bar divides by its own start_ms_, set in
+//    the Progress constructor at src/rd_video.cpp:3448, which runs after
+//    VideoBuildPalette has returned -- so it excludes the palette entirely.  On the
+//    published 18001-frame run (palette 28677 ms, wall 352507 ms) that is 55.6/s on
+//    the bar against 51.1/s in the summary, ~8% apart, neither labelled.  Two fixes,
+//    either acceptable: give Progress a way to start its clock earlier (a constructor
+//    parameter or a SetStartOffset, since start_ms_ is private and set once), or label
+//    the bar's rate as excluding the palette.  The summary's interval should stay
+//    inclusive -- the palette is serial and the user waited through it.
+//
+// 3. src/rd_video.cpp is the only file that has needed a bytes-per-pixel figure for a
+//    queue slot, and it is now derived once from the allocations (see the table above
+//    set_slot_bytes).  If another path ever needs the same number -- an image batch, a
+//    plugin -- it should come from that one place rather than a fifth guess.
+//
+// 4. Pipeline::reserved() is now ffmpeg's decoder headroom alone, because every other
+//    byte the process allocates is a queue slot.  Anything that used to read
+//    reserved() expecting a figure that included page-locked staging will see a smaller
+//    number by exactly the pinned term.  In this file the only reader is the [ram]
+//    line, and it adds the figure to in_flight_bytes(), which counts the pinned bytes
+//    already -- so the peak is unchanged and correct.  There is no other reader in the
+//    tree, but the semantics changed, so a grep for reserved() is worth doing before
+//    anything else reaches for it.
 
 }  // namespace rd

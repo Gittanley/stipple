@@ -103,18 +103,41 @@ __device__ __forceinline__ void d_associate_alpha_info(int assoc, const double* 
   out->b = __dmul_rn(alpha, e[2]);
 }
 
-// Device mirror of rd::QNode.  Laid out so it can be memcpy'd straight from the
-// host-side vector.
+// Device mirror of rd::QNode.  Field-copied, not memcpy'd: both uploaders walk
+// the fields by name (this file's loop at the bottom, and
+// cuda_common::UploadTree), so the two structs need not be the same size -- and
+// they are not.  QNode is 136 bytes because `number_unique` (8) and
+// `quantize_error` (8) are 8-aligned behind a 4-byte `parent`, so
+// `total_color` starts at 72 and `color_number` at 120.  Hoisting the three
+// 4-byte members ahead of the doubles removes the two interior 4 bytes of pad
+// and lands the struct exactly on 128.
+//
+// THAT MATTERS BECAUSE THERE ARE TWO COPIES.  rd_cuda_common.cuh:134 has a
+// third-party-identical DevNode in namespace rd::cuda_common, and that is the
+// one rd_blocks_cuda.cu and rd_approx_cuda.cu actually hand to their kernels
+// (both via cuda_common::UploadTree).  If only one copy is reordered the two
+// translation units index the same uploaded bytes with different field offsets
+// and read the wrong palette entry for a colour -- no diagnostic anywhere,
+// because both sides are self-consistent.  The static_asserts below pin the
+// layout on this side; rd_cuda_common.cuh needs the identical four so a
+// divergence is a compile error rather than a wrong picture.
 struct DevNode {
   int child[16];
   int parent;
-  double total_color[4];
-  double quantize_error;
-  unsigned long long number_unique;
   unsigned int color_number;
   unsigned int id;
   unsigned int level;
+  double total_color[4];
+  double quantize_error;
+  unsigned long long number_unique;
 };
+
+static_assert(sizeof(DevNode) == 128, "DevNode must be a true 128 bytes");
+static_assert(offsetof(DevNode, parent) == 64, "DevNode field order");
+static_assert(offsetof(DevNode, level) == 76, "DevNode field order");
+static_assert(offsetof(DevNode, total_color) == 80, "DevNode field order");
+static_assert(offsetof(DevNode, quantize_error) == 112, "DevNode field order");
+static_assert(offsetof(DevNode, number_unique) == 120, "DevNode field order");
 
 // quantize.c:ColorToQNodeId().
 __device__ __forceinline__ int d_node_id(int assoc, double r, double g, double b,
@@ -412,15 +435,79 @@ bool CudaAvailable() {
   return count > 0;
 }
 
+// How many whole frames of this geometry fit in `vram_budget`.
+//
+// This used to divide the budget by `width*height*sizeof(float4)` and call the
+// quotient the answer, which is the cost of `dst` alone.  RiemersmaWalkCuda
+// allocates EIGHT buffers, and at 1080p with an alpha-carrying palette and
+// --frames 16 the old figure was 506.25 MiB against 1561.91 MiB actually
+// requested -- a 3.085x under-charge:
+//     dst        16 x 33,177,600 =  530,841,600
+//     src         1 x 33,177,600 =   33,177,600   <- omitted entirely
+//     cache      16 x 67,108,864 = 1,073,741,824   <- omitted entirely
+//     error_state 16 x 512        =        8,192
+//     frame_state 16 x 768        =       12,288
+//     weights                     =          128
+// The palette and the tree were omitted too, though at 16 colours they are
+// 512 B and a few hundred KiB.
+//
+// The number was also never used.  rd_cli.cpp:1476 tests `fits < 1` and
+// assigns nothing, so --max-vram-mb was a "does one frame fit" test wearing a
+// budget's name: `--max-vram-mb 32 --frames 64` passed it and then died inside
+// cudaMalloc with "the image does not fit in VRAM", which is true but is not
+// the answer the flag asked for.
+//
+// TWO SUBTLETIES, both stated because they change what the number means:
+//
+//  1. `cache_entries` is `palette.associate_alpha ? kCacheEntries : (1 << 18)`
+//     -- 67,108,864 B or 1,048,576 B per frame, a 64x spread.  associate_alpha
+//     is not a parameter here and cannot be one without touching
+//     include/rd_riemersma.h:230, src/rd_cuda_stub.cpp:55 and src/rd_cli.cpp:
+//     1474 together, so this charges the WORST case (kCacheEntries) always.  That
+//     never under-charges, which is the direction that produces the misleading
+//     cudaMalloc failure above; it over-charges by up to 64x on the cache term
+//     for a palette without alpha, which makes the quotient up to 3.02x lower
+//     than the truth in that case.  Today that costs nothing measurable, because
+//     the only consumer is the `fits < 1` test.  It starts costing real frames
+//     the moment the caller clamps --frames to this value -- see the report for
+//     the one-line change in rd_cli.cpp and for the parameter that should land
+//     with it.
+//
+//  2. `kMaxQNodes * sizeof(DevNode)` is ImageMagick's design cap, not a proven
+//     bound.  ColorTree::nodes_ is append-only: a node pruned by PruneChild
+//     keeps its slot and the same (parent, id) pair can be created again, so
+//     nodes_.size() may exceed kMaxQNodes.  CudaMaxFrames cannot see
+//     tree.nodes().size() -- the tree is not passed -- and the honest per-pixel
+//     bound (1 + width*height*kMaxTreeDepth nodes, 2.1 GB at 1080p) is worse
+//     than useless as a budget.  So this charges the cap.  At 1080p that is
+//     34,152,576 B, about one extra frame, which is the right order of
+//     magnitude and is charged in full.
 int CudaMaxFrames(std::size_t width, std::size_t height, std::size_t vram_budget) {
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) return 0;
   std::size_t free_bytes = 0, total_bytes = 0;
   if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return 1;
   if (vram_budget != 0 && vram_budget < free_bytes) free_bytes = vram_budget;
-  const std::size_t per_frame = width * height * sizeof(float4);
-  if (per_frame == 0) return 0;
-  std::size_t frames = free_bytes / per_frame;
+
+  const std::size_t frame_bytes = width * height * sizeof(float4);
+  if (frame_bytes == 0) return 0;
+
+  // Charged once per launch whatever `frames` is.
+  const std::size_t fixed_bytes =
+      frame_bytes                             // src: one whole extra frame
+      + kMaxColormapSize * 4 * sizeof(double)  // palette (UploadPalette sizes
+                                              //   for count; this is the cap)
+      + kErrorQueueLength * sizeof(double)     // weights: 16 doubles
+      + kMaxQNodes * sizeof(DevNode);          // colour tree
+  if (free_bytes <= fixed_bytes) return 0;
+
+  // Charged `frames` times over.
+  const std::size_t per_frame_bytes =
+      frame_bytes                          // dst
+      + kCacheEntries * sizeof(int)         // memo cache, 2^24 x 4 B
+      + kErrorQueueLength * sizeof(Rgba)    // error_state: 16 x 32 B
+      + 64 * sizeof(Frame);                 // frame_state: 64 x 12 B
+  std::size_t frames = (free_bytes - fixed_bytes) / per_frame_bytes;
   if (frames < 1) return 0;
   if (frames > 4096) frames = 4096;
   return static_cast<int>(frames);

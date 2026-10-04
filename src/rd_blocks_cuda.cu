@@ -106,7 +106,18 @@ __global__ void BlkIndexWalkKernel(const float* __restrict__ cx,
                                    int nblocks, int frame_pitch, int block_size,
                                     unsigned char* __restrict__ out_index) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= nblocks * frame_pitch) return;
+  // int*int, and `--batch-frames` has no upper clamp anywhere in the program, so
+  // this product does pass INT_MAX (2,147,483,647).  nblocks = ceil(n/block) and
+  // n = pixels+1, so the first overflowing batch is 530,112 frames at 1920x1080
+  // with the default --blocks 512 (nblocks 4051), and 16,570 with --blocks 16
+  // (nblocks 129,601).  Past INT_MAX the int product wraps NEGATIVE, and
+  // `slot >= negative` is true for EVERY thread: the walk writes no index at all,
+  // the scatters then read the raw cudaMalloc bytes, and the call still exits 0.
+  // Only the BOUND is widened.  `slot` is left int, which is the smaller change
+  // and keeps `frame`/`local` int, but it means positions from 2^31 up are still
+  // dropped -- a leak of a fraction of a percent at the first overflowing batch,
+  // not of the whole image.
+  if (slot >= static_cast<std::int64_t>(nblocks) * frame_pitch) return;
 
   // Which frame this work item belongs to, and which block within it.  Each
   // frame is an independent walk, so each keeps its own error state.
@@ -223,7 +234,13 @@ __global__ void BlkScatterKernel(float4* __restrict__ pixels,
                                 int frame_pitch, int pixel_pitch, int assoc,
                                 std::uint16_t* __restrict__ u16) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic.  n = pixels+1, so at
+  // 1920x1080 n * frame_pitch passes INT_MAX (2,147,483,647) at --batch-frames
+  // 1036 (2,148,250,436) and at 7680x4320 at 65 (2,156,544,065); the product then
+  // wraps NEGATIVE, `slot >= negative` is true for every thread, and this scatter
+  // writes nothing -- so the download below returns the raw cudaMalloc bytes of
+  // d_pixels/d_u16 and the caller exits 0.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const int pixel = curve[i];
@@ -294,7 +311,12 @@ __global__ void BlkScatterYuv444Kernel(const int* __restrict__ curve,
                                        int frame_pitch, int pixel_pitch, int assoc,
                                        unsigned char* __restrict__ yuv) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
+  // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
+  // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and the
+  // planar output buffer keeps whatever cudaMalloc returned -- three bytes per
+  // pixel, which the encoder consumes directly.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const int pixel = curve[i];
@@ -389,7 +411,12 @@ __global__ void BlkGatherKernel(const float4* __restrict__ pixels,
                                 const int* __restrict__ curve, T* __restrict__ cx,
                                 int n, int frame_pitch, int pixel_pitch) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
+  // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
+  // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
+  // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
+  // memory and still exits 0.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const float4 p =
@@ -419,7 +446,12 @@ __global__ void BlkGatherU16Kernel(const std::uint16_t* __restrict__ pixels,
                                    T* __restrict__ cx, int n, int frame_pitch,
                                    int pixel_pitch, int channels) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
+  // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
+  // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
+  // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
+  // memory and still exits 0.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const std::uint16_t* p =
@@ -509,7 +541,12 @@ __global__ void BlkGatherYuv444Kernel(const unsigned char* __restrict__ planes,
                                       T* __restrict__ cx, int n, int frame_pitch,
                                       int pixel_pitch) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
+  // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
+  // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
+  // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
+  // memory and still exits 0.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const int pix = curve[i];
@@ -569,7 +606,12 @@ __global__ void BlkGatherYuv420Kernel(const unsigned char* __restrict__ planes,
                                       T* __restrict__ cx, int n, int frame_pitch,
                                       int pixel_pitch, int w, int h) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-  if (slot >= n * frame_pitch) return;
+  // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
+  // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
+  // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
+  // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
+  // memory and still exits 0.  Bound widened; `slot` left int.
+  if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
   const int frame = slot / n;
   const int i = slot - frame * n;
   const int pix = curve[i];
@@ -732,6 +774,10 @@ struct DeviceState {
   int frames = 0, block = 0;
   std::uint64_t phash = 0;
   bool want_u16 = false;
+  // Part of the reuse key for the same reason `want_u16` is: it decides whether
+  // d_u16_buf holds 3 bytes per pixel or 8, so reusing a buffer across the switch
+  // would read and write past its end.
+  bool want_yuv444 = false;
   bool want_in_u16 = false;
   int in_channels = 4;
   int in_mode = 0;
@@ -803,13 +849,36 @@ struct DeviceState {
       stream_buf[i] = nullptr;
     }
     if (d_nodes) cudaFree(d_nodes);
-    if (d_search) cudaFree(d_search);
+    // `g_flat_search` is ONE process-wide __device__ pointer, but d_search is
+    // per-DeviceState, and cudaFree does not touch the global.  So the invariant
+    // is maintained here rather than assumed: after this returns, the global names
+    // either a live allocation or nothing.
+    //
+    // Read-then-clear, not clear unconditionally.  kStateSlots is 2 and each slot
+    // has its own mutex, so two workers run this concurrently; an unconditional
+    // clear in slot 1 would knock slot 0's *live* flat index out from under a
+    // launch that is already in flight, silently demoting it to the recursive
+    // ClosestColor -- same picture, but the whole reason the index exists is gone.
+    // So clear only when the global names THIS state's buffer.  When the read
+    // itself fails the context is already unusable, and there clearing anyway is
+    // strictly better than knowingly leaving a dangling pointer behind.
+    if (d_search) {
+      const DevSearch* live = nullptr;
+      const bool readable =
+          cudaMemcpyFromSymbol(&live, cuda_common::g_flat_search,
+                               sizeof(live)) == cudaSuccess;
+      if (!readable || live == d_search) {
+        const DevSearch* none = nullptr;
+        cudaMemcpyToSymbol(cuda_common::g_flat_search, &none, sizeof(none));
+      }
+      cudaFree(d_search);
+      d_search = nullptr;
+    }
     if (d_weights) cudaFree(d_weights);
     if (d_palette) cudaFree(d_palette);
     if (d_owner) cudaFree(d_owner);
     if (d_curve) cudaFree(d_curve);
     d_nodes = nullptr;
-    d_search = nullptr;
     d_weights = nullptr;
     d_palette = nullptr;
     d_owner = nullptr;
@@ -861,6 +930,30 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     return "--blocks must be at least 16 (the error queue is 16 entries deep)";
   }
   if (options.frames < 1) return "--frames must be >= 1";
+  // The palette index is one BYTE on its way out of the walk: d_index_buf is
+  // `curve_capacity` bytes (one per visit position, BlkIndexWalkKernel writes
+  // `static_cast<unsigned char>(index)`), and both scatters read that same byte
+  // back as `index[slot]`.  So a palette larger than 256 entries is not a failed
+  // lookup -- d_select_index still returns an in-range index every time, no
+  // bounds check fires, and the image is simply recoloured with the wrong
+  // entries: at 257 colours exactly one entry folds onto another, at 300
+  // forty-four do, and at 4096, 3840 of 4096 (93.75%).  The count is *used* as
+  // int here and as int in the kernel signature, so nothing narrows it silently;
+  // the narrowing is the one-byte store.
+  //
+  // Refused rather than widened.  Widening means uint16 in this file, the same
+  // in the OpenCL mirror in rd_opencl.cpp and its `.idx.bin` dump, and in
+  // RiemersmaBlocksCpu's `chosen` vector -- three engines and a file format
+  // agreeing on one width.  Half of that is not a safer state than this one; it
+  // is the same silent aliasing with a different stride.
+  if (palette.count > 256) {
+    return "the blocks engine carries one palette index per byte, so " +
+           std::to_string(palette.count) +
+           " colours would alias onto the first 256 and the image would come out "
+           "in the wrong colours with no error; use --engine cuda, which is "
+           "bit-exact, carries no index buffer, and has no 256-colour limit, or "
+           "--colors 256 or fewer.";
+  }
 
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) return "cudaGetDevice failed";
@@ -910,21 +1003,28 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   // output format asked for is the one they were built for.  A clip that switches
   // between the float and uint16 paths rebuilds rather than reading a buffer of
   // the wrong kind.
+  //
+  // `emit_yuv444` is part of that key and has to be, because it is part of the
+  // buffer's *size*: the same d_u16_buf is 3 bytes per pixel in planar mode and 8
+  // interleaved, and both scatters and the download size themselves from it.  Key
+  // it and the resize below is safe; leave it out and a clip that switches format
+  // mid-run reinterprets a 3 B/px buffer as 8 B/px and reads and writes 2.7x past
+  // its end -- which is the overread this predicate previously made possible.
   const bool reuse = st.valid && st.level == level && st.width == width &&
                      st.height == height && st.block == options.block &&
                      st.phash == phash && frames <= st.frames &&
                      st.want_u16 == want_u16 &&
+                     st.want_yuv444 == options.emit_yuv444 &&
                      st.want_in_u16 == want_in_u16 &&
                      st.in_channels == in_channels &&
                      st.in_mode == (in_yuv ? 1 : in_yuv_pre ? 2 : in_yuv420 ? 3 : 0);
   const auto t_setup0 = std::chrono::steady_clock::now();
-  double curve_ms = 0.0;
   std::size_t unvisited = 0;
   int unvisited_pixel = -1;
   int n = 0, nblocks_total = 0;
   // Capacity (allocated) versus this call's extent (used).
   std::size_t pixel_capacity = 0, curve_capacity = 0;
-  std::size_t pixel_used = 0, curve_used = 0;
+  std::size_t pixel_used = 0;
 
   if (reuse) {
     n = st.n;
@@ -941,11 +1041,7 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     st.Release();
     std::vector<int> owner;
     std::vector<int> curve;
-    const auto t_curve0 = std::chrono::steady_clock::now();
     BuildCurveIndex(level, width, height, &curve, &owner);
-    curve_ms = std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - t_curve0)
-                   .count();
     n = static_cast<int>(curve.size());
     if (n < static_cast<int>(width * height)) {
       return "compacted curve is shorter than the image";
@@ -1046,21 +1142,40 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
         // video pipeline reads frames straight into pinned memory, so it needs none,
         // and 265 MiB of pinned host memory is not worth reserving for a memcpy that
         // no longer happens.
-        if (!options.in_u16_pinned &&
-            cudaHostAlloc(&st.h_pinned16_buf[i],
-                          pixel_capacity * in_channels * sizeof(std::uint16_t),
-                          cudaHostAllocPortable) != cudaSuccess) {
-          st.h_pinned16_buf[i] = nullptr;
+        //
+        // And only for the interleaved case: all three planar modes upload
+        // `in_u16` straight into d_in_yuv_buf (see the H2D below, which branches
+        // on in_yuv_any before it ever looks at this buffer), so in a planar mode
+        // this allocation is 100% dead -- not oversized, dead.  At 1080p batch 16
+        // that was 265,420,800 B of pinned host RAM per device state that nothing
+        // could read.  Sized from `need`, which is the same expression the
+        // staging memcpy's byte count comes from, with capacity for used.
+        if (!options.in_u16_pinned && !in_yuv_any) {
+          if (cudaHostAlloc(&st.h_pinned16_buf[i], need, cudaHostAllocPortable) !=
+              cudaSuccess) {
+            st.h_pinned16_buf[i] = nullptr;
+          }
         }
       }
       if (cudaStreamCreate(&st.stream_buf[i]) != cudaSuccess) {
         st.stream_buf[i] = nullptr;
       }
-      // Four uint16 per pixel, so half the bytes of the float4 buffer beside it.
-      // Only allocated when asked for, so the single-image path pays nothing.
+      // Sized from the same expression `bytes_u16` uses at the download, with
+      // pixel_capacity for pixel_used: planar 8-bit 4:4:4 is 3 bytes per pixel,
+      // interleaved rgba64le is 8.  It used to be allocated at the interleaved
+      // figure unconditionally, so with emit_yuv444 set -- the default, see
+      // RD_YUV_OUT in rd_video.cpp -- 5 of every 8 bytes were never written and
+      // never read: 165,888,000 B, 158.20 MiB, at 1920x1080 x 16 frames.  Zero
+      // bytes moved; the reservation was simply larger than the job.
+      //
+      // `want_yuv444` is in the reuse key for exactly this reason: at 3 B/px the
+      // buffer is no longer big enough for the interleaved layout, so reusing it
+      // across the switch would overrun it 2.7x over.
       if (want_u16) {
-        if (cudaMalloc(&st.d_u16_buf[i],
-                       pixel_capacity * 4 * sizeof(std::uint16_t)) != cudaSuccess) {
+        const std::size_t u16_bytes =
+            options.emit_yuv444 ? pixel_capacity * 3
+                                : pixel_capacity * 4 * sizeof(std::uint16_t);
+        if (cudaMalloc(&st.d_u16_buf[i], u16_bytes) != cudaSuccess) {
           st.Release();
           return "cudaMalloc uint16 output failed";
         }
@@ -1098,9 +1213,25 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
         built != nullptr) {
       st.d_search = built;
       cudaMemcpyToSymbol(cuda_common::g_flat_search, &st.d_search, sizeof(st.d_search));
+      // Checked at the point of issue, like every other transfer here: a silent
+      // failure here is not a missing speed-up but a d_select_index reading a
+      // pointer that was never set, i.e. behaviour that depends on what the
+      // previous state happened to leave in the symbol.
+      const cudaError_t sym_err = cudaGetLastError();
+      if (sym_err != cudaSuccess) {
+        st.Release();
+        return std::string("flat-search symbol upload failed: ") +
+               cudaGetErrorString(sym_err);
+      }
     } else {
       const DevSearch* none = nullptr;
       cudaMemcpyToSymbol(cuda_common::g_flat_search, &none, sizeof(none));
+      const cudaError_t sym_err = cudaGetLastError();
+      if (sym_err != cudaSuccess) {
+        st.Release();
+        return std::string("flat-search symbol clear failed: ") +
+               cudaGetErrorString(sym_err);
+      }
     }
     if (cudaMemcpy(st.d_weights, host_weights, sizeof(host_weights),
                    cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1123,6 +1254,7 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     st.block = options.block;
     st.phash = phash;
     st.want_u16 = want_u16;
+    st.want_yuv444 = options.emit_yuv444;
     st.want_in_u16 = want_in_u16;
     st.in_channels = in_channels;
     st.in_mode = in_yuv ? 1 : in_yuv_pre ? 2 : in_yuv420 ? 3 : 0;
@@ -1135,8 +1267,6 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
 
   // This call's extent, which may be smaller than the allocation for a short batch.
   pixel_used = pixel_pitch * static_cast<std::size_t>(frames);
-  curve_used = static_cast<std::size_t>(n) * static_cast<std::size_t>(frames);
-  (void)curve_used;
 
   if (unvisited != 0 && !st.warned_unvisited) {
     st.warned_unvisited = true;
@@ -1196,11 +1326,13 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   unsigned char* const d_in_yuv = in_yuv_any ? st.d_in_yuv_buf[si] : nullptr;
   if (want_in_u16) {
     const std::size_t bytes_in = in_bytes_for(pixel_used);
+    // Every copy in this block is checked where it is issued, for the reason the
+    // first one already was: a failed copy used to surface as "invalid argument"
+    // from the gather, hundreds of lines away from its cause.  The checks only
+    // read the sticky error state -- no extra transfer, no sync, no reordering --
+    // so the sequence issued is exactly the one that was issued before.
     if (in_yuv_any) {
       cudaMemcpyAsync(d_in_yuv, in_u16, bytes_in, cudaMemcpyHostToDevice, stream);
-      // Checked here rather than left to the next launch check: a failed copy used to
-      // surface as "invalid argument" from the gather, hundreds of lines away from
-      // its cause.
       { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("yuv H2D failed: ") + cudaGetErrorString(e); }
     } else if (options.in_u16_pinned) {
       // The caller deposited the frames straight into page-locked memory, so there is
@@ -1208,21 +1340,27 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
       // frame is memcpy'd into staging first, which is 9.35 GB of host copy over a
       // 605-frame 1080p clip for no benefit.
       cudaMemcpyAsync(d_in16, in_u16, bytes_in, cudaMemcpyHostToDevice, stream);
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("interleaved H2D failed: ") + cudaGetErrorString(e); }
     } else if (h_pinned16 != nullptr) {
       std::memcpy(h_pinned16, in_u16, bytes_in);
       cudaMemcpyAsync(d_in16, h_pinned16, bytes_in, cudaMemcpyHostToDevice, stream);
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("staged uint16 H2D failed: ") + cudaGetErrorString(e); }
     } else {
       cudaMemcpyAsync(d_in16, in_u16, bytes_in, cudaMemcpyHostToDevice, stream);
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("pageable uint16 H2D failed: ") + cudaGetErrorString(e); }
     }
   } else if (options.batch_pinned) {
     // `batch` is page-locked, so this is a direct DMA and there is nothing to
     // stage.  Same bytes, same kernel, same output as the staging path.
     cudaMemcpyAsync(d_pixels, batch, bytes, cudaMemcpyHostToDevice, stream);
+    { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("pinned float4 H2D failed: ") + cudaGetErrorString(e); }
   } else if (h_pinned != nullptr) {
     std::memcpy(h_pinned, batch, bytes);
     cudaMemcpyAsync(d_pixels, h_pinned, bytes, cudaMemcpyHostToDevice, stream);
+    { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("staged float4 H2D failed: ") + cudaGetErrorString(e); }
   } else {
     cudaMemcpyAsync(d_pixels, batch, bytes, cudaMemcpyHostToDevice, stream);
+    { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("pageable float4 H2D failed: ") + cudaGetErrorString(e); }
   }
 
   const int threads = 128;
@@ -1246,8 +1384,6 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     // contiguous uint16 instead of three separate bytes.  Same arithmetic, same
     // result as the fused kernel -- the point is purely the access pattern.
     std::uint16_t* const d_rgb16 = st.d_rgb16_buf[si];
-    const std::int64_t total_px =
-        static_cast<std::int64_t>(pixel_used);
     // One block-row per frame; see BlkYuvToRgb16Kernel for why the plane stride
     // cannot be folded into a flat index.
     dim3 pre(static_cast<unsigned>((pixel_pitch + threads - 1) / threads),
@@ -1338,10 +1474,12 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
                                       : pixel_used * 4 * sizeof(std::uint16_t);
     if (stream != nullptr) {
       cudaMemcpyAsync(out_u16, d_u16, bytes_u16, cudaMemcpyDeviceToHost, stream);
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("uint16 D2H failed: ") + cudaGetErrorString(e); }
       // Debug only: fetch the float result too, so the check below compares like
       // with like.  In the shipping path this copy does not happen.
       if (d_pixels_out != nullptr) {
         cudaMemcpyAsync(batch, d_pixels, bytes, cudaMemcpyDeviceToHost, stream);
+        { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("float4 debug D2H failed: ") + cudaGetErrorString(e); }
       }
     } else {
       cudaMemcpy(out_u16, d_u16, bytes_u16, cudaMemcpyDeviceToHost);
@@ -1352,6 +1490,7 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   } else {
     if (stream != nullptr) {
       cudaMemcpyAsync(batch, d_pixels, bytes, cudaMemcpyDeviceToHost, stream);
+      { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) return std::string("float4 D2H failed: ") + cudaGetErrorString(e); }
     } else {
       cudaMemcpy(batch, d_pixels, bytes, cudaMemcpyDeviceToHost);
     }
@@ -1370,7 +1509,11 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     // time folded in.
     float ms[3] = {0, 0, 0};
     for (int i = 0; i < 3; ++i) cudaEventElapsedTime(&ms[i], kt.beg[i], kt.end[i]);
-    const char* names[3] = {"gather", "walk", "scatter"};
+    // The three labels are spelled out in the format string below, in the same
+    // order as beg[]/end[] above.  They used to also sit in a `names[3]` array
+    // that nothing read -- it had to be void-cast to compile, and printing from it
+    // would have meant %s three times, which is the same line with more moving
+    // parts.
     std::fprintf(stderr, "[kern] gather %7.2f  walk %7.2f  scatter %7.2f  (sum %7.2f ms)\n",
                  ms[0], ms[1], ms[2], ms[0] + ms[1] + ms[2]);
     // Search cost, per pixel.  Compile-time gated; see the note on RD_CC_COUNT in
@@ -1391,7 +1534,6 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
       }
     }
 #endif
-    (void)names;
   }
   // The device's uint16 must equal what FloatsToRaw computes from the float4 it
   // also produced, sample for sample, because the encoder consumes these bytes
@@ -1401,6 +1543,21 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   // The byte-for-byte A/B against the host path is `--gpu-float-out`; that one
   // needs no debug download and covers the whole pipeline.
   if (want_u16 && d_pixels_out != nullptr && std::getenv("RD_CHECK_U16") != nullptr) {
+    // This comparison reads out_u16 as 4 uint16 per pixel.  With emit_yuv444 -- the
+    // DEFAULT -- out_u16 holds 3 bytes per pixel in planar Y, U, V order, so
+    // `out_u16[4*i + c]` runs up to pixel_used bytes past the end of the caller's
+    // buffer.  A host-side overread, in a debug path, pre-existing.
+    //
+    // It is skipped rather than reshaped because the two layouts are not
+    // comparable per channel: FloatsToRaw writes RGBA, BlkScatterYuv444Kernel
+    // writes YUV.  Reshaping means re-deriving the expected YUV from the float4,
+    // which is a different check with a different failure signature.  Say clearly
+    // that it did not run, so it can never be mistaken for a pass.
+    if (options.emit_yuv444) {
+      std::fprintf(stderr,
+                   "[u16check] SKIPPED: the output is planar YUV444 (3 B/px), which "
+                   "this check cannot compare per channel against RGBA. Not a pass.\n");
+    } else {
     // Temporary: with both buffers downloaded, the uint16 the device produced must
     // equal what FloatsToRaw would compute from the float4 it also produced.
     std::size_t bad = 0;
@@ -1426,6 +1583,7 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     std::fprintf(stderr, "[u16check] %llu of %llu samples differ\n",
                  static_cast<unsigned long long>(bad),
                  static_cast<unsigned long long>(pixel_used * 4));
+    }
   }
   const double kernel_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - t_kernel0)

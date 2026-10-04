@@ -130,17 +130,46 @@ __device__ __forceinline__ void d_associate_alpha_pixel(int assoc, const float4&
 }
 
 // Device mirror of rd::QNode, laid out so a host-side std::vector<QNode> can be
-// field-copied into it.
+// field-copied into it.  Field by field and never by memcpy: QNode itself is 136
+// bytes, so the two must not be assumed to agree in size, only in field names --
+// UploadTree() below is what makes that true, and it is the only writer.
+//
+// The field ORDER is a deliberate choice, not the order the fields are written in:
+// the three unsigned ints sit immediately after `parent`, ahead of the doubles,
+// and that is exactly what makes the struct 128 bytes rather than 136.
+//
+//   child   0.. 63    int[16]
+//   parent  64.. 67   int
+//   the 3 uints 68.. 79            (color_number, id, level)
+//   total_color  80..111   double[4]
+//   quantize_error 112..119
+//   number_unique 120..127
+//
+// Doubles-first needs a 4-byte hole at 68..71 to reach `total_color`'s 8-byte
+// alignment and another 4 at 128..131 because the largest member is 8-byte
+// aligned: 64 + 4 + 4 + 32 + 8 + 8 + 4 + 4 = 128 of members in 136 bytes.  Moving
+// the uints into the hole removes both -- their alignment is 4, so they fill 68..79
+// exactly, and `total_color` then lands on 80, which is already 8-aligned.
+//
+// 128 = 4 x 32, and cudaMalloc returns memory aligned to at least 256 bytes, so
+// every node in the array starts on a 32-byte sector boundary.  That is the
+// property the note on d_select_index() is actually about; at 136 bytes a node
+// straddled sector boundaries and the comment claimed an alignment the layout did
+// not have.
 struct DevNode {
   int child[16];
   int parent;
-  double total_color[4];
-  double quantize_error;
-  unsigned long long number_unique;
   unsigned int color_number;
   unsigned int id;
   unsigned int level;
+  double total_color[4];
+  double quantize_error;
+  unsigned long long number_unique;
 };
+static_assert(sizeof(DevNode) == 128,
+              "the walk is load-latency bound on whole-node loads, which is only "
+              "worth anything if a node is a whole number of 32-byte sectors; see "
+              "the layout arithmetic above");
 
 // quantize.c:ClosestColor() over the subtree rooted at `node`, with IM's
 // post-order traversal and per-channel early exits.  Recursion depth is bounded
@@ -157,7 +186,9 @@ struct DevNode {
 // not a plain membership set.
 //
 // The traversal itself was the cost, not the arithmetic.  It is a chain of dependent
-// loads through a 128-byte node, and only ~3.7 nodes are visited per pixel, so almost
+// loads through a 128-byte node -- asserted, and 128 = 4 x 32 is the whole reason
+// the field order in DevNode is what it is -- and only ~3.7 nodes are visited per
+// pixel, so almost
 // none of the time is arithmetic: what dominates is load latency and the fact that
 // adjacent pixels take different paths, so a warp pays for the union of its lanes'
 // traversals.  Measured on two clips of identical geometry, 2.63 versus 3.71

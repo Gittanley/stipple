@@ -1102,6 +1102,22 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
                                   std::uint16_t* out_u16,
                                   int state_slot,
                                   const std::uint16_t* in_u16) {
+  // Defence in depth, and currently unreachable: the flat-search-only restriction at
+  // :1216 already refuses anything above 16 colours, so this engine could never
+  // actually alias.  `b_idx` IS one unsigned char per curve position (idx_bytes =
+  // n * frames at :1245, read back into a std::vector<unsigned char> at :1752), so
+  // IF that restriction is ever lifted the bug arrives silently: the lookup still
+  // succeeds, the image just comes out in the wrong colours.  Kept, with wording
+  // matching the CUDA blocks engine (:949), the CPU blocks path and the approx
+  // engine, so all four refuse identically rather than three of them by accident.
+  if (palette.count > 256) {
+    return "the OpenCL blocks engine carries one palette index per byte, so " +
+           std::to_string(palette.count) +
+           " colours would alias onto the first 256 and the image would come out "
+           "in the wrong colours with no error; use --engine cuda, which is "
+           "bit-exact, carries no index buffer, and has no 256-colour limit, or "
+           "--colors 256 or fewer.";
+  }
   // Take the slot up front and hold no lock for the rest of the function.  That
   // is the entire point of the slot array: two video workers on different slots
   // run concurrently, and nothing below is shared mutable state except the

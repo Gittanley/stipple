@@ -4,6 +4,8 @@
 #include "rd_riemersma.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -395,6 +397,49 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         const ColorTree& tree, std::size_t width,
                         std::size_t height, RgbaF* batch, int frames,
                         int block) {
+  // `chosen` below is a std::vector<unsigned char>, so the palette index this
+  // function hands to the scatter is truncated to 8 bits.  `--colors` accepts
+  // up to kMaxColormapSize (65536, rd_cli.cpp), and the index is the winning
+  // leaf's color_number, so it runs to palette.count - 1.  Above 256 entries
+  // the truncation aliases: index i lands on i & 0xFF and the scatter then
+  // reads palette.entries[i & 0xFF] -- a valid entry, the wrong one.  Nothing
+  // fails, no allocation is out of range, and the picture is quietly wrong:
+  //   count 257 ->   1 entry aliases (0.4%)
+  //   count 300 ->  44 entries alias (14.7%)
+  //   count 4096 -> 3840 entries alias (93.8%, i.e. the whole palette)
+  //
+  // So this refuses instead.  Widening `chosen` to uint16 is the real fix and
+  // is NOT local: rd_blocks_cuda.cu:185 and rd_opencl.cpp:390 truncate the same
+  // index the same way, so all three would have to move together and the
+  // `.idx.bin` on-disk format (1 byte per index) would change with them.
+  //
+  // NOTE ON THE FALLBACK: returning leaves `batch` holding the decoded frames,
+  // i.e. UNDITHERED pixels.  That is still a wrong picture -- this function
+  // returns void and there is no error channel to report through -- so the
+  // stderr line below is the only thing standing between this and a silent bad
+  // encode.  rd_video.cpp:3072 needs a channel to make the failure hard; see
+  // the report.  Printed at most once per process because this runs on every
+  // CPU worker thread, on every batch, for the life of the job.
+  if (palette.count > 256) {
+    static std::atomic<bool> reported{false};
+    bool expected = false;
+    if (reported.compare_exchange_strong(expected, true)) {
+      // The sentence below is character-for-character the one rd_blocks_cuda.cu
+      // returns for the same refusal, because the same refusal on two engines
+      // that a single --engine flag chooses between should read as one fault.
+      // Only the "[dither] error: " prefix and %d-for-to_string differ, both
+      // because this path returns void and has to print instead of return.
+      std::fprintf(
+          stderr,
+          "[dither] error: the blocks engine carries one palette index per byte, "
+          "so %d colours would alias onto the first 256 and the image would come "
+          "out in the wrong colours with no error; use --engine cuda, which is "
+          "bit-exact, carries no index buffer, and has no 256-colour limit, or "
+          "--colors 256 or fewer.\n",
+          palette.count);
+    }
+    return;
+  }
   if (frames < 1 || block < kErrorQueueLength) return;
   const std::size_t pixels = width * height;
   double weights[kErrorQueueLength];
