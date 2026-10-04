@@ -1007,7 +1007,13 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
         // Pinned staging for the pixel buffer.  Falls back to a direct copy from the
         // caller's pageable memory if the pin fails (e.g. no more pageable RAM),
         // which costs bandwidth but never correctness.
-        if (cudaHostAlloc(&st.h_pinned_buf[i], pixel_capacity * sizeof(float4),
+        //
+        // Not allocated at all when `batch` is itself page-locked: the upload below
+        // takes the direct-DMA branch and never reads this buffer.  Allocating it
+        // anyway cost 33,177,600 B (31.64 MiB) of pinned host RAM per device state on
+        // every --engine blocks image run, for a buffer nothing opened.
+        if (!options.batch_pinned &&
+            cudaHostAlloc(&st.h_pinned_buf[i], pixel_capacity * sizeof(float4),
                           cudaHostAllocPortable) != cudaSuccess) {
           st.h_pinned_buf[i] = nullptr;
         }

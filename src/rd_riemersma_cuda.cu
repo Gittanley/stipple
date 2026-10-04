@@ -22,6 +22,8 @@
 // on its own thread, which is what Phase 2 video does.
 #include "rd_riemersma.h"
 
+#include "rd_cuda_common.cuh"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -451,8 +453,12 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
     scratch.Release();
     return "cudaMalloc for pixels failed (the image does not fit in VRAM)";
   }
-  if (cudaMalloc(&scratch.palette, sizeof(double) * 4 * kMaxColormapSize) !=
-          cudaSuccess ||
+  // Sizes for palette.count, not MaxColormapSize: this path was allocating and
+  // uploading 2,097,152 B (plus a 2 MiB zero-filled host vector) on every call
+  // to carry 16 colours, which is 512 B.  cuda_common::UploadPalette already
+  // had this right; this file just never included it.
+  cuda_common::UploadPalette(palette, &scratch.palette);
+  if (scratch.palette == nullptr ||
       cudaMalloc(&scratch.weights, sizeof(double) * kErrorQueueLength) !=
           cudaSuccess) {
     scratch.Release();
@@ -503,20 +509,10 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
 
   double host_weights[kErrorQueueLength];
   build_error_weights(host_weights);
-  std::vector<double> host_palette(4 * kMaxColormapSize, 0.0);
-  for (int i = 0; i < palette.count; ++i) {
-    host_palette[4 * i + 0] = palette.entries[i].r;
-    host_palette[4 * i + 1] = palette.entries[i].g;
-    host_palette[4 * i + 2] = palette.entries[i].b;
-    host_palette[4 * i + 3] = palette.entries[i].a;
-  }
-  if (cudaMemcpy(scratch.palette, host_palette.data(),
-                 sizeof(double) * 4 * kMaxColormapSize, cudaMemcpyHostToDevice) !=
-          cudaSuccess ||
-      cudaMemcpy(scratch.weights, host_weights, sizeof(host_weights),
+  if (cudaMemcpy(scratch.weights, host_weights, sizeof(host_weights),
                  cudaMemcpyHostToDevice) != cudaSuccess) {
     scratch.Release();
-    return "upload of the palette failed";
+    return "upload of the error weights failed";
   }
 
   // With zero curve visits there is nothing to dither: the kernel returns at its own
@@ -525,7 +521,15 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
   // accident -- it uploaded into the same buffer it downloaded from, so the copy
   // round-tripped the input unchanged.  Leaving `pixels` alone is those same bytes.
   // A 1x1 image lands here, and it is the only geometry that does.
-  if (level <= 0) return std::string();
+  //
+  // The Release() is load-bearing and was missed when this guard was added: by this
+  // point all eight allocations are live, and with associate_alpha the memo cache
+  // alone is 67,108,864 B per frame -- 1 GiB at --frames 16.  Every other early
+  // return in this function releases; this one did not.
+  if (level <= 0) {
+    scratch.Release();
+    return std::string();
+  }
 
   // Upload frame 0 once.  It is the shared read-only source for every frame in the
   // batch, so there is nothing to replicate.

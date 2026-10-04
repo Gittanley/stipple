@@ -1548,6 +1548,21 @@ int main(int argc, char** argv) {
                     walk_blocks, walk_blocks == 1 ? "" : "s");
       }
     } else {
+      // Same reasoning as the blocks branch above, and stronger: the engine takes ONE
+      // host frame, uploads one frame and downloads one frame, so N distinct frames are
+      // not even representable in this API.  The extra walks are not merely discarded,
+      // they are provably IDENTICAL -- every input is shared and read-only (srcbuf,
+      // palette, nodes, weights, cache size) and the only per-frame state is reset the
+      // same way each launch.  So at --frames 16 this wastes 15 walks, 506.25 MiB of
+      // `dst`, and up to 1 GiB of cache, for byte-identical output.
+      if (opt.frames != 1) {
+        std::fprintf(stderr,
+                     "[dither] --frames %d does not apply to --engine cuda on a single "
+                     "image; the engine uploads one frame and downloads one frame, so "
+                     "the walks would be identical. Running 1 frame.\n",
+                     opt.frames);
+        opt.frames = 1;
+      }
       cuda_error = rd::RiemersmaWalkCuda(*palette, params, *tree, image.width,
                                          image.height, store->data(), opt.frames,
                                          &device);
