@@ -381,6 +381,8 @@ struct BlockOptions {
   // Likewise `out_u16`: a pinned destination makes the download a true async DMA
   // instead of one through the driver's internal bounce buffer.
   bool out_u16_pinned = false;
+  // `batch` is already page-locked; skip staging memcpy.
+  bool batch_pinned = false;
 };
 
 // `batch` holds `options.frames` consecutive frames of width*height RGBA-float

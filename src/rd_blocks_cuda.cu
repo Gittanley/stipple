@@ -1208,6 +1208,10 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     } else {
       cudaMemcpyAsync(d_in16, in_u16, bytes_in, cudaMemcpyHostToDevice, stream);
     }
+  } else if (options.batch_pinned) {
+    // `batch` is page-locked, so this is a direct DMA and there is nothing to
+    // stage.  Same bytes, same kernel, same output as the staging path.
+    cudaMemcpyAsync(d_pixels, batch, bytes, cudaMemcpyHostToDevice, stream);
   } else if (h_pinned != nullptr) {
     std::memcpy(h_pinned, batch, bytes);
     cudaMemcpyAsync(d_pixels, h_pinned, bytes, cudaMemcpyHostToDevice, stream);

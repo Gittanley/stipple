@@ -1525,6 +1525,9 @@ int main(int argc, char** argv) {
         opt.blocks.frames = opt.frames;
       }
       if (is_blocks) {
+        // The store is page-locked whenever CUDA is present, so the engine can
+        // DMA straight from it and skip its own staging memcpy.
+        opt.blocks.batch_pinned = store->pinned();
         cuda_error = rd::RiemersmaBlocksCuda(*palette, params, *tree, image.width,
                                              image.height, store->data(),
                                              opt.blocks, &device);

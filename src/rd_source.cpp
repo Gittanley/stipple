@@ -66,6 +66,16 @@ PixelStore* PixelStore::Create(std::size_t width, std::size_t height,
 
   // ---- RAM path -----------------------------------------------------------
   if (bytes <= max_ram_bytes) {
+    // Page-locked when CUDA is present.  The blocks engine's upload and download
+    // then DMA straight from and into this buffer, instead of a 16 B/px staging
+    // memcpy in and the driver's bounce buffer out -- 32 B/px of host DRAM
+    // traffic per frame that buys nothing.  CudaAllocPinned returns nullptr in a
+    // --no-cuda build, so this falls through unchanged.
+    if (void* pin = ::rd::CudaAllocPinned(bytes)) {
+      store->data_ = static_cast<RgbaF*>(pin);
+      store->pinned_ = true;
+      return store;
+    }
     void* mem = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
                                PAGE_READWRITE);
     if (mem != nullptr) {
@@ -117,6 +127,8 @@ PixelStore::~PixelStore() {
   if (mapped_) {
     ::UnmapViewOfFile(data_);
     if (mapping_ != nullptr) ::CloseHandle(static_cast<HANDLE>(mapping_));
+  } else if (pinned_) {
+    ::rd::CudaFreePinned(data_);
   } else {
     ::VirtualFree(data_, 0, MEM_RELEASE);
   }

@@ -21,6 +21,11 @@
 
 namespace rd {
 
+// Defined in the CUDA translation unit; returns nullptr in a --no-cuda build.
+// Declared here rather than included so rd_source.h stays free of cuda_runtime.h.
+void* CudaAllocPinned(std::size_t bytes);
+void CudaFreePinned(void* p);
+
 // Interleaved RGBA float, row-major.  This is exactly one Quantum per channel.
 using PixelBuffer = RgbaF*;
 
@@ -44,6 +49,11 @@ class PixelStore {
 
   // True when the pixels are heap resident; false when disk backed.
   bool resident() const { return data_ != nullptr && !mapped_; }
+
+  // True when the allocation is page-locked, so a CUDA engine can DMA straight
+  // to and from it with no staging copy.  False in a --no-cuda build and on the
+  // disk path -- file-backed pages must not be pinned, the OS may evict them.
+  bool pinned() const { return pinned_; }
 
   // Human readable description of where the pixels live.
   const char* backing() const {
@@ -72,6 +82,7 @@ class PixelStore {
   RgbaF* data_ = nullptr;
 
   bool mapped_ = false;
+  bool pinned_ = false;
   void* mapping_ = nullptr;   // HANDLE-ish base for UnmapViewOfFile
   std::size_t mapping_size_ = 0;
   std::string spill_path_;
