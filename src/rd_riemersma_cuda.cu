@@ -182,7 +182,23 @@ struct Frame {
 // held in per-thread *global* scratch rather than local arrays: compute
 // capability 7.x caps local memory at 512 B per thread, and keeping them local
 // overflows the stack and kills the context.
-__global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
+// `src` is ONE shared read-only frame; `dst` is `frames` independent outputs.
+//
+// These were one buffer, which forced the caller to replicate frame 0 across every
+// slot before launching -- 497,664,000 B of device-to-device copy at --frames 16,
+// 87.9% of this path's device traffic, for a result the caller then discarded
+// (it downloads slot 0 only).  The kernel interleaves read and write on the same
+// address (`px->x = ...` after `const float4 src = *px`), so each thread needs a
+// PRIVATE copy of its pixel to read from; that is what the replication was for.
+//
+// Splitting the buffers gives every thread the same guarantee without the copy: the
+// source is immutable for the whole launch, so all frames read the same bytes, and
+// each frame writes only its own slice.  Do not "optimise" this by aliasing every
+// thread onto slot 0 with a zero pitch -- thread A can write its dithered value
+// before thread B reads that address as its source, and B's input becomes A's output.
+__global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
+                                    float4* __restrict__ dst,
+                                    int pixel_pitch, int width,
                                     int height, int level,
                                     const DevNode* __restrict__ nodes,
                                     const double* __restrict__ palette,
@@ -213,6 +229,9 @@ __global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
   Rgba* error = reinterpret_cast<Rgba*>(error_state) + frame_id * 16;
   Frame* stack = reinterpret_cast<Frame*>(frame_state) + frame_id * 64;
   int* my_cache = cache + static_cast<size_t>(frame_id) * cache_entries;
+  // This frame's output slice.  The source stays shared and read-only.
+  const float4* const srcbuf = src;
+  float4* const dstbuf = dst + static_cast<size_t>(frame_id) * pixel_pitch;
   int x = 0, y = 0;
 
   for (int i = 0; i < cache_entries; ++i) my_cache[i] = -1;
@@ -252,8 +271,8 @@ __global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
     if (e >= 0) {
       if (x >= 0 && y >= 0 && x < width && y < height) {
         const size_t idx = static_cast<size_t>(y) * width + x;
-        float4* px = pixels + idx;
-        const float4 src = *px;
+        const float4 src = srcbuf[idx];
+        float4* px = dstbuf + idx;
         Rgba pixel;
         d_associate_alpha_pixel(assoc, src, &pixel);
 
@@ -318,8 +337,8 @@ __global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
   // Trailing RiemersmaDither(ForgetGravity): visit the resting cursor, no move.
   if (x >= 0 && y >= 0 && x < width && y < height) {
     const size_t idx = static_cast<size_t>(y) * width + x;
-    float4* px = pixels + idx;
-    const float4 src = *px;
+    const float4 src = srcbuf[idx];
+    float4* px = dstbuf + idx;
     Rgba pixel;
     d_associate_alpha_pixel(assoc, src, &pixel);
     for (int i = 0; i < 16; ++i) {
@@ -359,7 +378,10 @@ __global__ void RiemersmaWalkKernel(float4* __restrict__ pixels, int width,
 }
 
 struct DeviceScratch {
-  float4* pixels = nullptr;
+  // One shared read-only source frame, and `frames` independent outputs.  Split
+  // so no replication is needed; see the kernel's comment.
+  float4* src = nullptr;
+  float4* dst = nullptr;
   DevNode* nodes = nullptr;
   double* palette = nullptr;
   double* weights = nullptr;
@@ -374,7 +396,8 @@ struct DeviceScratch {
     if (weights) cudaFree(weights);
     if (palette) cudaFree(palette);
     if (nodes) cudaFree(nodes);
-    if (pixels) cudaFree(pixels);
+    if (dst) cudaFree(dst);
+    if (src) cudaFree(src);
     *this = DeviceScratch{};
   }
 };
@@ -422,8 +445,10 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
   const std::size_t frames_sz = static_cast<std::size_t>(frames);
 
   DeviceScratch scratch;
-  if (cudaMalloc(&scratch.pixels, pixel_count * frames_sz * sizeof(float4)) !=
-      cudaSuccess) {
+  if (cudaMalloc(&scratch.src, pixel_count * sizeof(float4)) != cudaSuccess ||
+      cudaMalloc(&scratch.dst, pixel_count * frames_sz * sizeof(float4)) !=
+          cudaSuccess) {
+    scratch.Release();
     return "cudaMalloc for pixels failed (the image does not fit in VRAM)";
   }
   if (cudaMalloc(&scratch.palette, sizeof(double) * 4 * kMaxColormapSize) !=
@@ -494,26 +519,27 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
     return "upload of the palette failed";
   }
 
-  // Upload frame 0, then replicate it for the remaining batch slots so the
-  // kernel has `frames` independent, identical starting states.
-  if (cudaMemcpy(scratch.pixels, pixels, pixel_count * sizeof(float4),
+  // With zero curve visits there is nothing to dither: the kernel returns at its own
+  // `level <= 0` guard without ever writing `dst`, so a round trip would download
+  // uninitialised device memory.  The old single-buffer code got this right by
+  // accident -- it uploaded into the same buffer it downloaded from, so the copy
+  // round-tripped the input unchanged.  Leaving `pixels` alone is those same bytes.
+  // A 1x1 image lands here, and it is the only geometry that does.
+  if (level <= 0) return std::string();
+
+  // Upload frame 0 once.  It is the shared read-only source for every frame in the
+  // batch, so there is nothing to replicate.
+  if (cudaMemcpy(scratch.src, pixels, pixel_count * sizeof(float4),
                  cudaMemcpyHostToDevice) != cudaSuccess) {
     scratch.Release();
     return "upload of the source frame failed";
-  }
-  for (std::size_t f = 1; f < frames_sz; ++f) {
-    void* dst = scratch.pixels + f * pixel_count;
-    if (cudaMemcpy(dst, scratch.pixels, pixel_count * sizeof(float4),
-                   cudaMemcpyDeviceToDevice) != cudaSuccess) {
-      scratch.Release();
-      return "frame replication failed";
-    }
   }
 
   const int threads = frames < 256 ? frames : 256;
   const int blocks = static_cast<int>((frames + threads - 1) / threads);
   RiemersmaWalkKernel<<<blocks, threads, 0, nullptr>>>(
-      scratch.pixels, static_cast<int>(width), static_cast<int>(height), level,
+      scratch.src, scratch.dst, static_cast<int>(pixel_count),
+      static_cast<int>(width), static_cast<int>(height), level,
       scratch.nodes, scratch.palette, palette.count, scratch.weights,
       params.diffusion, palette.associate_alpha ? 1 : 0, scratch.cache,
       cache_entries, scratch.error_state, scratch.frame_state, frames);
@@ -528,7 +554,7 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
     scratch.Release();
     return "kernel execution failed: " + detail;
   }
-  if (cudaMemcpy(pixels, scratch.pixels, pixel_count * sizeof(float4),
+  if (cudaMemcpy(pixels, scratch.dst, pixel_count * sizeof(float4),
                  cudaMemcpyDeviceToHost) != cudaSuccess) {
     scratch.Release();
     return "download of the dithered frame failed";
