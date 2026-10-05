@@ -176,28 +176,45 @@ bool ImBuildPalette(const LoadedImage& loaded, int colors, Palette* out,
     clone = DestroyImage(clone);
     return false;
   }
-  // quantize.c:SetAssociatedAlpha(), in full.  The previous version implemented only
-  // the first half of the condition -- alpha participates when the image carries an
-  // alpha channel -- and omitted the second: IM ALSO clears it when the image has at
-  // most two colours and is in a grey colorspace, even on an image that carries alpha.
+  // quantize.c:SetAssociatedAlpha(), in full.  Upstream:
   //
-  // That omission changes OUTPUT, not just bookkeeping.  With alpha counted as a
-  // channel, a grey gradient at two colours spans two grey levels x two alpha levels and
-  // the quantizer needs more colours to separate them; with it cleared, alpha is ignored
-  // and the same image collapses to fewer.  Measured on a GrayscaleAlpha fixture at
-  // --colors 2: ImageMagick produced 1 colour, this path produced 2, and the tree
-  // disagreed with the palette it came from.
+  //   associate_alpha = image->alpha_trait != UndefinedPixelTrait;
+  //   if ((quantize_info->number_colors == 2) &&
+  //       ((quantize_info->colorspace == LinearGRAYColorspace) ||
+  //        (quantize_info->colorspace == GRAYColorspace)))
+  //     associate_alpha = MagickFalse;
   //
-  // The test is on the image's colorspace field rather than a pixel comparison, so it is
-  // IM's rule and not an approximation of it.  IsGrayColorspace() is declared in a header
-  // this translation unit does not include, so the two greyscale enum values it tests for
-  // are named directly: GRAYColorspace and LinearGRAYColorspace are the complete set.
+  // The second clause tests the QUANTIZE INFO's colorspace, not the image's.  This
+  // function sets qi->colorspace = UndefinedColorspace (above, which is both upstream's
+  // GetQuantizeInfo default and what `magick ... -colors N` passes), so the clause is
+  // dead: quantize_info->colorspace can never be grey here.
+  //
+  // Testing source->colorspace instead -- which an earlier version did, on the grounds
+  // that "IM clears it when the image has at most two colours and is in a grey
+  // colorspace" -- cleared alpha on images whose pixels IM DOES associate, and that
+  // changes output rather than bookkeeping.  Measured on tests/in_gray_alpha.png
+  // (GrayscaleAlpha, 9 unique colours, constant alpha 32768) at --colors 2:
+  //
+  //   associate_alpha  nodes  tree colours  colours
+  //   = true (IM)          52  1             (32612,32612,32612,32768)
+  //   = false (the bug)    60  2             (15844,..,65535) (49379,..,65535)
+  //
+  // Both halves of IM's behaviour are reproduced in the same place here, so the palette
+  // and the tree -- which rd_cli takes this one value from -- cannot disagree.  The
+  // row marked "= true" is not inferred: it is what ColorTree::Build computes for these
+  // pixels, cross-checked against `magick in_gray_alpha.png -dither Riemersma -colors 2`
+  // (1 colour, 32612/32768) and against the same fixture at --colors 4, 9 and 16, where
+  // the flag was already `yes` and the tree matched IM's colormap exactly.
+  //
+  // IsGrayColorspace() is declared in a header this translation unit does not include, so
+  // the two greyscale enum values it tests for are named directly: GRAYColorspace and
+  // LinearGRAYColorspace are the complete set.
   const bool grey_colorspace =
-      source->colorspace == GRAYColorspace ||
-      source->colorspace == LinearGRAYColorspace;
+      qi->colorspace == GRAYColorspace ||
+      qi->colorspace == LinearGRAYColorspace;
   out->associate_alpha =
       source->alpha_trait != UndefinedPixelTrait &&
-      (!grey_colorspace || colors > 2);
+      (!grey_colorspace || qi->number_colors != 2u);
   for (int i = 0; i < out->count; ++i) {
     const PixelInfo& e = clone->colormap[i];
     out->entries[i].r = static_cast<double>(e.red);

@@ -414,7 +414,7 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         const ColorTree& tree, std::size_t width,
                         std::size_t height, RgbaF* batch, int frames,
                         int block, unsigned char* raw_out, std::size_t out_pixels,
-                        bool out_yuv444) {
+                        bool out_yuv444, std::string* error_out) {
   // `raw_out != nullptr && out_pixels > 0` selects the fused output.  Everything below
   // is written so the two paths produce identical bytes: the fused path reproduces the
   // convert pass's arithmetic EXACTLY rather than approximately, including the places
@@ -440,30 +440,51 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
   // i.e. UNDITHERED pixels.  That is still a wrong picture -- this function
   // returns void and there is no error channel to report through -- so the
   // stderr line below is the only thing standing between this and a silent bad
-  // encode.  rd_video.cpp:3072 needs a channel to make the failure hard; see
-  // the report.  Printed at most once per process because this runs on every
-  // CPU worker thread, on every batch, for the life of the job.
+  // ERROR CHANNEL.  This function returns void, so a refusal had nowhere to go and the
+  // caller set `raw_ready` unconditionally -- which made both early returns produce a
+  // SILENT WRONG ENCODE: the writer skipped its convert and encoded whatever the
+  // previous batch happened to leave in `b.out()`.  The stderr line was the only
+  // defence, and on a quiet run nobody reads stderr.
+  //
+  // The refusal now travels back through the `std::string* error_out` the caller
+  // supplies, using the same success-is-empty convention the two GPU engines already
+  // use.  Written on failure, never on success, and a null pointer is tolerated so the
+  // declaration's other callers keep working.
+  //
+  // This is what gates the gather fusion.  Once the reader's widening is fused into the
+  // gather there is no float buffer left to fall back on, so the same silent path stops
+  // being wrong output and becomes reading uninitialised memory.
   if (palette.count > 256) {
+    const char* kRefusal =
+        "the blocks engine carries one palette index per byte, so the palette would "
+        "alias onto the first 256 and the image would come out in the wrong colours "
+        "with no error; use --engine cuda, which is bit-exact, carries no index "
+        "buffer, and has no 256-colour limit, or --colors 256 or fewer.";
+    if (error_out != nullptr) {
+      *error_out = std::string(kRefusal) + " (" + std::to_string(palette.count) +
+                   " colours requested)";
+    }
     static std::atomic<bool> reported{false};
     bool expected = false;
     if (reported.compare_exchange_strong(expected, true)) {
       // The sentence below is character-for-character the one rd_blocks_cuda.cu
       // returns for the same refusal, because the same refusal on two engines
       // that a single --engine flag chooses between should read as one fault.
-      // Only the "[dither] error: " prefix and %d-for-to_string differ, both
-      // because this path returns void and has to print instead of return.
-      std::fprintf(
-          stderr,
-          "[dither] error: the blocks engine carries one palette index per byte, "
-          "so %d colours would alias onto the first 256 and the image would come "
-          "out in the wrong colours with no error; use --engine cuda, which is "
-          "bit-exact, carries no index buffer, and has no 256-colour limit, or "
-          "--colors 256 or fewer.\n",
-          palette.count);
+      // Only the "[dither] error: " prefix differs now, and only because the
+      // stderr line is a courtesy -- the caller is what acts on it.
+      std::fprintf(stderr, "[dither] error: %s (%d colours requested)\n", kRefusal,
+                   palette.count);
     }
     return;
   }
-  if (frames < 1 || block < kErrorQueueLength) return;
+  if (frames < 1 || block < kErrorQueueLength) {
+    if (error_out != nullptr) {
+      *error_out = "invalid dither batch: frames must be >= 1 and block must be >= " +
+                   std::to_string(kErrorQueueLength) + " (got frames=" +
+                   std::to_string(frames) + ", block=" + std::to_string(block) + ")";
+    }
+    return;
+  }
   const std::size_t pixels = width * height;
   double weights[kErrorQueueLength];
   build_error_weights(weights);

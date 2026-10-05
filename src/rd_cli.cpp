@@ -269,20 +269,73 @@ int ReportInterrupted(const std::string& out_path, bool interrupted = true) {
   return 130;  // conventional 128 + SIGINT
 }
 
+// Two rates, over two intervals, both named.
+//
+// `result.total_ms` is the wall clock INCLUDING the palette -- the palette is a serial
+// prefix, VideoBuildPalette has returned before VideoProcess is entered, and a
+// throughput figure that discounts a stage the user sat and watched is not throughput.
+// The progress bar's rate is a different number: its clock starts in the Progress
+// constructor inside VideoProcess, so it EXCLUDES the palette.  On the published
+// 18001-frame run (palette 28677 ms, wall 352507 ms) that is 51.1/s here and 55.6/s on
+// the bar -- two figures ~8% apart, both unlabelled, and the bar's ETA built from the
+// second of them.
+//
+// So this line names the interval it divides by, and the bar is labelled to match
+// (rd_progress.cpp, `rate_window_`).  Neither number changed: what changed is that each
+// says which window it is a rate over, so the two can be compared instead of guessed
+// at.  A reader who wants the bar's figure has it on the bar, marked; a reader who
+// wants end-to-end has it here.
 void PrintVideoSummary(const rd::VideoResult& result) {
-  std::printf("frames     : %lld in %.2f s (%.1f fps)\n",
-              static_cast<long long>(result.frames),
-              result.total_ms / 1000.0,
+  const double total_s = result.total_ms / 1000.0;
+  const double pipeline_ms =
+      result.total_ms > result.palette_ms ? result.total_ms - result.palette_ms : 0.0;
+  // `result.frames` is what VideoProcess calls frames DITHERED (rd_video.cpp:3791
+  // assigns frames_dithered), and the progress bar counts frames WRITTEN
+  // (segment_written, fed to Update at :3738).  On an unsegmented run the writer
+  // drains every dithered batch before it exits -- its only non-segmented stop is
+  // `eof && frames_dithered >= frames_read` (:3746, :3755) -- so the two agree and
+  // the word is not needed.  On a segmented or resumed run they need not, which is
+  // why the segmented path in RunVideo now accumulates `want` rather than
+  // seg_result.frames.  Said out loud rather than left to be inferred, because the
+  // alternative is a summary whose numerator and the bar's numerator are the same
+  // word meaning two different things.
+  std::printf("frames     : %lld in %.2f s (%.1f fps, palette included)\n",
+              static_cast<long long>(result.frames), total_s,
               result.total_ms > 0.0 ? result.frames * 1000.0 / result.total_ms
                                     : 0.0);
-  std::printf("busy time  : palette %.0f | decode %.0f | dither %.0f | encode %.0f"
-              " | wall %.0f ms\n",
-              result.palette_ms, result.decode_ms, result.dither_ms,
-              result.encode_ms, result.total_ms);
+  // The bar's number, computed here so the two are visibly the same measurement over
+  // two windows rather than two unrelated figures.  Printed only when the palette was a
+  // real cost, because otherwise it is the same number twice.
+  //
+  // "the window the progress bar covers" is exact to within the two statements between
+  // VideoProcess's `t_start` (rd_video.cpp:3465) and the Progress constructor
+  // (:3497) -- microseconds -- and deliberately not claimed to be identical.  The bar's
+  // own denominator is its private start_ms_, which nothing outside that class can
+  // read, so this line recomputes the same quantity from the fields that are visible
+  // rather than pretending to a precision it does not have.
+  if (result.palette_ms > 0.0 && pipeline_ms > 0.0) {
+    std::printf("             %.1f fps over the %.2f s window the progress bar covers "
+                "(excludes the %.2f s palette)\n",
+                result.frames * 1000.0 / pipeline_ms, pipeline_ms / 1000.0,
+                result.palette_ms / 1000.0);
+  }
+  // The middle three are SUMMED WORKER TIME, not a partition of the wall clock, and
+  // saying so in the label is the point: `dither` in particular is accumulated once per
+  // dither worker (rd_video.cpp:3446), so with N workers it counts N threads' elapsed
+  // time and can exceed the wall clock.  Presenting them in a row separated by pipes
+  // under a single word invited exactly the naive reading that the numbers do not
+  // support.  convert_ms and pipe_ms ARE a partition of encode_ms, which the second
+  // line now says.
+  std::printf("busy time  : wall %.0f ms (palette %.0f of it)\n"
+              "             summed worker time: decode %.0f | dither %.0f | "
+              "encode %.0f\n",
+              result.total_ms, result.palette_ms, result.decode_ms,
+              result.dither_ms, result.encode_ms);
   // The writer's cost split, because the two halves scale differently and only
-  // one of them is a candidate for moving to the GPU.
-  std::printf("             writer %.0f ms of that encode stage: %.0f ms float->uint16"
-              " on the host, %.0f ms pushing the pipe\n",
+  // one of them is a candidate for moving to the GPU.  These two DO add up to the
+  // encode figure above; the three beside it do not add up to the wall.
+  std::printf("             writer %.0f ms of that encode figure: %.0f ms "
+              "float->uint16 on the host, %.0f ms pushing the pipe\n",
               result.convert_ms + result.pipe_ms, result.convert_ms,
               result.pipe_ms);
 }
@@ -663,7 +716,28 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     // covers one segment only; taking it as the whole job's time reported N times too
     // few seconds and a per-segment palette cost of zero.  The palette is carried
     // across from the pre-loop result and counted exactly once.
-    result.frames += seg_result.frames;
+    //
+    // `seg_result.frames` is frames DITHERED, which is not the same as frames in the
+    // output file, and on this path the two genuinely differ.  The writer clips a
+    // batch that straddles the segment boundary (rd_video.cpp:3595-3599:
+    // `frames_to_write` is clamped to `frames_in_segment - segment_written`), while
+    // the dither worker has already counted the whole batch at :3447
+    // (`frames_dithered += b.frames`).  So every segment reports up to
+    // batch_frames - 1 frames that were dithered and then not written, and the
+    // overcount is repeated once per segment.  Measured shape, not a guess: at
+    // --segment-frames 1000 --batch-frames 16 over 18001 frames that is 19 segments
+    // and up to 19*15 = 285 phantom frames, which at 51 fps is 5.6 s of fictitious
+    // time and inflates the reported frame count by 1.6%.  It is also a numerator
+    // that disagrees with the file: ffprobe on the joined output is the authority and
+    // this is not.
+    //
+    // `want` is the number of frames this segment was asked to cover, which is what
+    // the segment file holds once the encoder has accepted them -- and it is bounded
+    // by the same clip the writer applies, because both derive from
+    // opt.frames_in_segment.  On the LAST segment `want` is
+    // min(seg_frames, info.frames - first), so a container that over-reports its own
+    // length cannot inflate the count either.
+    result.frames += static_cast<std::int64_t>(want);
     result.total_ms += seg_result.total_ms;
     result.decode_ms += seg_result.decode_ms;
     result.dither_ms += seg_result.dither_ms;
@@ -785,6 +859,33 @@ int main(int argc, char** argv) {
         if (!ParseIntArg(argv[i + 1], "--blocks", &parsed_v)) return 2;
         ++i;
         opt.blocks.block = static_cast<decltype(opt.blocks.block)>(parsed_v);
+      }
+      // The floor is 16, and it is enforced HERE because the CLI uses this number in
+      // its own arithmetic and neither engine protects it there.
+      //
+      //   * `--engine opencl --blocks 0` was a hard crash.  rd_opencl.cpp:1138 clamps
+      //     internally -- `std::max(kErrorQueueLength, options.block)` -- and returns
+      //     success, so nothing between here and the "blocks :" line below rejects 0;
+      //     the line then evaluates (width*height + block - 1) / block with block == 0,
+      //     which on x64 is 0xC0000094 and kills the process.  It happens AFTER the
+      //     dither and BEFORE the file is written, so the whole run is lost to a flag
+      //     nobody was told was wrong.
+      //   * `--engine opencl --blocks 1` .. 15 did not crash, but printed a block count
+      //     computed from the user's number while the engine walked 16-position blocks.
+      //   * `--engine blocks` was already safe, and by accident: rd_blocks_cuda.cu:929
+      //     refuses block < 16 with a message, so the CLI never reached the division.
+      //
+      // Clamping rather than refusing follows the --frames precedent below: the value
+      // is adjusted to something that works and the adjustment is announced, so no
+      // command line that runs today starts failing.  It also makes the number
+      // self-consistent for the resume path, which records opt.block in the checkpoint
+      // -- recording 4 while every engine walked 16 describes a render nobody performed.
+      if (opt.blocks.block < 16) {
+        std::fprintf(stderr,
+                     "[dither] --blocks %d is below the error queue's depth of 16; "
+                     "using 16.\n",
+                     opt.blocks.block);
+        opt.blocks.block = 16;
       }
     } else if (arg == "--approx-iters") {
       if (!NeedsValue(argc, i, "--approx-iters")) return 2;
@@ -1177,6 +1278,58 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (opt.video) {
+    // The mirror image of the video-only refusal further down, and it has the same
+    // justification: a flag that parses, is stored, and is then read by nothing on
+    // this path is a setting the user believes took effect.
+    //
+    // Only two are refused, and both are refused because they make the user believe
+    // something FALSE ABOUT THE OUTPUT rather than merely about a knob:
+    //
+    //   --verify    RunVideo never reads it.  Nothing in src/rd_video.cpp compares
+    //               anything against ImageMagick, so `--verify --video` rendered the
+    //               clip, printed no verify line, and exited 0 -- and that is the one
+    //               flag whose entire contract is "tell me if this is wrong".
+    //   --dither N  A plugin dither is a host function pointer and the video pipeline
+    //               is built around the block partition, so there is no way to call it.
+    //               The name is validated above, so a correctly spelled plugin name is
+    //               accepted and then Riemersma runs instead: exactly the failure that
+    //               validation was added to prevent, reached by adding --video.
+    //
+    // Deliberately NOT refused, because each is a no-op that cannot mislead -- and
+    // this is a judgement about which no-ops mislead, so it is worth stating the
+    // test: a flag is refused when believing it took effect would make the reader
+    // wrong about the OUTPUT FILE, and left alone when it would only make them
+    // wrong about a knob they can see is untouched.
+    //   --no-cache  The video path is cache-free by construction (RiemersmaBlocksCpu
+    //                and the two GPU blocks engines never build a memo table), so the
+    //                request is satisfied by accident rather than ignored.
+    //   --format    ffmpeg picks the container from the extension; there is no
+    //                ImageMagick coder on this path at all.
+    //   --frames    The video equivalent is --batch-frames, whose default is already
+    //                16, so the request is met.
+    //   --dump-curve, --dump-palette, --max-ram-mb  A diagnostic that prints nothing,
+    //                and a limit the pipeline expresses as --mem-fraction.
+    // A stricter line would refuse all of them, and the cost of that is a flag the
+    // user can put in a script for both paths; the benefit is a message about a
+    // setting that had no effect on a file that is correct.  UNVERIFIED: whether any
+    // existing caller in this repository passes one of these with --video -- there is
+    // no such call site in src/ or tools/, but scripts outside the tree are not
+    // visible from here.
+    if (opt.verify) {
+      std::fprintf(stderr,
+                   "error: --verify cannot apply to --video: there is no reference "
+                   "Riemersma pass on that path, so it would exit 0 without comparing "
+                   "anything.  Drop it.\n");
+      return 2;
+    }
+    if (opt.dither != "riemersma") {
+      std::fprintf(stderr,
+                   "error: --dither %s has no --video path: a plugin is a host "
+                   "function pointer and the video pipeline is built around the block "
+                   "partition, so Riemersma would run instead.  Drop the flag, or "
+                   "dither the frames as images.\n", opt.dither.c_str());
+      return 2;
+    }
     // Carry the shared colour/dither settings into the video options.
     opt.video_opt.colors = opt.colors;
     opt.video_opt.block = opt.blocks.block;
@@ -1245,17 +1398,69 @@ int main(int argc, char** argv) {
   // out.png` used to render an image and exit 0, having done nothing with --crf.
   // Silent no-op is worse than a refusal: the user believes a setting took effect.
   //
-  // Palette flags are deliberately NOT listed.  --palette-export, --palette-import,
-  // --im-palette and --palette-from are honoured for images too (see below), and the
-  // existing `bypassed` diagnostic already names the sampling knobs that an imported
-  // palette makes moot.
+  // Palette flags are split, and the split is by what the image path actually reads
+  // rather than by whether the word "palette" is in the name:
+  //
+  //   honoured here  --palette-export, --palette-import.  Both write or read the
+  //                  palette this run uses, and an image is exactly the case where you
+  //                  want to fix a palette once and re-use it (see the blocks below).
+  //   listed below   --palette-from.  This one was previously described as honoured for
+  //                  images, which is not true: the image path reads opt.palette_import
+  //                  and nothing reads opt.video_opt.palette_from, so
+  //                      rdither --palette-from p.png in.png out.png
+  //                  dithered with a palette derived from the image and said nothing.
+  //                  That is the worst shape of this defect -- not a knob that does
+  //                  nothing but a PALETTE that does not, so the picture is not the one
+  //                  that was asked for.  It is listed here rather than honoured,
+  //                  because honouring it means a second reader in the image path, and
+  //                  --palette-import already is that reader with the colour-count
+  //                  check attached.
+  //   reported, not refused  --palette-frames, --palette-tile, --palette-budget-ms,
+  //                  --palette-max-samples, --palette-dedup, --palette-stage1-colors,
+  //                  --palette-mode, --im-palette.  These describe how a VIDEO palette
+  //                  is sampled from a decoded stream; the image path derives its
+  //                  palette from the image with ImBuildPalette and never reads them.
+  //                  They cannot change the picture -- the palette comes from the
+  //                  image either way -- so the answer is a named note rather than an
+  //                  exit code, which is also why they are exempt from the exit-2
+  //                  treatment the rest of this list gets.  See the `bypassed` block
+  //                  below, which now names them whenever they were TYPED.
+  //
+  // No flag in this list is meaningful on an image, so nothing here is caught by
+  // mistake.  That was checked field by field rather than by eye: each entry sets one
+  // field on opt.video_opt (or the global g_video_memory_fraction), and each of those
+  // fields is read only inside RunVideo or VideoProcess.  The one that needed a second
+  // look was --mem-fraction, which also assigns rd::g_video_memory_fraction at parse
+  // time -- and that global is read NOWHERE in the tree: grepping it returns the
+  // declaration, the definition at rd_riemersma_cpu.cpp:18, and this assignment, and
+  // no reader.  The video path uses opt.mem_fraction directly (rd_video.cpp:2140), so
+  // the global is dead code and the flag is video-only in fact as well as in name.
   {
+    // The four at the end of the second group are the ones this list was still
+    // missing, and all four are read by nothing on the image path -- verified by
+    // reading every use of the fields they set, not by the absence of a mention:
+    //   --cpu-threads N   opt.video_opt.cpu_threads.  The image path allocates its
+    //                    worker count from hardware_concurrency inside the engine, or
+    //                    not at all for the sequential walk; there is no reader here.
+    //   --no-gpu          opt.video_opt.use_gpu.  Refused inside VideoProcess on a
+    //                    machine with no CUDA device, and irrelevant to an image.
+    //   --input-mode M    opt.video_opt.input_mode.  A decoder-output format.  The
+    //                    image path's input format is whatever the coder produced.
+    //   --palette-only    opt.video_opt.palette_only.  It could plausibly mean
+    //                    something here -- the image path does build and print a
+    //                    palette before the dither -- but nothing implements it, so
+    //                    `rdither --palette-only in.png out.png` renders and dithers
+    //                    the image and stops, which is the opposite of what the flag
+    //                    says.  Refused rather than implemented, because implementing
+    //                    it means skipping the write and that is a behaviour change to
+    //                    a flag that has always been accepted.
     static const char* const kVideoOnly[] = {
         "--crf", "--preset", "--video-codec", "--video-lossless", "--video-pix-fmt",
         "--video-preserve-vfr", "--no-audio", "--segment-frames", "--resume",
         "--reader-threads", "--decode-threads", "--encode-threads", "--no-hwaccel",
         "--host-grace-ms", "--queue-depth", "--batch-frames", "--gpu-workers",
-        "--gpu-float-out", "--mem-fraction",
+        "--gpu-float-out", "--mem-fraction", "--palette-from",
+        "--cpu-threads", "--no-gpu", "--input-mode", "--palette-only",
     };
     std::vector<std::string> ignored;
     for (const char* f : kVideoOnly) {
@@ -1355,25 +1560,45 @@ int main(int argc, char** argv) {
     rd::ImShutdown();
     return 1;
   }
-  // The sampler knobs are all about HOW a palette is derived, and an imported one
-  // is already derived.  Silently ignoring them is how a user ends up believing
-  // --palette-frames did something during a run where it could not have, so the
-  // ones actually passed are named.
-  if (!opt.palette_import.empty()) {
+  // The sampler knobs are all about HOW a palette is derived, and on this path they
+  // derive nothing: ImBuildPalette quantises the image, and none of these are read
+  // again.  An imported palette makes that doubly true -- there is no derivation to
+  // influence at all.
+  //
+  // Driven off `seen_flags` rather than off the option VALUES, which is the whole
+  // reason that list exists (see the comment on Options::seen_flags).  The value test
+  // this replaces could only fire when the user happened to pass something other than
+  // the default: `--palette-tile 128` is the default and is exactly as inert as
+  // `--palette-tile 256`, but only the second was ever named.  So the diagnostic
+  // under-reported precisely in the case where the user had made a deliberate choice
+  // and been silently ignored -- the case the note exists for.
+  //
+  // The condition is also no longer gated on an import being present, because the
+  // gate was the other half of the hole: with no --palette-import, `--palette-frames
+  // 400 in.png out.png` was a flag that did nothing and said nothing.
+  {
+    static const char* const kSamplerKnobs[] = {
+        "--im-palette", "--palette-frames", "--palette-tile", "--palette-budget-ms",
+        "--palette-max-samples", "--palette-dedup", "--palette-stage1-colors",
+        "--palette-mode",
+    };
     std::vector<std::string> bypassed;
-    if (opt.video_opt.im_palette) bypassed.push_back("--im-palette");
-    if (opt.video_opt.palette_frames > 0) bypassed.push_back("--palette-frames");
-    if (opt.video_opt.palette_tile > 0) bypassed.push_back("--palette-tile");
-    if (opt.video_opt.palette_budget_ms > 0) bypassed.push_back("--palette-budget-ms");
-    if (opt.video_opt.palette_max_samples > 0) bypassed.push_back("--palette-max-samples");
+    for (const char* k : kSamplerKnobs) {
+      for (const std::string& s : opt.seen_flags) {
+        if (s == k) { bypassed.push_back(s); break; }
+      }
+    }
     if (!bypassed.empty() && !opt.quiet) {
       std::string list;
       for (std::size_t i = 0; i < bypassed.size(); ++i) {
         if (i != 0) list += ", ";
         list += bypassed[i];
       }
-      std::printf("palette    : ignoring %s -- an imported palette is not sampled\n",
-                  list.c_str());
+      std::printf("palette    : ignoring %s -- %s\n", list.c_str(),
+                  opt.palette_import.empty()
+                      ? "this path derives the palette from the image with "
+                        "ImageMagick's own quantizer, not by sampling"
+                      : "an imported palette is not sampled");
     }
   }
   // The flag lives on video_opt because that is where the parsing already put it,
@@ -1505,6 +1730,30 @@ int main(int argc, char** argv) {
   params.colors = opt.colors;
   params.diffusion = opt.diffusion;
   params.use_cache = !opt.no_cache;
+  if (opt.no_cache) {
+    // Say which engines honour it, because they do not all do it the same way and the
+    // flag is a diagnostic: it exists to isolate IM's memo table from the error the
+    // walk introduces, so an answer that silently ignored it makes the whole
+    // comparison meaningless rather than merely different.
+    //
+    //   cpu     RiemersmaWalkCpu allocates NO table and recomputes every lookup
+    //           (rd_riemersma_cpu.cpp:334-339, :72, :86).
+    //   cuda    RiemersmaWalkKernel skips the table the same way; the two now agree
+    //           on what the flag means, which they did not until this was wired up.
+    //   blocks  Cache-free by construction: there is no single visit order to memoise,
+    //           since every block is an independent walk.  The CLI already forces
+    //           params.use_cache = false for it.
+    //   opencl  Same partition and the same arithmetic as blocks.
+    //   approx  Cache-free by construction; the CLI already forces it false.
+    if (opt.engine == rd::Engine::kCpu || opt.engine == rd::Engine::kCuda) {
+      std::fprintf(stderr,
+                   "[dither] --no-cache: the %s walk recomputes every palette lookup. "
+                   "This is NOT ImageMagick's output and --verify will report a "
+                   "mismatch; the flag isolates the memo table's contribution to the "
+                   "answer.\n",
+                   opt.engine == rd::Engine::kCpu ? "cpu" : "cuda");
+    }
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   if (opt.engine == rd::Engine::kCuda || opt.engine == rd::Engine::kApprox ||
@@ -1539,6 +1788,23 @@ int main(int argc, char** argv) {
     }
     std::string device;
     std::string cuda_error;
+    // --max-vram-mb consults CudaMaxFrames, which has no palette and no use_cache to
+    // consult either (rd_riemersma_cuda.cu, subtlety 3 in that function's comment).
+    // Asking it about the opencl engine is a category error: the number describes
+    // CUDA's allocation set, and OpenCL's is a different one.  It is refused rather
+    // than ignored, for the same reason the video-only list is -- a budget that is
+    // checked against the wrong device's arithmetic is not a budget that was honoured.
+    if (opt.max_vram_mb != 0 && opt.engine == rd::Engine::kOpenCL) {
+      std::fprintf(stderr,
+                   "error: --max-vram-mb cannot apply to --engine opencl: the budget "
+                   "is checked against CudaMaxFrames, which sizes the CUDA engine's "
+                   "allocations and knows nothing about the OpenCL context.  Drop it, "
+                   "or use --engine blocks.\n");
+      delete store;
+      rd::ImFree(&image);
+      rd::ImShutdown();
+      return 2;
+    }
     if (opt.max_vram_mb != 0) {
       const int fits = rd::CudaMaxFrames(image.width, image.height,
                                          opt.max_vram_mb * 1024ull * 1024ull);
@@ -1610,14 +1876,23 @@ int main(int argc, char** argv) {
                                               opt.blocks, &device);
       }
       if (!opt.quiet) {
+        // The divisor is `opt.blocks.block`, which the parse now floors at 16, so
+        // this can no longer divide by zero.  The guard is kept anyway and is not
+        // paranoia: it is a load-bearing invariant of a printf that runs AFTER the
+        // dither, so a zero here costs the whole render rather than a message.  If
+        // the floor is ever moved or removed, this is the line that fails.
+        const int bsize = opt.blocks.block > 0 ? opt.blocks.block : 1;
         const long long walk_blocks =
-            (static_cast<long long>(image.width) * image.height +
-             opt.blocks.block - 1) / opt.blocks.block;
+            (static_cast<long long>(image.width) * image.height + bsize - 1) / bsize;
         // %lld, not %d: the expression is a long long (a 1920x1080 frame at
         // block 32 is 64800, which happens to fit, but 8K would not) and a
         // mismatched varargs type is undefined behaviour, not a warning.
+        //
+        // `opt.frames` here, not `opt.blocks.frames`: the two are set from each
+        // other above and are equal on every path that reaches this line, and using
+        // the field the engine actually received is the one that cannot drift.
         std::printf("blocks     : %d positions/block, %d frame%s, %lld block%s/walk\n",
-                    opt.blocks.block, opt.frames, opt.frames == 1 ? "" : "s",
+                    bsize, opt.blocks.frames, opt.blocks.frames == 1 ? "" : "s",
                     walk_blocks, walk_blocks == 1 ? "" : "s");
       }
     } else {
@@ -1700,11 +1975,41 @@ int main(int argc, char** argv) {
   }
   const double dither_ms = ElapsedMs(t0);
   if (!opt.quiet) {
-    // Aggregate throughput: the CUDA engine may run `frames` independent walks
+    // Walks ACTUALLY performed, which is not `opt.frames`.
+    //
+    // Every branch above either honours --frames or declines it, and they record the
+    // outcome in different fields: the cuda branch clamps `opt.frames` itself, the
+    // blocks/opencl branch clamps `opt.blocks.frames` and leaves `opt.frames` at the
+    // user's number, and the plugin and cpu branches ignore the flag entirely.  This
+    // line used `opt.frames`, so:
+    //
+    //   --engine blocks --frames 4 in.png out.png
+    //       printed "4 walks" and 4x the Mpixel/s, having run ONE.  The store holds a
+    //       single frame (rd_source.cpp sizes it width*height*sizeof(RgbaF)) and the
+    //       branch above says so on stderr, but the throughput line then reported the
+    //       number the flag asked for rather than the work done -- so a user comparing
+    //       two runs could make one look 4x faster from a flag that changed nothing.
+    //   --engine cuda --frames 4 was already right, because that branch assigns
+    //       opt.frames = 1.
+    //   --engine cpu --frames 4 printed "4 walks" and 4x Mpixel/s for a strictly
+    //       sequential walk.  This is the worst of the three: the cpu engine takes no
+    //       frame count at all, so nothing warned.
+    //
+    // One variable, assigned where the answer is known, so the reported count cannot
+    // disagree with the call that was made.
+    const int walks = opt.engine == rd::Engine::kBlocks ||
+                              opt.engine == rd::Engine::kOpenCL
+                          ? opt.blocks.frames
+                          : ((opt.engine == rd::Engine::kCpu ||
+                              opt.engine == rd::Engine::kApprox)
+                                 ? 1
+                                 : opt.frames);
+    // Aggregate throughput: an engine may run several independent walks
     // concurrently, so reporting only one frame's pixel count would hide the
-    // scaling that frame batching actually buys.
+    // scaling that frame batching actually buys.  Divide by the same number the walk
+    // count reports, or the two figures on this one line contradict each other.
     const double walked =
-        static_cast<double>(image.width) * image.height * opt.frames;
+        static_cast<double>(image.width) * image.height * walks;
     // walked pixels / (ms -> s) / 1e6 == Mpixel/s
     const char* engine_name = opt.engine == rd::Engine::kCuda    ? "cuda"
                               : opt.engine == rd::Engine::kApprox ? "approx"
@@ -1712,7 +2017,7 @@ int main(int argc, char** argv) {
                               : opt.engine == rd::Engine::kOpenCL ? "opencl"
                                                                   : "cpu";
     std::printf("dither     : %.2f ms (%d walk%s, %.2f Mpixel/s aggregate, %s engine)\n",
-                dither_ms, opt.frames, opt.frames == 1 ? "" : "s",
+                dither_ms, walks, walks == 1 ? "" : "s",
                 walked / (dither_ms * 1000.0), engine_name);
   }
 

@@ -128,29 +128,27 @@ if (-not (Test-Path $jpg)) {
 }
 
 $images = @("t_1x1", "t_3x5", "t_17x13", "t_wide", "in_grad", "in_plasma",
-            "in_shapes", "in_alpha", "noisy", "in_jpeg")
+            "in_shapes", "in_alpha", "noisy", "in_jpeg", "in_gray_alpha")
 
-# NOT in the list above: in_gray_alpha, generated just below.  It is a grey image with
-# alpha at --colors 2, and it exposes a divergence that is NOT the associate_alpha flag
-# this commit fixes.  ImageMagick's own CLI collapses it to a single flat colour:
+# in_gray_alpha was EXCLUDED here until this commit, and the exclusion recorded the reason
+# honestly: a grey image with alpha at --colors 2, where ImageMagick's CLI collapses to
+# one colour while ColorTree::Build yielded two, and the tool's own
+# "colormap : tree matches ImageMagick exactly" check caught the disagreement.
 #
-#     magick in_gray_alpha.png -dither Riemersma -colors 2 out.png
-#     -> 1 colour, (127,127,127,128)
+# CLOSED, and the cause was a divergence from upstream rather than a missing feature.
+# SetAssociatedAlpha in MagickCore/quantize.c tests quantize_info->colorspace; this port
+# tested source->colorspace.  ImBuildPalette sets qi->colorspace = UndefinedColorspace
+# (upstream's GetQuantizeInfo default, and what the CLI passes), so upstream's clause can
+# never fire there -- while the port's fired on greyscale images and cleared an alpha IM
+# does associate, which changes the colour COUNT.
 #
-# while ColorTree::Build, which derives its colours from the pixels rather than from the
-# palette ImageMagick handed us, yields 2.  The tool's own "colormap : tree matches
-# ImageMagick exactly" check detects the disagreement and refuses, which is the correct
-# behaviour -- so this is a real, caught, OPEN divergence rather than a silent one.
+# Both ends measured by rebuilding, not by argument: the pre-fix tree gives --colors 2
+# exit 4 with associate_alpha=no and no verify line, while 4/9/16 all match; the fixed
+# tree matches at all four.  The tree was never meant to be constrained to the palette
+# count -- in IM, AssignImageColors derives image->colors from the same cube_info the
+# tree came from -- so the two consumers were simply fed different associate_alpha.
 #
-# Closing it means reproducing QuantizeImage's colour-COUNT behaviour for a degenerate
-# input, which is a larger piece of work than the flag it was found behind, and it is not
-# a regression: nothing here changed behaviour for any input that was previously tested.
-# Recorded rather than hidden, and the fixture is kept so the divergence can be
-# reproduced with one command:
-#
-#     rdither --colors 2 --verify --quiet tests\in_gray_alpha.png out.png
-#
-# Add it to $images above when that is fixed; leaving it out is a KNOWN GAP, not a pass.
+# Generated below like the others, since it is derived from in_grad.
 
 # Source extension per fixture.  Everything is PNG except in_jpeg, which is a JPEG
 # on purpose -- see the comment where it is generated.  A non-PNG input is the only

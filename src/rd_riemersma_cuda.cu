@@ -194,6 +194,45 @@ __device__ void d_closest_color(const DevNode* __restrict__ nodes,
   }
 }
 
+// quantize.c's memoised palette lookup, with the memo table OPTIONAL.
+//
+// `use_cache == 0` means NO memoisation -- every visit walks the octree -- and not
+// "a smaller table".  That is not a distinction this file is free to invent: the
+// host walk already defines it, in rd_riemersma_cpu.cpp:334-339 and :71-86.  With
+// DitherParams::use_cache false the std::vector is constructed with size 0, so
+// `cache_data` is nullptr, `Visit` takes the `params.use_cache ? cache[key] : -1`
+// branch, and every single visit recomputes the lookup and stores nothing.  A
+// smaller table would be a THIRD answer -- not the cached one and not the cache-free
+// one -- and `--no-cache` would then mean something different on each engine, which
+// is the defect this function exists to remove.
+//
+// The whole body is one function because it is reached from two places, the main
+// visit and the trailing ForgetGravity visit, and a flag honoured at one of them and
+// not the other produces a picture that is neither cached nor cache-free: no error,
+// and a per-engine answer that depends on which visit happened to be last.
+__device__ __forceinline__ int d_palette_index(int use_cache, int* my_cache,
+                                               int key, const DevNode* nodes,
+                                               const double* palette, int assoc,
+                                               const Rgba& pixel) {
+  int index = use_cache ? my_cache[key] : -1;
+  if (index < 0) {
+    int node = 0;  // the root is always node 0
+    for (int i = kMaxTreeDepth - 1; i > 0; --i) {
+      const int id = d_node_id(assoc, pixel.r, pixel.g, pixel.b, pixel.a, i);
+      const int child = nodes[node].child[id];
+      if (child < 0) break;
+      node = child;
+    }
+    double distance = __dadd_rn(
+        __dmul_rn(4.0, __dmul_rn(kQRange + 1.0, kQRange + 1.0)), 1.0);
+    index = 0;
+    d_closest_color(nodes, palette, assoc, nodes[node].parent, pixel, &distance,
+                    &index);
+    if (use_cache) my_cache[key] = index;
+  }
+  return index;
+}
+
 struct Frame {
   int level;
   int dir;
@@ -221,6 +260,16 @@ struct Frame {
 // each frame writes only its own slice.  Do not "optimise" this by aliasing every
 // thread onto slot 0 with a zero pitch -- thread A can write its dithered value
 // before thread B reads that address as its source, and B's input becomes A's output.
+//
+// The split makes `dst` a fresh allocation rather than an overlay on the source, so
+// the question "does this kernel write every pixel the frame contains?" now decides
+// whether the download is defined.  It does, and not by luck: the leaves cover 4^L - 1
+// distinct cells and the trailing ForgetGravity visit lands on the one cell they miss,
+// so leaves + trailing is the whole 2^L-by-2^L grid.  The host does NOT seed `dst`,
+// and the long note at that memcpy's old position says why -- in particular that the
+// closed form in BuildCurveIndex DOES leave a cell uncovered, so the two paths are not
+// the same and only one of them needs the help.  Do not add a seeding copy here on the
+// strength of the closed form's behaviour.
 __global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
                                     float4* __restrict__ dst,
                                     int pixel_pitch, int width,
@@ -231,6 +280,7 @@ __global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
                                     const double* __restrict__ weights,
                                     double diffusion, int assoc,
                                     int* __restrict__ cache, int cache_entries,
+                                    int use_cache,
                                     double* __restrict__ error_state,
                                     int* __restrict__ frame_state,
                                      int frames) {
@@ -253,13 +303,20 @@ __global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
   // Per-thread scratch, carved out of the batch allocations.
   Rgba* error = reinterpret_cast<Rgba*>(error_state) + frame_id * 16;
   Frame* stack = reinterpret_cast<Frame*>(frame_state) + frame_id * 64;
-  int* my_cache = cache + static_cast<size_t>(frame_id) * cache_entries;
+  // Null when caching is off, and deliberately left as a null POINTER rather than
+  // `cache + 0`: pointer arithmetic on a null pointer is undefined even with a zero
+  // offset, and it would then be dereferenced by the first visit if a guard were ever
+  // dropped.  The host does not allocate the table at all in that case.
+  int* my_cache = nullptr;
+  if (use_cache) my_cache = cache + static_cast<size_t>(frame_id) * cache_entries;
   // This frame's output slice.  The source stays shared and read-only.
   const float4* const srcbuf = src;
   float4* const dstbuf = dst + static_cast<size_t>(frame_id) * pixel_pitch;
   int x = 0, y = 0;
 
-  for (int i = 0; i < cache_entries; ++i) my_cache[i] = -1;
+  if (use_cache) {
+    for (int i = 0; i < cache_entries; ++i) my_cache[i] = -1;
+  }
   for (int i = 0; i < 16; ++i) {
     error[i].r = 0.0;
     error[i].g = 0.0;
@@ -314,23 +371,8 @@ __global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
         if (assoc) pixel.a = static_cast<double>(d_clamp_pixel(pixel.a));
 
         const int key = d_cache_offset(assoc, pixel.r, pixel.g, pixel.b, pixel.a);
-        int index = my_cache[key];
-        if (index < 0) {
-          int node = 0;  // the root is always node 0
-          for (int i = kMaxTreeDepth - 1; i > 0; --i) {
-            const int id =
-                d_node_id(assoc, pixel.r, pixel.g, pixel.b, pixel.a, i);
-            const int child = nodes[node].child[id];
-            if (child < 0) break;
-            node = child;
-          }
-          double distance = __dadd_rn(
-              __dmul_rn(4.0, __dmul_rn(kQRange + 1.0, kQRange + 1.0)), 1.0);
-          index = 0;
-          d_closest_color(nodes, palette, assoc, nodes[node].parent, pixel,
-                          &distance, &index);
-          my_cache[key] = index;
-        }
+        const int index = d_palette_index(use_cache, my_cache, key, nodes, palette,
+                                          assoc, pixel);
 
         const double* ce = palette + 4 * index;
         px->x = static_cast<float>(ce[0]);
@@ -378,22 +420,8 @@ __global__ void RiemersmaWalkKernel(const float4* __restrict__ src,
     pixel.b = static_cast<double>(d_clamp_pixel(pixel.b));
     if (assoc) pixel.a = static_cast<double>(d_clamp_pixel(pixel.a));
     const int key = d_cache_offset(assoc, pixel.r, pixel.g, pixel.b, pixel.a);
-    int index = my_cache[key];
-    if (index < 0) {
-      int node = 0;
-      for (int i = kMaxTreeDepth - 1; i > 0; --i) {
-        const int id = d_node_id(assoc, pixel.r, pixel.g, pixel.b, pixel.a, i);
-        const int child = nodes[node].child[id];
-        if (child < 0) break;
-        node = child;
-      }
-      double distance = __dadd_rn(
-          __dmul_rn(4.0, __dmul_rn(kQRange + 1.0, kQRange + 1.0)), 1.0);
-      index = 0;
-      d_closest_color(nodes, palette, assoc, nodes[node].parent, pixel,
-                      &distance, &index);
-      my_cache[key] = index;
-    }
+    const int index = d_palette_index(use_cache, my_cache, key, nodes, palette,
+                                      assoc, pixel);
     const double* ce = palette + 4 * index;
     px->x = static_cast<float>(ce[0]);
     px->y = static_cast<float>(ce[1]);
@@ -457,7 +485,7 @@ bool CudaAvailable() {
 // cudaMalloc with "the image does not fit in VRAM", which is true but is not
 // the answer the flag asked for.
 //
-// TWO SUBTLETIES, both stated because they change what the number means:
+// THREE SUBTLETIES, all stated because they change what the number means:
 //
 //  1. `cache_entries` is `palette.associate_alpha ? kCacheEntries : (1 << 18)`
 //     -- 67,108,864 B or 1,048,576 B per frame, a 64x spread.  associate_alpha
@@ -482,6 +510,16 @@ bool CudaAvailable() {
 //     than useless as a budget.  So this charges the cap.  At 1080p that is
 //     34,152,576 B, about one extra frame, which is the right order of
 //     magnitude and is charged in full.
+//
+//  3. The per-frame cache charge is also unconditional, and `use_cache` is not a
+//     parameter here, so `rdither --no-cache --engine cuda --max-vram-mb N` is
+//     charged for a 1 GiB-per-frame table the engine no longer allocates (see
+//     RiemersmaWalkCuda).  Over-charging is the wrong direction for the only
+//     consumer: rd_cli.cpp tests `fits < 1` and refuses, so a budget that would
+//     comfortably fit the uncached run can be refused because of a table that is
+//     not there.  The parameter that would fix it is on the CudaMaxFrames
+//     declaration, in a header this file does not own, and it is the same
+//     associate_alpha gap as subtlety 1 -- one argument fixes both.
 int CudaMaxFrames(std::size_t width, std::size_t height, std::size_t vram_budget) {
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) return 0;
@@ -529,7 +567,22 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
   }
 
   const int level = ComputeCurveLevel(width, height);
-  const int cache_entries = palette.associate_alpha ? kCacheEntries : (1 << 18);
+  // --no-cache.  `params.use_cache` was not read anywhere in this file, so the flag
+  // reached the CLI, was stored in DitherParams, was handed to this function as the
+  // first argument after the palette -- and changed nothing.  `--no-cache --engine cuda`
+  // returned exactly the cached picture and `--no-cache --engine cpu` returned the
+  // cache-free one, so the same command line with one word changed produced two
+  // different images and neither said so.
+  //
+  // The semantics are the host's, not this file's: RiemersmaWalkCpu with
+  // DitherParams::use_cache false allocates NO table (a zero-length vector) and
+  // recomputes every lookup.  So `cache_entries` is 0 here and the allocation is
+  // skipped entirely -- not shrunk.  A smaller table would still be a cache, and would
+  // be a third distinct answer, which is worse than the bug being fixed: it would
+  // agree with neither engine.
+  const bool use_cache = params.use_cache;
+  const int cache_entries =
+      !use_cache ? 0 : (palette.associate_alpha ? kCacheEntries : (1 << 18));
   const std::size_t pixel_count = width * height;
   const std::size_t frames_sz = static_cast<std::size_t>(frames);
 
@@ -578,7 +631,12 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
       return "upload of the colour tree failed";
     }
   }
-  if (cudaMalloc(&scratch.cache,
+  // 67,108,864 B per frame with associate_alpha -- 1 GiB at --frames 16 -- so this is
+  // also the largest single allocation on the path, and it is the one --no-cache
+  // removes.  `scratch.cache` stays null when caching is off, which Release() and the
+  // kernel's own `use_cache` guard both handle.
+  if (use_cache &&
+      cudaMalloc(&scratch.cache,
                  static_cast<std::size_t>(cache_entries) * frames_sz *
                      sizeof(int)) != cudaSuccess) {
     scratch.Release();
@@ -607,7 +665,14 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
   // uninitialised device memory.  The old single-buffer code got this right by
   // accident -- it uploaded into the same buffer it downloaded from, so the copy
   // round-tripped the input unchanged.  Leaving `pixels` alone is those same bytes.
-  // A 1x1 image lands here, and it is the only geometry that does.
+  // A 1x1 image lands here, and it is the only geometry that does: level is
+  // ceil(log2(max(width, height))), so level <= 0 means max(width, height) <= 1.
+  //
+  // NOTE the contrast with the CLOSED FORM, which is not this code: BuildCurveIndex
+  // enumerates n in [0, 4^L-1) and appends a hardcoded origin, so it leaves
+  // (2^L-1, 0) unvisited and re-visits (0,0) instead.  The recursion above does the
+  // opposite and covers the grid exactly.  Same project, two curves, one of them short
+  // a pixel; see the long note at the launch site and tools/probe-unvisited-pixel.ps1.
   //
   // The Release() is load-bearing and was missed when this guard was added: by this
   // point all eight allocations are live, and with associate_alpha the memo cache
@@ -626,6 +691,39 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
     return "upload of the source frame failed";
   }
 
+  // NO SEEDING OF `dst` IS NEEDED, and adding it would be a wrong fix for a bug this
+  // path does not have.  Recorded because the argument for it is very nearly correct
+  // and is made in a neighbouring file.
+  //
+  // The claim: the walk covers cells 0 .. 4^level-2, so the grid's last cell
+  // (2^level-1, 0) is never visited, and since `dst` is a fresh cudaMalloc that pixel
+  // comes back as uninitialised device memory.  That claim is TRUE of
+  // BuildCurveIndex (rd_riemersma_cpu.cpp:245) -- the CLOSED FORM -- and false of the
+  // recursion this kernel runs.  Both were evaluated, exhaustively rather than by
+  // reading, and they differ:
+  //
+  //   * Closed form, n in [0, 4^L-1) plus the literal `out->push_back(0)` at :308:
+  //     covers every cell except (2^L-1, 0), and then visits the ORIGIN a second time.
+  //     One cell short.  That is the blocks/opencl path, and the missing pixel is real
+  //     there -- see tools/probe-unvisited-pixel.ps1, which exists for it.
+  //   * This kernel's recursion: the leaves cover 4^L - 1 DISTINCT cells and the
+  //     resting cursor is exactly the one cell they miss, (2^L-1, 0) -- measured at
+  //     levels 1, 6, 10 and 11, where leaves+trailing covered 4, 4096, 1048576 and
+  //     4194304 cells against 4^L each, i.e. the whole grid.  The trailing
+  //     RiemersmaDither(ForgetGravity) visit at the bottom of this kernel is what
+  //     covers it.
+  //
+  // ImageMagick agrees with the recursion and not with the closed form: on a 64x64
+  // image of 64 distinct greys spanning 0..255 across the width,
+  // `magick -colors 16 -dither Riemersma` changed 4096 of 4096 pixels -- (63,0)
+  // included, 255 -> 240 -- and its output held 10 distinct colours.  So the
+  // recursion's coverage is the correct one, and a seeding copy here would have
+  // "fixed" a defect that does not exist on this path while leaving the real one --
+  // in BuildCurveIndex -- untouched.
+  //
+  // The trailing visit is guarded by the same in-bounds test as every other visit, so
+  // when (2^L-1, 0) is outside the image -- which is the 1920x1080 case, 2047 >= 1920 --
+  // nothing is written there and nothing needs to be: it is not part of the frame.
   const int threads = frames < 256 ? frames : 256;
   const int blocks = static_cast<int>((frames + threads - 1) / threads);
   RiemersmaWalkKernel<<<blocks, threads, 0, nullptr>>>(
@@ -633,7 +731,8 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
       static_cast<int>(width), static_cast<int>(height), level,
       scratch.nodes, scratch.palette, palette.count, scratch.weights,
       params.diffusion, palette.associate_alpha ? 1 : 0, scratch.cache,
-      cache_entries, scratch.error_state, scratch.frame_state, frames);
+      cache_entries, use_cache ? 1 : 0, scratch.error_state, scratch.frame_state,
+      frames);
 
   const cudaError_t launch = cudaGetLastError();
   if (launch != cudaSuccess) {

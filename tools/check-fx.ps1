@@ -86,8 +86,22 @@ foreach ($m in [regex]::Matches($raw, '(?s)<[^<>]*ui_type[^<>]*>')) {
 }
 
 # 1b. `compile` is fxc effect syntax; Reshade's parser rejects it outright.
-if ($raw -match '(?m)^\s*(VertexShader|PixelShader)\s*=\s*compile\b') {
-  $line = ($raw.Substring(0, $Matches[0].Index) -split "`n").Count
+#
+# This rule used `-match` plus `$Matches[0].Index`.  $Matches holds the matched TEXT,
+# not a Match object, so `.Index` on a string is $null, `Substring(0, $null)` becomes
+# `Substring(0, 0)`, and "" splits into exactly one element -- so this rule reported
+# "line 1" for every violation it has ever found, in any file.  The other three rules
+# below read `$m.Index` off a real Match from [regex]::Matches, which is why only this
+# one was wrong: one rule reaching for the offset by a different mechanism.
+#
+# Measured: planting `PixelShader = compile ps_RDither();` on line 426 of a 430-line
+# shader printed "line 1: 'compile' in the technique block".  A defect report that
+# names the wrong line is a false claim about the reader's own file, and it was false
+# in every run.  [ \t]*, not \s*: .NET's \s spans newlines, so `\s*` after `^` can
+# consume whole lines and move the match start; harmless once the offset comes from a
+# Match, but wrong, and it would mislead the next edit here.
+foreach ($m in [regex]::Matches($raw, '(?m)^[ \t]*(VertexShader|PixelShader)[ \t]*=[ \t]*compile\b')) {
+  $line = ($raw.Substring(0, $m.Index) -split "`n").Count
   $violations += "line ${line}: 'compile' in the technique block -- fxc syntax, rejected by Reshade; name the entry point directly"
 }
 
@@ -104,14 +118,36 @@ foreach ($m in [regex]::Matches($raw, '(?s)\{[^}]*\bTexture\b\s+[^;=]+;')) {
   $line = ($raw.Substring(0, $m.Index) -split "`n").Count
   $violations += "line ${line}: '{ Texture X; }' needs an EQUALS -- the form this install uses is '{ Texture = texLUT; }'"
 }
-foreach ($m in [regex]::Matches($raw, '(?m)^\s*sampler\s+(\w+)\s*(?::\s*\w+\s*)?;')) {
+foreach ($m in [regex]::Matches($raw, '(?m)^[ \t]*sampler[ \t]+(\w+)[ \t]*(?::[ \t]*\w+[ \t]*)?;')) {
   $line = ($raw.Substring(0, $m.Index) -split "`n").Count
   $violations += "line ${line}: bare 'sampler $($m.Groups[1].Value);' -- use ReShade::BackBuffer from ReShade.fxh instead"
 }
 
 # 1d. The 2.x screen-size names.  ReShade 3.x calls these BUFFER_*.
+#
+# The guard was `(?!.*//)`, which asserts that the symbol is not preceded by `//`
+# ANYWHERE ON THE LINE -- including in a trailing comment.  That is much broader than
+# the intent, and it disables the rule for real code.  Measured on this file with
+# `float w2 = BACKBUFFER_WIDTH; // 2.x spelling` inserted before the technique:
+#
+#   (?m)^(?!.*//).*BACKBUFFER_WIDTH\b   matches 0 lines
+#   (?m)^.*BACKBUFFER_WIDTH\b          matches 2 lines
+#
+# The rule below skips only lines that ARE comments -- leading `//` or `/*` -- which is
+# what it has to do, because this shader's own header documents all four traps in `//`
+# comments and quotes the forbidden spellings verbatim.  Verified by planting each
+# violation: the four rules fire on a planted `compile`, a braced sampler without an
+# equals, a bare `sampler X : SAMPLER0;`, and `BACKBUFFER_WIDTH` both on its own line
+# and after code on a line with a trailing comment.
+#
+# The old guard was not merely redundant.  It is why the trailing-comment case reached
+# dxc at all: on a machine with a Windows SDK the shader still fails to compile ("use
+# of undeclared identifier 'BACKBUFFER_WIDTH'", exit 1), so the defect was caught by
+# stage 2 -- and stage 2 is skipped, with exit 2, on every machine without one, where
+# the violation would then ship.  A rule that only works on the machines that happen
+# to have a compiler is not a rule.
 foreach ($sym in @('BACKBUFFER_WIDTH', 'BACKBUFFER_HEIGHT')) {
-  foreach ($m in [regex]::Matches($raw, "(?m)^(?!.*//).*\b$sym\b")) {
+  foreach ($m in [regex]::Matches($raw, "(?m)^[ \t]*(?!//)(?!/\*)(?!.*\*\/).*\b$sym\b")) {
     $line = ($raw.Substring(0, $m.Index) -split "`n").Count
     $violations += "line ${line}: '$sym' is the 2.x spelling; ReShade 3.x provides BUFFER_WIDTH / BUFFER_HEIGHT"
   }

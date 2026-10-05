@@ -556,6 +556,24 @@ int CountNeutralPaletteEntries(const Palette& palette, double threshold) {
 // shutdown path, which closes the encoder's stdin and lets ffmpeg finalise.
 std::atomic<bool> g_interrupted{false};
 
+// Set when a HOST dither worker refuses a batch -- the >256-colour check, or a
+// degenerate geometry.  Distinct from an interrupt, because an interrupt is a user
+// action and exits on whatever grounds the user chose, while this is a defect and must
+// make the process fail.  Written at most once per process (guarded by its own CAS at
+// the write site) because every host worker would otherwise race to report it.
+std::mutex g_host_dither_error_mu;
+std::string g_host_dither_error;
+
+void SetHostDitherError(const std::string& what) {
+  std::lock_guard<std::mutex> lock(g_host_dither_error_mu);
+  if (g_host_dither_error.empty()) g_host_dither_error = what;
+}
+
+const std::string& HostDitherError() {
+  std::lock_guard<std::mutex> lock(g_host_dither_error_mu);
+  return g_host_dither_error;
+}
+
 extern "C" BOOL WINAPI ConsoleHandler(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
       type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
@@ -1720,37 +1738,117 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // and gets the punchier palette for free, so the default follows it.
   const bool palette_8bit = opt.palette_depth != 16;
   const std::size_t raw_px = pixels * 4;
-  std::vector<std::uint16_t> raw16(raw_px);
+  // Only the buffer the requested depth actually decodes into.  Both were
+  // allocated unconditionally, so the default 8-bit run carried a 16,589,440 B
+  // uint16 buffer it never read -- and on the by-seek path one PER WORKER, six of
+  // them, 99.5 MB, for the same reason.  `palette_8bit` is fixed above, before
+  // either is reached, so this cannot change which of the two a sample lands in.
+  std::vector<std::uint16_t> raw16;
+  if (!palette_8bit) raw16.resize(raw_px);
   std::vector<std::uint8_t> raw8(raw_px);
-  std::vector<RgbaF> frame(pixels);
 
-  // Places one decoded sample into its montage cell.  Factored out because the
-  // parallel seek path below needs the same placement without the shared `frame`.
-  auto place_frame = [&](int s, const RgbaF* src) {
+  // One decoded sample pixel -> RgbaF.  The identical arithmetic to the two
+  // full-frame widening loops this replaces, kept in one place because the tile
+  // path now calls it per PLACED pixel and the full-frame path per pixel.
+  auto widen = [&](const std::uint8_t* p8, const std::uint16_t* p16, RgbaF* dst) {
+    if (p8 != nullptr) {
+      dst->r = static_cast<float>(p8[0]) * 257.0f;
+      dst->g = static_cast<float>(p8[1]) * 257.0f;
+      dst->b = static_cast<float>(p8[2]) * 257.0f;
+      dst->a = static_cast<float>(p8[3]) * 257.0f;
+      return;
+    }
+    dst->r = static_cast<float>(p16[0]);
+    dst->g = static_cast<float>(p16[1]);
+    dst->b = static_cast<float>(p16[2]);
+    dst->a = static_cast<float>(p16[3]);
+  };
+
+  // Places one decoded sample into its montage cell, WIDENING AS IT PLACES.
+  //
+  // This was two steps: widen the whole 2,073,600-pixel frame into an RgbaF
+  // buffer (33,177,600 B, 16 B/px), then copy the cell out of it.  At the default
+  // 128 px tile that is the wrong shape by a factor of 127 -- the cell is 16,384
+  // pixels, so 99.21% of what the widening wrote was never read.  And this is a
+  // SERIAL stage that gates the entire render, before the main reader has decoded
+  // a frame, so the traffic is latency added in front of the job rather than
+  // throughput lost inside it.
+  //
+  // Per sample at 1920x1080, counting bytes read plus bytes written:
+  //
+  //   tile 128 (the default), 256 samples, cell 16,384 px = 262,144 B of RgbaF:
+  //     before  raw8 8,294,400 + frame 33,177,600 + frame 262,144
+  //             + montage 262,144                               = 41,996,288 B
+  //     after   raw8    65,536 + montage 262,144                =    327,680 B
+  //     saving  41,668,608 B per sample; 10,667,163,648 B over 256 samples,
+  //             10,173.00 MiB
+  //
+  //   --palette-tile 0 (full resolution), 32 samples -- what the 64 Mpixel cap
+  //   binds at 1080p, cell 2,073,600 px:
+  //     before  raw8 8,294,400 + frame 33,177,600 + frame 33,177,600
+  //             + montage 33,177,600                            = 107,827,200 B
+  //     after   raw8 8,294,400 + montage 33,177,600             =  41,472,000 B
+  //     saving  66,355,200 B per sample; 2,123,366,400 B over 32 samples,
+  //             2,025.00 MiB
+  //
+  // Two caveats on those numbers, both stated rather than rounded away.  First,
+  // they are byte counts, and the tile path's 16,384 reads are STRIDED, so in
+  // cache lines they cost up to 16,384 x 64 B rather than 16,384 B on the source
+  // side; that puts the saving on the default geometry nearer 9,933.00 MiB than
+  // 10,173.00 MiB, and it moves in the direction of the change rather than against
+  // it (the same lines were being pulled into the 33 MB frame before).  Second,
+  // the scattered reads land in an 8,294,400 B buffer instead of a 33,177,600 B
+  // one, so the working set per worker shrinks by 75%.
+  //
+  // OUTPUT-PRESERVING, and by arithmetic rather than by argument: every value
+  // written is `float(raw) * 257.0f` at 8-bit depth or `float(raw)` at 16 -- one
+  // float multiply or one float cast either way, exactly as the loops it replaces
+  // did -- from the same source byte, at the same (sx, sy) the lattice picks, into
+  // the same cell offset.  Nothing else read `frame`: the quantizer is handed
+  // `montage.data()`, and the diagnostic dump at RD_DUMP_MONTAGE dumps the montage.
+  auto place_raw = [&](int s, const std::uint8_t* src8,
+                       const std::uint16_t* src16) {
     const int cx = s % cols;
     const int cy = s / cols;
     if (tile <= 0) {
+      // Full resolution is a straight row copy; it stays one, and the widening
+      // simply happens on the way through instead of beforehand.
       for (int y = 0; y < cell_h; ++y) {
-        const RgbaF* row = src + static_cast<std::size_t>(y) * info.width;
+        const std::size_t base = static_cast<std::size_t>(y) * info.width;
         RgbaF* dst = montage.data() +
                      (static_cast<std::size_t>(cy) * cell_h + y) * montage_w +
                      static_cast<std::size_t>(cx) * cell_w;
-        std::copy(row, row + info.width, dst);
+        if (src8 != nullptr) {
+          const std::uint8_t* row = src8 + 4 * base;
+          for (int x = 0; x < cell_w; ++x) {
+            widen(row + 4 * static_cast<std::size_t>(x), nullptr, dst + x);
+          }
+          continue;
+        }
+        const std::uint16_t* row = src16 + 4 * base;
+        for (int x = 0; x < cell_w; ++x) {
+          widen(nullptr, row + 4 * static_cast<std::size_t>(x), dst + x);
+        }
       }
       return;
     }
     for (int ty = 0; ty < cell_h; ++ty) {
       const int sy =
           static_cast<int>(static_cast<std::int64_t>(ty) * info.height / cell_h);
-      const RgbaF* row = src + static_cast<std::size_t>(sy) * info.width;
       const std::size_t fy =
           static_cast<std::size_t>(cy) * cell_h + static_cast<std::size_t>(ty);
+      const std::size_t row_base = static_cast<std::size_t>(sy) * info.width;
       RgbaF* dst = montage.data() + fy * montage_w +
                    static_cast<std::size_t>(cx) * cell_w;
       for (int tx = 0; tx < cell_w; ++tx) {
         const int sx =
             static_cast<int>(static_cast<std::int64_t>(tx) * info.width / cell_w);
-        dst[tx] = row[sx];
+        const std::size_t o = row_base + static_cast<std::size_t>(sx);
+        if (src8 != nullptr) {
+          widen(src8 + 4 * o, nullptr, dst + tx);
+        } else {
+          widen(nullptr, src16 + 4 * o, dst + tx);
+        }
       }
     }
   };
@@ -1788,9 +1886,12 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     pool.reserve(static_cast<std::size_t>(workers));
     for (int wi = 0; wi < workers; ++wi) {
       pool.emplace_back([&]() {
+        // The pipe buffers, and nothing else: the widening that used to fill an
+        // `lf` here now happens straight into the montage cell (place_raw), so
+        // six workers no longer each carry a 33,177,600 B RgbaF frame.
         std::vector<std::uint8_t> l8(static_cast<std::size_t>(pixels) * 4);
-        std::vector<std::uint16_t> l16(static_cast<std::size_t>(pixels) * 4);
-        std::vector<RgbaF> lf(static_cast<std::size_t>(pixels));
+        std::vector<std::uint16_t> l16;
+        if (!palette_8bit) l16.resize(static_cast<std::size_t>(pixels) * 4);
         for (;;) {
           const int s = next_sample.fetch_add(1);
           if (s >= want) return;
@@ -1811,22 +1912,14 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
           bool full = false;
           if (palette_8bit) {
             full = one.Read(l8.data(), l8.size()) == l8.size();
-            if (full) {
-              for (std::size_t i = 0; i < pixels; ++i) {
-                lf[i].r = static_cast<float>(l8[4 * i + 0]) * 257.0f;
-                lf[i].g = static_cast<float>(l8[4 * i + 1]) * 257.0f;
-                lf[i].b = static_cast<float>(l8[4 * i + 2]) * 257.0f;
-                lf[i].a = static_cast<float>(l8[4 * i + 3]) * 257.0f;
-              }
-            }
           } else {
             full = one.Read(l16.data(), l16.size() * sizeof(std::uint16_t)) ==
                    l16.size() * sizeof(std::uint16_t);
-            if (full) RawToFloats(l16.data(), lf.data(), pixels, 4);
           }
           one.Close();
           if (!full) continue;
-          place_frame(s, lf.data());
+          place_raw(s, palette_8bit ? l8.data() : nullptr,
+                    palette_8bit ? nullptr : l16.data());
           placed[static_cast<std::size_t>(s)] = 1;
           // Progress from whichever worker happens to finish, which is the
           // point: with six concurrent seeks the completions arrive out of
@@ -1853,9 +1946,10 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
       if (!placed[static_cast<std::size_t>(sampled)]) break;
     }
     if (std::getenv("RD_TRACE") != nullptr) {
-      std::fprintf(stderr, "\r[palette] %d/%d samples by seek, %.1f ms/frame elapsed %.1f s   ",
-                   sampled, want, decode_ms / std::max(1, sampled),
-                   decode_ms / 1000.0);
+      std::fprintf(stderr,
+                   "\r[palette] %d/%lld samples by seek, %.1f ms/frame elapsed %.1f s   ",
+                   sampled, static_cast<long long>(want),
+                   decode_ms / std::max(1, sampled), decode_ms / 1000.0);
       std::fflush(stderr);
     }
   }
@@ -1865,19 +1959,8 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     std::size_t got = 0;
     if (palette_8bit) {
       got = child.Read(raw8.data(), raw8.size());
-      if (got == raw8.size()) {
-        for (std::size_t i = 0; i < pixels; ++i) {
-          frame[i].r = static_cast<float>(raw8[4 * i + 0]) * 257.0f;
-          frame[i].g = static_cast<float>(raw8[4 * i + 1]) * 257.0f;
-          frame[i].b = static_cast<float>(raw8[4 * i + 2]) * 257.0f;
-          frame[i].a = static_cast<float>(raw8[4 * i + 3]) * 257.0f;
-        }
-      }
     } else {
       got = child.Read(raw16.data(), raw16.size() * sizeof(std::uint16_t));
-      if (got == raw16.size() * sizeof(std::uint16_t)) {
-        RawToFloats(raw16.data(), frame.data(), pixels, 4);
-      }
     }
     decode_ms += NowMs() - d0;
     if (got != (palette_8bit ? raw8.size() : raw16.size() * sizeof(std::uint16_t))) {
@@ -1896,7 +1979,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     // neither tracked a human sense of time.  It also ignored --quiet.
     progress.Update(sampled + 1);
 
-    // Full resolution is a straight copy; a tile is a lattice sample.
+    // Full resolution is a straight copy; a tile is a lattice sample.  Both widen
+    // from the decoder's own bytes as they place, so the montage never sees an
+    // intermediate full-resolution frame -- see place_raw.
     //
     // The tile used to be a box average, with a comment claiming that "keeps the
     // palette representative".  That is backwards: averaging distinct hues pulls
@@ -1907,7 +1992,8 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     // to reason about and measurably better: 16-colour mean saturation on an
     // 80%-grey clip went 48.8% (tile 256 lattice) -> 52.0% (tile 128) -> 74.6%
     // (full resolution).
-    place_frame(sampled, frame.data());
+    place_raw(sampled, palette_8bit ? raw8.data() : nullptr,
+              palette_8bit ? nullptr : raw16.data());
   }
   child.Close();
   if (sampled == 0) {
@@ -2335,6 +2421,13 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // throughput number that looked like a win.  Both symptoms, one wrong constant.
   const std::size_t out_frame_bytes =
       out_yuv444 ? pixels * 3 : pixels * 4 * sizeof(std::uint16_t);
+  // The same rounding-up as in16_elems_for, for the same reason and the same reason
+  // it is needed at all here: `pixels * 3 / 2` is not integral for an odd pixel
+  // count, and truncating would leave the last frame's final byte outside the
+  // allocation.  Round UP, so the buffer is never short by one byte.
+  const auto out16_elems_for = [&](int frames) {
+    return (static_cast<std::size_t>(frames) * out_frame_bytes + 1) / 2;
+  };
 
   Child decoder;
   // Segment start.  Deliberately *not* an input seek: `-ss` before -i snaps to a
@@ -2996,16 +3089,32 @@ bool VideoProcess(const std::string& in, const std::string& out,
       // by a byte a frame.  The output is out_frame_bytes: 3 per pixel for the default
       // planar yuv444p, 8 for rgba64le.
       //
-      // NOTE the pinned size here is not the size of the buffer the reader strides by
-      // when the allocation FAILS: the pageable fallback below is sized in whole
-      // pixels * 4 uint16 (8 B/px) regardless of out_frame_bytes.  On the default
-      // yuv444 output that fallback is 2.67x larger than the pinned buffer it stands
-      // in for, so the budget's 3 B/px under-states it.  That is safe in the direction
-      // that matters -- a failed pinned allocation happens when memory is already short,
-      // and b.pixels' 16 B/px dominates -- but it is a real gap and the honest fix is
-      // to size the fallback from out_frame_bytes too.  Left alone because it changes
-      // an allocation size on a path that has already produced one silent zero-frame
-      // bug (see the comment below).
+      // The PAGEABLE fallback is now sized from out_frame_bytes as well, which closes
+      // the gap this note used to leave open.  It was `batch * pixels * 4 uint16`
+      // -- 8 B/px -- regardless of the output format, so on the default planar
+      // yuv444p output it held 265,420,800 B per slot where the pinned buffer it
+      // stands in for holds 99,532,800 B: 165,888,000 B and 158.22 MiB per slot
+      // of pure over-allocation, on the path that runs precisely when memory is
+      // already short.  The budget counted the true 3 B/px, so the reported queue
+      // was never wrong -- the process just held more than it said.
+      //
+      // It was left alone out of fear of the silent zero-frame bug below, which is
+      // a fair reason to be careful here and not a reason to keep 2.67x.  What makes
+      // this safe is that `batch * out_frame_bytes` is not a new bound: it is the
+      // size the PINNED buffer has always been allocated at, in production, on
+      // every run.  And every consumer of `out()` is inside that bound, which is
+      // what was actually needed to be shown rather than assumed:
+      //
+      //   * both engines, and RiemersmaBlocksCpu, write one out_frame_bytes per
+      //     frame -- `emit_yuv444` is set from `out_yuv444` at the call site;
+      //   * FloatsToYuv444Parallel writes pixels*3, which IS out_frame_bytes when
+      //     out_yuv444, and FloatsToRawParallel writes pixels*8, which IS
+      //     out_frame_bytes when !out_yuv444 -- so the two writers agree with the
+      //     one constant either way;
+      //   * the writer pipes frames * out_frame_bytes.
+      //
+      // So nothing in this file reads or writes a byte of b.out16 past
+      // batch * out_frame_bytes, in any configuration.
       const std::size_t in_bytes = static_cast<std::size_t>(batch) * in_frame_bytes;
       const std::size_t out_bytes =
           static_cast<std::size_t>(batch) * out_frame_bytes;
@@ -3033,11 +3142,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
         b.in16.resize(in16_elems_for(batch));
       }
       if (b.out16_pin == nullptr) {
-        b.out16.resize(static_cast<std::size_t>(batch) * pixels * 4);
+        b.out16.resize(out16_elems_for(batch));
       }
     } else {
       b.in16.resize(in16_elems_for(batch));
-      b.out16.resize(static_cast<std::size_t>(batch) * pixels * 4);
+      b.out16.resize(out16_elems_for(batch));
     }
   }
   std::deque<int> free_slots;
@@ -3245,7 +3354,16 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // host workers dithered a zero-initialised buffer: measured mean R 56.37
         // against 120.74 for the same clip with the default `--cpu-threads 0`, and
         // byte-identical for N=1 and N=4.  Silently, deterministically, exit 0.
-        if (!use_gpu || opt.gpu_float_out || cpu_threads > 0) {
+        //
+        // It now reads `host_touches_pixels` rather than re-spelling the three
+        // disjuncts, because it WAS re-spelling them.  That predicate is documented
+        // as "declared once ... so the figure reported and the memory actually taken
+        // cannot drift apart", and this second copy is exactly the drift it exists to
+        // prevent -- two sites to edit, one of which the note above never mentions,
+        // and a mismatch here is not a slow path but a black or garbage frame.  The
+        // two conditions are equal today; the duplication is the defect, not the
+        // value.
+        if (host_touches_pixels) {
           if (use_yuv444) {
             // Planar 8-bit, three BYTES per pixel.  RawToFloats would read this as
             // uint16 and land on frame f-1's chroma planes, which is right for frame 0
@@ -3434,11 +3552,42 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // planar YUV bytes, it would reinterpret 3 B/px as 16 B/px and produce garbage
         // with no error, which is the failure mode the note above the writer's convert
         // describes for the --gpu-float-out case.
+        //
+        // raw_written is set ONLY on success.  It used to be set unconditionally, and
+        // that was a silent wrong encode: RiemersmaBlocksCpu returns void, so a refusal
+        // (the >256-colour check, or frames < 1) returned without writing b.out(), and
+        // raw_ready then told the writer to skip its convert -- so the encoder received
+        // whatever the PREVIOUS batch left in that buffer.  Right frame count, right
+        // palette, plausible picture, wrong pixels.
+        std::string cpu_err;
         RiemersmaBlocksCpu(palette, params, tree, info.width, info.height,
                            b.pixels.data(), b.frames, std::max(16, opt.block),
                            reinterpret_cast<unsigned char*>(b.out()), pixels,
-                           out_yuv444);
-        raw_written = true;
+                           out_yuv444, &cpu_err);
+        if (!cpu_err.empty()) {
+          // Hard stop, not a note.  Reported once per process because this runs on
+          // every host worker on every batch.
+          //
+          // NOTE: no `return` here.  An early return skips the worker's normal exit
+          // path -- the slot is never returned to free_slots and cv_done is never
+          // signalled -- so the writer waits on a condition variable that will never be
+          // met.  That showed up as 0xC0000409, a fail-fast, which is louder than the
+          // bug but is still the wrong shape of failure.  Falling through lets the
+          // worker clean up after itself; the pipeline then unwinds through
+          // g_interrupted, and VideoProcess returns non-zero because of the recorded
+          // error below.
+          static std::atomic<bool> cpu_err_reported{false};
+          bool expected = false;
+          if (cpu_err_reported.compare_exchange_strong(expected, true)) {
+            std::fprintf(stderr, "error: host dither failed: %s\n", cpu_err.c_str());
+          }
+          SetHostDitherError(cpu_err);
+          g_interrupted.store(true);
+          // raw_written deliberately stays FALSE: this batch has no valid fused output,
+          // so the writer must not be told the bytes are there.
+        } else {
+          raw_written = true;
+        }
       }
       const double dt = NowMs() - t0;
       {
@@ -3702,6 +3851,16 @@ bool VideoProcess(const std::string& in, const std::string& out,
                "engine line above.";
     }
     return false;
+  }
+
+  if (!HostDitherError().empty()) {
+    // A host worker refused a batch.  The pipeline has already been told to unwind, and
+    // the frames it did produce are not a complete render, so the caller must be able
+    // to tell that apart from success.  Without this the run reported a plausible
+    // summary and exit 0 over a partial encode.
+    std::fprintf(stderr, "error: %s\n", HostDitherError().c_str());
+    if (result != nullptr) result->frames = 0;
+    return result;
   }
 
   if (result != nullptr) {

@@ -221,7 +221,14 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         // fused path and restores the old two-step behaviour exactly.
                         unsigned char* raw_out = nullptr,
                         std::size_t out_pixels = 0,
-                        bool out_yuv444 = true);
+                        bool out_yuv444 = true,
+                        // Error channel, same convention as the two GPU engines: written
+                        // only on failure, never on success, and a null pointer is
+                        // tolerated.  This exists because the function returns void, so a
+                        // refusal used to leave the caller believing the fused output had
+                        // been written when it had not -- and the caller then skipped its
+                        // convert and encoded the PREVIOUS batch's bytes.
+                        std::string* error_out = nullptr);
 
 // The Hilbert visit order for a frame, and the map from a pixel back to the visit
 // that owns it.  Exposed so a port of this engine to another accelerator (see

@@ -159,10 +159,66 @@ void Progress::DrawLocked() {
   // first unit includes one-off setup (a CUDA context, the first palette lookup,
   // the encoder's first keyframe), and dividing by that produces a number big
   // enough to be memorable and wrong.
+  //
+  // The rate is labelled with the window it divides by, and that label is not
+  // decoration.  Every figure on this line is a ratio of `done` to `elapsed`,
+  // and `elapsed` is measured from THIS bar's own construction -- so the rate
+  // describes only the span during which this bar existed.  The end-of-run
+  // summary in rd_cli.cpp divides by a total that includes work done before the
+  // first bar was ever constructed (the video palette stage, which is a serial
+  // prefix: VideoBuildPalette returns before VideoProcess -- and therefore before
+  // this bar -- is entered).  Those two rates are the same measurement over two
+  // different windows, and on the published 18001-frame run they read 55.6/s and
+  // 51.1/s: about 8% apart, both correct, neither saying which was which.
+  //
+  // Two properties are being asserted here and both are checkable by reading.  (1)
+  // `elapsed` is unchanged -- the rate is still done/elapsed, not
+  // done/(elapsed+something): no arithmetic was altered, only a word was added,
+  // so no existing number moved.  (2) The word names the window rather than
+  // claiming the number is better than the summary's: "since bar start" is a
+  // statement about this line's own denominator, and the summary's rate is
+  // labelled "palette included" over there.  Nothing here reconciles the two by
+  // fiat; the reader is told what each one divides by and can subtract.
+  //
+  // A bar is per-stage, so the qualifier is true for EVERY caller rather than only
+  // for the video one: there are two constructions in the tree (rd_video.cpp:1689
+  // "palette" and :3497 "video"), and each covers only its own stage.
+  //
+  // It costs 16 columns, and the truncation a few lines below makes that worth
+  // measuring rather than guessing.  For the line
+  //   "[video] 12345/18001 69%  55.6/s since bar start  eta 1m30s  5m23s elapsed  read 12400"
+  // (85 chars) the qualifier survives at console widths 60 and above, and is cut at 40
+  // -- where the ellipsis lands mid-phrase and reads as "55.6/s since ~".  So on a
+  // narrow console the label is absent, and the bar then reverts to exactly the
+  // ambiguity it was added to remove.  That is a real limit of this fix and it is not
+  // papered over: the summary line in rd_cli.cpp is not width-truncated at all, so
+  // the interval is always named there.  A shorter qualifier ("stage") would survive
+  // 40 columns and was rejected because "stage" names the caller rather than the
+  // denominator, and the denominator is the thing in question.
+  //
+  // The alternative -- seeding start_ms_ with the prior stage's cost -- would need a
+  // Progress API change (start_ms_ is private and set once in the constructor, and
+  // include/rd_progress.h is not this file's) and would be wrong besides: this bar
+  // does not exist during the palette, so charging it for that time would report
+  // work it never watched.  The ETA is deliberately left alone for the same reason --
+  // an ETA that included a fixed cost already spent would understate the time
+  // remaining by exactly that cost, which is a third inconsistent number in the one
+  // place where being wrong is immediately visible as the bar running late.
+  // See PrintVideoSummary in rd_cli.cpp for the matching label.
   if (done > 0.0) {
     const double rate = done / std::max(1e-9, elapsed);
-    char r[24];
-    std::snprintf(r, sizeof(r), "  %.1f/s", rate);
+    // 384, not 48.  `%.1f` of a double is 311 characters at DBL_MAX (measured,
+    // not estimated), and the floor on the divisor is 1e-9 while done_ is an
+    // int64_t, so `done_ / elapsed` has no small upper bound in principle: the
+    // longest value reachable from the int64 numerator is 30 characters, but
+    // nothing stops a caller reporting a done_ that has been through a lossy
+    // conversion, and 311 + 2 + 17 + NUL = 331 fits 384 with room either way.
+    // snprintf truncates rather than overflowing, so 48 was never a memory bug --
+    // it was a wrong-output bug: a truncated field reads as "  1.7.../s si" and the
+    // console-width trim further along cannot repair it, because by then the
+    // damage is inside the number.
+    char r[384];
+    std::snprintf(r, sizeof(r), "  %.1f/s since bar start", rate);
     line += r;
     if (total_ > 0 && done_ >= 8 && elapsed >= 0.5) {
       line += "  eta ";

@@ -265,6 +265,29 @@ if ($avail.Count -lt 2) {
   'cannot compare: only ' + $avail.Count + ' of 2 arms produced a usable run.'
   'A one-arm comparison has no delta, and printing one against a missing arm is how'
   'this script used to publish a figure built on an unparsed 0.0.'
+  #
+  # ...but this gate used to exit 2 unconditionally, which put it AHEAD of the $void
+  # gate at the end of the file -- the one place that knows the difference between a
+  # run that could not be measured and a run that FAILED.  Every rep dying on
+  # "rdither exited 1" satisfies this gate too, so a broken tool under test came out
+  # as exit 2, which verify.ps1 prints as SKIPPED: the run that measured nothing was
+  # reported as the run that was never attempted.  Measured, with -Clip pointing at a
+  # file that is not a video: both arms VOID[fail] "rdither exited 1", and this file
+  # exited 2.  tools\probe-cpubudget.ps1 has the same two gates in the other order and
+  # does not have this defect, which is what makes it the reference rather than a
+  # coincidence.
+  #
+  # So the shape problem is reported as the shape problem, and the failures under it
+  # decide the exit code, exactly as they do at the end of the file.
+  $hard = @($void | Where-Object { $_.Class -eq 'fail' })
+  if ($hard.Count -gt 0) {
+    ''
+    "FAILED: $($hard.Count) of $($Reps * $arms.Count) runs failed outright, so the arms"
+    'cannot be compared because they did not run -- that is a failure, not an'
+    'unavailable comparison, and it must not be reported as one.'
+    foreach ($v in $hard) { '  rep {0} {1,-7} {2}' -f $v.Rep, $v.Arm, $v.Why }
+    exit 1
+  }
   exit 2
 }
 

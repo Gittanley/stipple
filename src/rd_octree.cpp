@@ -213,7 +213,28 @@ void ColorTree::Build(const RgbaF* pixels, std::size_t width, std::size_t height
   nodes_.clear();
   colormap_.assign(kMaxColormapSize, PaletteEntry{});
   associate_alpha_ = associate_alpha;
-  maximum_colors_ = max_colors;
+  // quantize.c:QuantizeImage() clamps the count it is handed before anything reads it:
+  //
+  //   maximum_colors=quantize_info->number_colors;
+  //   if (maximum_colors == 0) maximum_colors=MaxColormapSize;
+  //   if (maximum_colors > MaxColormapSize) maximum_colors=MaxColormapSize;
+  //
+  // This is not defensive tidiness.  maximum_colors_ is compared against
+  // node_live_count_ through a static_cast<std::size_t>, and a value of 0 there makes
+  // EVERY node merge into its parent -- PruneChild's gate `nodes > maximum_colors` is
+  // `nodes > 0`, true for every node including the root's children -- so the tree
+  // collapses to a single colour.  A NEGATIVE value becomes SIZE_MAX, so the gate is
+  // false for every node and nothing is ever pruned; the reduce loop's
+  // `while (color_count_ > maximum_colors_)` is then true for any count >= 0 and the
+  // loop cannot terminate.  One place, before anything reads it, removes both.
+  //
+  // Unreachable today, and deliberately not treated as a live defect: rd_cli.cpp:831
+  // rejects --colors outside 2..kMaxColormapSize, and rd_video.cpp:1349 takes
+  // std::max(colors, palette_stage1_colors), so every call site passes at least 2.  It
+  // is here because the hazard is a HANG and an INFINITE LOOP rather than a wrong
+  // number, and because this is precisely the arithmetic upstream performs.
+  maximum_colors_ = (max_colors <= 0) ? kMaxColormapSize : max_colors;
+  if (maximum_colors_ > kMaxColormapSize) maximum_colors_ = kMaxColormapSize;
   node_live_count_ = 0;  // set to 1 below, once the root exists
   color_count_ = 0;
   pruning_threshold_ = 0.0;
@@ -221,8 +242,10 @@ void ColorTree::Build(const RgbaF* pixels, std::size_t width, std::size_t height
 
   // quantize.c:SetImageColormap(): depth = Log4(colormap size) + 2, minus one
   // when a dither method is selected, and MaxTreeDepth for greyscale input.
+  // maximum_colors_, NOT max_colors: upstream's loop reads the clamped value, so a
+  // caller passing 0 must give the same tree here as it does there.
   int depth = 1;
-  for (std::size_t colors = static_cast<std::size_t>(max_colors); colors != 0;
+  for (std::size_t colors = static_cast<std::size_t>(maximum_colors_); colors != 0;
        ++depth) {
     colors >>= 2;
   }
