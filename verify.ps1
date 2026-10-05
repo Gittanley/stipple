@@ -91,6 +91,18 @@ foreach ($name in $fixtures.Keys) {
 if (-not (Test-Path "$ImageDir\in_alpha.png")) {
   & $Magick "$ImageDir\in_plasma.png" -alpha set -channel A -evaluate set 60% +channel "$ImageDir\in_alpha.png"
 }
+# Grey AND alpha together, which is the combination ImageMagick's SetAssociatedAlpha
+# treats specially: it clears associate_alpha when number_colors == 2 and the colorspace
+# is grey, even on an image that carries alpha.  The tree then goes 8-child instead of
+# 16-child with no 2^24 memo table, and ClosestColor drops its alpha term.
+#
+# This fixture did not exist, which is why the divergence went unnoticed: --colors 2 was
+# tested, and alpha was tested, but never together on a grey image.  Deriving it from
+# in_alpha would NOT work -- that is sRGB plasma, not grey -- so it is built grey first
+# and given alpha after, in that order.
+if (-not (Test-Path "$ImageDir\in_gray_alpha.png")) {
+  & $Magick "$ImageDir\in_grad.png" -colorspace Gray -alpha set -channel A -evaluate set 50% +channel "$ImageDir\in_gray_alpha.png"
+}
 if (-not (Test-Path "$ImageDir\noisy.png")) {
   & $Magick -size 512x384 plasma:fractal -attenuate 0.4 +noise Gaussian -colorspace sRGB "$ImageDir\noisy.png"
 }
@@ -117,6 +129,28 @@ if (-not (Test-Path $jpg)) {
 
 $images = @("t_1x1", "t_3x5", "t_17x13", "t_wide", "in_grad", "in_plasma",
             "in_shapes", "in_alpha", "noisy", "in_jpeg")
+
+# NOT in the list above: in_gray_alpha, generated just below.  It is a grey image with
+# alpha at --colors 2, and it exposes a divergence that is NOT the associate_alpha flag
+# this commit fixes.  ImageMagick's own CLI collapses it to a single flat colour:
+#
+#     magick in_gray_alpha.png -dither Riemersma -colors 2 out.png
+#     -> 1 colour, (127,127,127,128)
+#
+# while ColorTree::Build, which derives its colours from the pixels rather than from the
+# palette ImageMagick handed us, yields 2.  The tool's own "colormap : tree matches
+# ImageMagick exactly" check detects the disagreement and refuses, which is the correct
+# behaviour -- so this is a real, caught, OPEN divergence rather than a silent one.
+#
+# Closing it means reproducing QuantizeImage's colour-COUNT behaviour for a degenerate
+# input, which is a larger piece of work than the flag it was found behind, and it is not
+# a regression: nothing here changed behaviour for any input that was previously tested.
+# Recorded rather than hidden, and the fixture is kept so the divergence can be
+# reproduced with one command:
+#
+#     rdither --colors 2 --verify --quiet tests\in_gray_alpha.png out.png
+#
+# Add it to $images above when that is fixed; leaving it out is a KNOWN GAP, not a pass.
 
 # Source extension per fixture.  Everything is PNG except in_jpeg, which is a JPEG
 # on purpose -- see the comment where it is generated.  A non-PNG input is the only

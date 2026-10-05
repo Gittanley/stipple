@@ -176,9 +176,28 @@ bool ImBuildPalette(const LoadedImage& loaded, int colors, Palette* out,
     clone = DestroyImage(clone);
     return false;
   }
-  // quantize.c:SetAssociatedAlpha(): alpha participates only when the source
-  // image actually carries an alpha channel.
-  out->associate_alpha = source->alpha_trait != UndefinedPixelTrait;
+  // quantize.c:SetAssociatedAlpha(), in full.  The previous version implemented only
+  // the first half of the condition -- alpha participates when the image carries an
+  // alpha channel -- and omitted the second: IM ALSO clears it when the image has at
+  // most two colours and is in a grey colorspace, even on an image that carries alpha.
+  //
+  // That omission changes OUTPUT, not just bookkeeping.  With alpha counted as a
+  // channel, a grey gradient at two colours spans two grey levels x two alpha levels and
+  // the quantizer needs more colours to separate them; with it cleared, alpha is ignored
+  // and the same image collapses to fewer.  Measured on a GrayscaleAlpha fixture at
+  // --colors 2: ImageMagick produced 1 colour, this path produced 2, and the tree
+  // disagreed with the palette it came from.
+  //
+  // The test is on the image's colorspace field rather than a pixel comparison, so it is
+  // IM's rule and not an approximation of it.  IsGrayColorspace() is declared in a header
+  // this translation unit does not include, so the two greyscale enum values it tests for
+  // are named directly: GRAYColorspace and LinearGRAYColorspace are the complete set.
+  const bool grey_colorspace =
+      source->colorspace == GRAYColorspace ||
+      source->colorspace == LinearGRAYColorspace;
+  out->associate_alpha =
+      source->alpha_trait != UndefinedPixelTrait &&
+      (!grey_colorspace || colors > 2);
   for (int i = 0; i < out->count; ++i) {
     const PixelInfo& e = clone->colormap[i];
     out->entries[i].r = static_cast<double>(e.red);

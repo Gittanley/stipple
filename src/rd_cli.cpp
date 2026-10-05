@@ -1437,6 +1437,25 @@ int main(int argc, char** argv) {
     const rd::RgbaF& p = store->data()[i];
     grayscale = (p.r == p.g) && (p.g == p.b);
   }
+  // ImageMagick's SetAssociatedAlpha clears associate_alpha when the image has at most
+  // two colours AND is in a grey colorspace, even when it carries alpha.  That decision
+  // is made ONCE, in ImBuildPalette (src/rd_im.cpp), because the palette and the tree
+  // must agree: with alpha counted as a channel the quantizer needs more colours to
+  // separate grey levels, so a palette built under one rule and a tree built under the
+  // other disagree about how many colours there are.
+  //
+  // It is NOT recomputed here.  An earlier version passed `image.has_alpha`
+  // unconditionally, which was the bug; a second version derived the rule from
+  // `r == g == b` over the decoded pixels, which fixed the tree and left the palette
+  // still using IM's half-rule.  Reading it off the palette makes the two agree by
+  // construction instead of by two implementations being kept in step.
+  const bool associate_alpha = palette->associate_alpha;
+  if (image.has_alpha && !associate_alpha) {
+    std::fprintf(stderr,
+                 "[dither] note: associate_alpha cleared -- at most 2 colours in a grey "
+                 "colorspace, matching ImageMagick's SetAssociatedAlpha. The tree is "
+                 "8-child rather than 16-child and carries no alpha term.\n");
+  }
   std::unique_ptr<rd::ColorTree> tree(new rd::ColorTree());
   if (!opt.palette_import.empty()) {
     // Reuse the tree ImReadPalette already built FROM the palette.  Rebuilding it
@@ -1448,7 +1467,7 @@ int main(int argc, char** argv) {
     tree = std::move(palette_tree);
   } else {
     tree->Build(store->data(), image.width, image.height, opt.colors,
-                image.has_alpha, grayscale);
+                associate_alpha, grayscale);
   }
   if (!opt.quiet) {
     std::printf("tree       : depth %d, %zu nodes, %d colours%s\n", tree->depth(),
