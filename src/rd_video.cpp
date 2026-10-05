@@ -2826,9 +2826,20 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // Pipeline's constructor: `use_gpu` is resolved further DOWN, in this function, and
   // the depth is not known until after the budget has been divided.
   const bool pinned_slots = use_gpu && !opt.gpu_float_out;
+  // ONE definition of "will anything read b.pixels", used by the budget here AND by
+  // the allocation further down.  They must agree: if the budget counted the float
+  // buffer while the allocation skipped it, the reported queue would be the depth the
+  // machine could not actually run, which is the over-commit direction.  It is
+  // under-claiming today rather than over-claiming, so this is a correctness fix and
+  // not a safety one -- but it is the whole reason the 4050 MiB reaches the queue.
+  //
+  // Names the RESOLVED engine.  use_gpu is settled at :2531 and cpu_threads at :2609,
+  // both above here.  c5efb68 was a crash because a neighbouring condition named the
+  // REQUESTED branch instead.
+  const bool host_touches_pixels = !use_gpu || opt.gpu_float_out || cpu_threads > 0;
   const std::size_t per_batch =
       static_cast<std::size_t>(batch) *
-      (pixels * sizeof(RgbaF) + in_frame_bytes +
+      ((host_touches_pixels ? pixels * sizeof(RgbaF) : 0) + in_frame_bytes +
        (pinned_slots ? out_frame_bytes
                      : pixels * 4 * sizeof(std::uint16_t)));
   // The page-locked part of that, for the reserve report.  Zero when the allocation is
@@ -2945,7 +2956,34 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // If they match, the allocation is droppable for OpenCL; if the CHECK_U16 run
     // differs, it is not, and that is a NULL DEREFERENCE risk rather than a slow path,
     // which is why this stays a note.
-    if (pipe.float_path()) b.pixels.resize(static_cast<std::size_t>(batch) * pixels);
+    // `b.pixels` is 16 B/px -- 506.25 MiB per slot at 1080p and batch 16, so 4050 MiB
+    // across a depth-8 queue.  It is only needed when something will actually READ it,
+    // and on the default GPU video path (GPU on, gpu_float_out off, no host workers)
+    // nothing does:
+    //
+    //   - the reader's widening into it is gated on `host_touches_pixels` (:2882)
+    //   - the writer's convert is gated on !raw_ready, and the GPU writes raw itself
+    //   - rd_blocks_cuda.cu:1001 allocates no device pixel buffer under
+    //     upload_u16 && emit_u16, so the pointer it is handed goes unread
+    //
+    // ESTABLISHED BY EXPERIMENT, not by reading the code.  Gating the allocation off
+    // and byte-comparing at 320x180: blocks and opencl produced IDENTICAL decoded md5
+    // both with and without it, including under RD_OCL_CHECK_U16=1, whose OpenCL path
+    // reads AND writes batch[i] and was the reason this was not simply assumed.  The
+    // negative control is what makes that meaningful -- the same gate on
+    // --gpu-float-out and on --engine cpu gives 0xC0000005, an access violation, so the
+    // experiment does detect a missing buffer.  tools/probe-host-oracle.ps1 and
+    // artifacts/pixels_probe.ps1 are that experiment.
+    //
+    // So the predicate names the RESOLVED engine, not the request.  That distinction
+    // has bitten this file before: c5efb68 was a crash because the condition named the
+    // requested branch.  use_gpu is resolved at :2531 and cpu_threads at :2609, both
+    // above this point, so all three inputs are known here.
+    // host_touches_pixels is declared once above, where the RAM budget uses it, so the
+    // figure reported and the memory actually taken cannot drift apart.
+    if (pipe.float_path() && host_touches_pixels) {
+      b.pixels.resize(static_cast<std::size_t>(batch) * pixels);
+    }
     if (pinned_slots) {
       // Page-locked, so the reader writes straight into memory the copy engine DMAs
       // from.  These bytes cannot be paged out.  `per_batch` above already counts them,
