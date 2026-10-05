@@ -208,7 +208,20 @@ std::string RiemersmaWalkCuda(const Palette& palette, const DitherParams& params
 void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         const ColorTree& tree, std::size_t width,
                         std::size_t height, RgbaF* batch, int frames,
-                        int block);
+                        int block,
+                        // Optional fused output.  When `raw_out` is non-null the
+                        // scatter writes encoder-ready bytes DIRECTLY from the palette
+                        // entry, instead of leaving an RgbaF behind for a separate
+                        // full-frame convert pass.  That deletes one whole pass over the
+                        // frame -- 16 B/px read plus 3 B/px written -- and with it the
+                        // scatter's own RgbaF write, since nothing reads that back.
+                        //
+                        // `out_pixels` is the per-frame pixel count, which is ALSO the
+                        // plane stride for the YUV444 layout; passing 0 disables the
+                        // fused path and restores the old two-step behaviour exactly.
+                        unsigned char* raw_out = nullptr,
+                        std::size_t out_pixels = 0,
+                        bool out_yuv444 = true);
 
 // The Hilbert visit order for a frame, and the map from a pixel back to the visit
 // that owns it.  Exposed so a port of this engine to another accelerator (see

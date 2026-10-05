@@ -1053,9 +1053,17 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
     // was measured across ten geometries rather than derived --
     //
     //     1920x1080  1280x720  768x1024  720x1280  640x360  854x480   ->  0
-    //     1024x768   1024x1024                                        ->  1 at (w-1, 0)
-    //     2048x2048                                                    ->  1 at (w-1, 0)
-    //     33x17                                                         ->  1 at (31, 0)
+    //     1024x768   1024x1024  2048x2048  4096x2160                  ->  1 at (w-1, 0)
+    //
+    // 4096x2160 is here and was not measured before: 4096 is a power of two, so it is
+    // in the break set and had no coverage.  And the row that used to claim
+    // "33x17 -> 1 at (31, 0)" is REMOVED because it cannot be reproduced.
+    // ComputeCurveLevel(33, 17) is ceil(log2(33)) = 6, so the missing cell is (63, 0),
+    // and 63 >= 33 puts it outside the image -- 33x17 has NO unvisited pixel.  (31,0)
+    // is the level-5 cell.  The probe agrees: it reports 33x17 among the geometries
+    // with none.  The general rule, derived rather than measured: the missing cell is
+    // (2^level - 1, 0), so it is in bounds exactly when `width` is a power of two AND
+    // width >= height.
     //
     // So FHD is clean and 1024x768 is not, which is why this went unnoticed: the
     // five-minute benchmark clip has none.  One cell is excluded, so the unvisited

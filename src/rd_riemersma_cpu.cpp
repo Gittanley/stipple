@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -379,6 +380,18 @@ struct CachedCurve {
   std::size_t height = 0;
   std::vector<int> index;
   std::vector<int> owner;
+  // Pixels the curve never visits -- `owner[p] < 0`.  A count AND a list, not an
+  // index, deliberately: the list is derived by scanning owner after the build, so it
+  // stays correct for however many gaps a future change to ComputeCurveLevel produces,
+  // including none.  Carrying a single index would silently under-fill the moment there
+  // were two.
+  //
+  // At the moment there is exactly one, at (2^level - 1, 0), and it lands inside the
+  // image only when width is a power of two AND width >= height -- so 1024x768,
+  // 1024x1024, 2048x2048 and 4096x2160 have one, and 1920x1080, 1280x720, 33x17 and
+  // the rest have none.  That is why a probe must assert this list rather than assume
+  // it is empty or has one element.
+  std::vector<std::int32_t> unvisited;
 };
 
 const CachedCurve& CachedCurveFor(int level, std::size_t width,
@@ -386,6 +399,10 @@ const CachedCurve& CachedCurveFor(int level, std::size_t width,
   static thread_local CachedCurve cache;
   if (cache.level != level || cache.width != width || cache.height != height) {
     BuildCurveIndex(level, width, height, &cache.index, &cache.owner);
+    cache.unvisited.clear();
+    for (std::size_t p = 0; p < cache.owner.size(); ++p) {
+      if (cache.owner[p] < 0) cache.unvisited.push_back(static_cast<std::int32_t>(p));
+    }
     cache.level = level;
     cache.width = width;
     cache.height = height;
@@ -396,7 +413,13 @@ const CachedCurve& CachedCurveFor(int level, std::size_t width,
 void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         const ColorTree& tree, std::size_t width,
                         std::size_t height, RgbaF* batch, int frames,
-                        int block) {
+                        int block, unsigned char* raw_out, std::size_t out_pixels,
+                        bool out_yuv444) {
+  // `raw_out != nullptr && out_pixels > 0` selects the fused output.  Everything below
+  // is written so the two paths produce identical bytes: the fused path reproduces the
+  // convert pass's arithmetic EXACTLY rather than approximately, including the places
+  // where that arithmetic looks like it could be simplified.
+  const bool fused = (raw_out != nullptr) && (out_pixels > 0);
   // `chosen` below is a std::vector<unsigned char>, so the palette index this
   // function hands to the scatter is truncated to 8 bits.  `--colors` accepts
   // up to kMaxColormapSize (65536, rd_cli.cpp), and the index is the winning
@@ -451,6 +474,23 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
   const std::vector<int>& owner = cached.owner;
   const int n = static_cast<int>(curve.size());
   const int nblocks = (n + block - 1) / block;
+  // Report the gaps in the same words the CUDA blocks engine uses, so one probe can
+  // assert both engines and the wording cannot drift between them.  The host has no
+  // BlkFillUnvisitedKernel equivalent: nothing here writes those pixels at all, they
+  // simply keep whatever the reader put in the frame -- which is the correct answer,
+  // and is why this is a note and not a warning.  Named because a count nobody can
+  // act on is only half an answer.
+  if (!cached.unvisited.empty()) {
+    std::fprintf(stderr,
+                 "[cpu] curve reaches %zu of %zu pixels; the %zu it does not "
+                 "reach keep their source value, which is what ImageMagick's own "
+                 "recursion leaves there.  First at index %d (%zu,%zu).  The "
+                 "uint16/yuv444 output path writes these explicitly.\n",
+                 width * height - cached.unvisited.size(), width * height,
+                 cached.unvisited.size(), cached.unvisited.front(),
+                 static_cast<std::size_t>(cached.unvisited.front()) % width,
+                 static_cast<std::size_t>(cached.unvisited.front()) / width);
+  }
   // Chosen index per visit position, exactly as the kernel's d_index buffer.
   // Storing it and scattering from it halves the octree work and is what makes
   // the host output match the device output.  thread_local so ten workers do not
@@ -517,11 +557,93 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
       const int pixel_index = curve[i];
       if (owner[pixel_index] != i) continue;
       const PaletteEntry& e = palette.entries[chosen[i]];
-      RgbaF& out = frame[pixel_index];
-      out.r = clamp_to_quantum(e.r);
-      out.g = clamp_to_quantum(e.g);
-      out.b = clamp_to_quantum(e.b);
-      if (palette.associate_alpha) out.a = clamp_to_quantum(e.a);
+      if (!fused) {
+        RgbaF& out = frame[pixel_index];
+        out.r = clamp_to_quantum(e.r);
+        out.g = clamp_to_quantum(e.g);
+        out.b = clamp_to_quantum(e.b);
+        if (palette.associate_alpha) out.a = clamp_to_quantum(e.a);
+        continue;
+      }
+      // Fused: FloatsToYuv444's arithmetic, on the same float the old path would have
+      // stored first.  `clamp_to_quantum` is a bare narrowing cast and the convert pass
+      // then did `static_cast<int>(that float) >> 8`, so this is bit-for-bit the same
+      // two operations in the same order -- not a shortcut around them.
+      const float fr = clamp_to_quantum(e.r);
+      const float fg = clamp_to_quantum(e.g);
+      const float fb = clamp_to_quantum(e.b);
+      unsigned char* o = raw_out + static_cast<std::size_t>(f) * out_pixels * 3;
+      if (out_yuv444) {
+        const int r8 = static_cast<int>(fr) >> 8;
+        const int g8 = static_cast<int>(fg) >> 8;
+        const int b8 = static_cast<int>(fb) >> 8;
+        const int yv = ((66 * r8 + 129 * g8 + 25 * b8 + 128) >> 8) + 16;
+        const int uv = ((-38 * r8 - 74 * g8 + 112 * b8 + 128) >> 8) + 128;
+        const int vv = ((112 * r8 - 94 * g8 - 18 * b8 + 128) >> 8) + 128;
+        o[pixel_index] = static_cast<unsigned char>(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+        o[out_pixels + pixel_index] =
+            static_cast<unsigned char>(uv < 0 ? 0 : (uv > 255 ? 255 : uv));
+        o[2 * out_pixels + pixel_index] =
+            static_cast<unsigned char>(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+      } else {
+        // FloatsToRaw's four uint16.  Alpha is NOT taken from the palette entry here:
+        // that pass read `src[i].a` out of the frame buffer, which for a visited pixel
+        // still holds whatever the reader put there.  With associate_alpha off the
+        // scatter never wrote .a, so the encoder has always received the SOURCE alpha
+        // here.  Reproducing that is deliberate -- changing it would change output, and
+        // the YUV444 writer ignores alpha entirely so the two writers cannot both be
+        // "fixed" in one change.
+        std::uint16_t* u = reinterpret_cast<std::uint16_t*>(raw_out) +
+                           static_cast<std::size_t>(f) * out_pixels * 4;
+        const RgbaF& src = frame[pixel_index];
+        u[4 * pixel_index + 0] = static_cast<std::uint16_t>(fr);
+        u[4 * pixel_index + 1] = static_cast<std::uint16_t>(fg);
+        u[4 * pixel_index + 2] = static_cast<std::uint16_t>(fb);
+        u[4 * pixel_index + 3] = palette.associate_alpha
+                                     ? static_cast<std::uint16_t>(clamp_to_quantum(e.a))
+                                     : static_cast<std::uint16_t>(src.a);
+      }
+    }
+
+    // The pixels the curve never reaches.  The scatter above is FILTERED by
+    // `owner[pixel_index] == i`, so it does not write them -- and the convert pass this
+    // fusion deletes used to cover them only because it swept the whole buffer.  So
+    // they must be written here, from the source value the reader left in `frame`,
+    // which is what ImageMagick's own recursion leaves there and what
+    // probe-unvisited-pixel.ps1 asserts.  Skipping this is the failure the fusion
+    // invites: stale heap on the first batch and the PREVIOUS batch's pixels after,
+    // which is the same shape as the bug at rd_blocks_cuda.cu:612.
+    //
+    // Driven off `cached.unvisited`, a list rather than an index, so a future
+    // ComputeCurveLevel that produces more than one gap cannot silently leave the rest
+    // unwritten.  Four measured geometries have exactly one (1024x768, 1024x1024,
+    // 2048x2048, 4096x2160); the other six have none.
+    if (fused) {
+      for (std::int32_t p : cached.unvisited) {
+        const std::size_t pixel_index = static_cast<std::size_t>(p);
+        const RgbaF& s = frame[pixel_index];
+        unsigned char* o = raw_out + static_cast<std::size_t>(f) * out_pixels * 3;
+        if (out_yuv444) {
+          const int r8 = static_cast<int>(clamp_to_quantum(s.r)) >> 8;
+          const int g8 = static_cast<int>(clamp_to_quantum(s.g)) >> 8;
+          const int b8 = static_cast<int>(clamp_to_quantum(s.b)) >> 8;
+          const int yv = ((66 * r8 + 129 * g8 + 25 * b8 + 128) >> 8) + 16;
+          const int uv = ((-38 * r8 - 74 * g8 + 112 * b8 + 128) >> 8) + 128;
+          const int vv = ((112 * r8 - 94 * g8 - 18 * b8 + 128) >> 8) + 128;
+          o[pixel_index] = static_cast<unsigned char>(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+          o[out_pixels + pixel_index] =
+              static_cast<unsigned char>(uv < 0 ? 0 : (uv > 255 ? 255 : uv));
+          o[2 * out_pixels + pixel_index] =
+              static_cast<unsigned char>(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+        } else {
+          std::uint16_t* u = reinterpret_cast<std::uint16_t*>(raw_out) +
+                             static_cast<std::size_t>(f) * out_pixels * 4;
+          u[4 * pixel_index + 0] = static_cast<std::uint16_t>(clamp_to_quantum(s.r));
+          u[4 * pixel_index + 1] = static_cast<std::uint16_t>(clamp_to_quantum(s.g));
+          u[4 * pixel_index + 2] = static_cast<std::uint16_t>(clamp_to_quantum(s.b));
+          u[4 * pixel_index + 3] = static_cast<std::uint16_t>(s.a);
+        }
+      }
     }
   }
 }

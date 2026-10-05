@@ -3388,8 +3388,19 @@ bool VideoProcess(const std::string& in, const std::string& out,
           return;
         }
       } else {
+        // Fused output: the scatter writes the encoder-ready bytes itself, so the
+        // writer's convert pass is deleted rather than run over a buffer nobody reads.
+        // raw_ready is what makes the writer skip it -- set it HERE, where the bytes
+        // were produced, not at the writer.  That ordering is the whole hazard: if the
+        // writer ran its convert over a buffer the scatter had already filled with
+        // planar YUV bytes, it would reinterpret 3 B/px as 16 B/px and produce garbage
+        // with no error, which is the failure mode the note above the writer's convert
+        // describes for the --gpu-float-out case.
         RiemersmaBlocksCpu(palette, params, tree, info.width, info.height,
-                           b.pixels.data(), b.frames, std::max(16, opt.block));
+                           b.pixels.data(), b.frames, std::max(16, opt.block),
+                           reinterpret_cast<unsigned char*>(b.out()), pixels,
+                           out_yuv444);
+        raw_written = true;
       }
       const double dt = NowMs() - t0;
       {
