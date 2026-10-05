@@ -163,9 +163,16 @@ $engines = @(
 
 # An engine this build cannot run makes its cases unaskable, not failed.  Without
 # this, `build.cmd --no-cuda` produced "90 passed, 45 failed" and exited 1: the 45
-# were exactly the cuda engine's share (9 images x 5 colour counts), every one of them
-# a refusal to start rather than a wrong pixel.  A build configuration the project
-# documents as supported was reporting a failing suite.
+# were exactly the cuda engine's share, every one of them a refusal to start rather
+# than a wrong pixel.  A build configuration the project documents as supported was
+# reporting a failing suite.
+#
+# The cuda share is 11 fixtures x 5 colour counts = 55 of the 165 total, which is why
+# README quotes "110 passed, 55 SKIPPED" for a --no-cuda build.  That arithmetic is a
+# product of the three lists below, so it is exact and does not need re-measuring when a
+# fixture is added -- but it does need UPDATING, and did not get it when in_gray_alpha
+# and in_jpeg arrived.  Three lists, one multiplication: if you add a fixture, a colour
+# count or an engine, this number moves.
 . "$PSScriptRoot\tools\rd-engine-probe.ps1"
 $avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('cuda') -Fixture (Join-Path $ImageDir "in_grad.png")
 Write-RdEngineSkipReport -Availability $avail | Out-Null
