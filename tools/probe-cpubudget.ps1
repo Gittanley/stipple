@@ -66,10 +66,22 @@ param(
   # How often to ask WMI for a child process not yet seen.  Measured cost of one
   # filtered Get-CimInstance Win32_Process on this machine: 24.0 ms.  Lower means
   # fewer missed short-lived children and more load on the machine under
-  # measurement; the default is deliberately unchanged from the old loop's 1200 ms
-  # for that reason.  ChildQueries and MaxChildGapS are printed per configuration
+  # measurement.  ChildQueries and MaxChildGapS are printed per configuration
   # so the cost is visible in the output.
-  [int]$ChildEveryMs = 1200,
+  #
+  # WAS 1200 ms, and that was too coarse to bound the error.  A child that is not
+  # enumerated before it exits contributes ZERO, not a partial figure, so the loss
+  # bound is (gap x logical cores) per miss.  At 1200 ms on 12 cores that is 14.4
+  # core-s per miss against a measured total of ~137 core-s -- the bound was worth
+  # ten percent of the whole measurement.  The first run with the old value
+  # recorded MaxChildGapS 11.4 s in a 23.8 s run, i.e. nine consecutive queries
+  # that saw no child at all, which is most of the run unobserved.
+  #
+  # 250 ms costs 24 ms of one core per query, about 1.2 percent of the machine
+  # under measurement, and bounds a miss at 3.0 core-s.  It is deliberately not
+  # tighter: the number being defended here is a share, and 1.2 percent of one
+  # core cannot move a share by a meaningful amount.
+  [int]$ChildEveryMs = 250,
   # Loop tick.  Only two things happen this often: noticing that rdither exited, and
   # taking the last readable CPU reading of each child.  Tighter means a tighter
   # bound on the last one, at no measurable cost -- a HasExited check and three
@@ -135,7 +147,19 @@ function Measure-Config {
   # measurement.  It is carried here as a null plus a flag, formatted as n/a, and
   # the caller refuses to publish a table containing one.
   $fps = $null
-  if ($text -match '\(([\d.]+) fps\)') { $fps = [double]$Matches[1] }
+  # The closing bracket is optional and the label is not matched.  It used to require
+# `fps)` immediately, which was true until the summary line gained a parenthetical
+# label -- it now reads `(32.0 fps, palette included)` -- so this regex matched
+# nothing and every configuration VOIDed.  A missed rate is not a zero, so refusing
+# to publish was the correct behaviour, but the cause was a message changing shape
+# under a probe that reads it as text.
+#
+# The PARENTHESIS is what selects the rate, and it has to stay the selector: the
+# summary prints two rates, and only the parenthesised one covers the whole job
+# (the other is the progress bar's window, which excludes the palette build). A
+# looser match on a bare number would take whichever came first, and the two
+# differ by ~28 percent on this clip.
+if ($text -match '\(([\d.]+) fps[,)]') { $fps = [double]$Matches[1] }
 
   $stage = (($text -split "`n" | Where-Object { $_ -match 'busy time' }) -join ' ') -replace '\s+',' '
 

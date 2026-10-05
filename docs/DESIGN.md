@@ -3817,3 +3817,106 @@ denominator should not be used until someone rebuilds it from a stated rule.
 fusion's 66,355,213 B are **13 bytes apart and entirely unrelated quantities** -- R1's is
 two 16 B/px passes, the fusion's is the reader's widening plus the gather's read
 reduction. They are not one figure and a typo of the other.
+
+## Correction: the CPU budget table divides by two different totals, and rdither's share re-measures at ~15.6%
+
+### The table does not add up, and the error is in the denominator
+
+The table above states x264 ~1240, rdither 121, h264 decode ~29 core-s. Those parts sum
+to **1390**, but the total beside them is printed as **1590** -- 200 core-s unaccounted
+for. The shares were then computed against *both* totals, in the same table:
+
+| | printed | against 1590 | against 1390 |
+|---|---:|---:|---:|
+| x264 ~1240 | ~89% | 77.99% | **89.21%** |
+| rdither 121 | 7.6% | **7.61%** | 8.71% |
+| h264 decode ~29 | 1.8% | **1.82%** | 2.09% |
+
+So `~89%` is right for the parts and `7.6%` / `1.8%` are right for the printed total, and
+the two cannot both be describing the same measurement. Whichever total is correct,
+**rdither's share is not 7.6%**: it is 8.71% if the parts are right and 7.61% if the total
+is, and in neither case is it the number quoted as "everything this project controls".
+
+This is decidable by arithmetic alone and needs no re-run.
+
+### Re-measured, 2026-10-05: rdither is ~15.6%, not 7.6-8.7%
+
+`tools/probe-cpubudget.ps1` on a 1920x1080 yuv420p h264 clip, 605 frames, 16 colours,
+`--engine blocks`, four configurations:
+
+| configuration | rd core-s | ff core-s | total | rd share | cores avg |
+|---|---:|---:|---:|---:|---:|
+| yuv444 (default) | 21.36 | 115.30 | 136.7 | 15.63% | 5.48 |
+| yuv420 | 19.16 | 106.55 | 125.7 | 15.24% | 5.35 |
+| yuv444 enc-threads 4 | 21.67 | 113.66 | 135.3 | 16.02% | 5.55 |
+| yuv420 enc-threads 4 | 18.81 | 107.08 | 125.9 | 14.94% | 5.43 |
+
+rdither's share of total pipeline CPU is **14.94-16.02%** across the four, roughly double
+the published figure. That is the direction the old instrument's known 52% under-count
+predicts: it missed short-lived and multi-threaded work, so rdither's true share was
+always higher than recorded and x264's always lower.
+
+If ffmpeg total is 84.4% and everything outside the preset is inside the remaining 15.6%,
+then zeroing all of rdither's CPU caps out at **1/0.844 = 18.5%** wall, not 11%.
+
+**What this does NOT establish.** The probe separates rdither from ffmpeg as a whole; it
+cannot split x264 from h264 decode, so it cannot confirm or refute the "~89% is the
+encoder" claim directly -- only rdither's share and ffmpeg's total. And `ff core-s` is a
+lower bound in at least one configuration (1 of 4 children last read within 200 ms of
+exit, at most 2.4 core-s missing), which moves rdither's share *up*, not down.
+
+### The reference clip cannot be regenerated, which makes every figure above unverifiable
+
+`tools/probe-cpubudget.ps1`, `tools/ab-input-mode.ps1` and `tools/probe-blockslen.ps1` all
+default to a clip under `%TEMP%\rd420\`, and **no script, document or workflow in this
+repository creates it**. It was made by hand. `%TEMP%` has been wiped at least once on
+this machine, so the clip the entire CPU-budget section rests on no longer exists and
+cannot be rebuilt from anything recorded here.
+
+The stand-in used for this re-measurement, and it is a stand-in rather than the original:
+
+```
+ffmpeg -y -loglevel error -loop 1 -framerate 60 -i tests/fhd_photo.png \
+  -vf "zoompan=z='min(zoom+0.0004,1.25)':d=605:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=60,format=yuv420p" \
+  -frames:v 605 -c:v libx264 -preset medium -crf 20 -r 60 %TEMP%\rd420\u8000.mp4
+```
+
+605 frames, 1920x1080, yuv420p, h264 -- matching the specification, differing in content.
+Absolute wall times are therefore not comparable with any earlier figure. The *share* is
+the more robust quantity, because rdither's work is fixed by pixel and palette count
+while x264's scales with how hard the content compresses, but that robustness is argued,
+not measured.
+
+### The palette is a larger share of the wall than the whole rdither CPU share
+
+Two runs of the same binary on the same clip, under the same probe, disagree:
+
+| run | wall | palette | palette share |
+|---|---:|---:|---:|
+| probe, yuv444 default | 23623 ms | 12237 ms | **51.8%** |
+| direct, no sampler | 18879 ms | 5245 ms | **27.8%** |
+
+Unexplained. The probe's sampler polls WMI every 250 ms during that window, which is
+~1.6 s of the 7 s difference at most, so the sampler does not account for all of it.
+Neither figure is adopted here.
+
+What survives both: **the palette build is 28-52% of the wall, and it is a serial prefix
+that nothing overlaps.** It is ours -- not the preset, not x264 -- which makes it a better
+target than the 18.5% ceiling, and it is the largest single block of non-overlappable work
+in the pipeline. Today's fusion of the widening into the montage cell removed 10,667,163,648 B
+of traffic from it; what remains is the serial sampling itself.
+
+### Two defects in the probe, both found by running it
+
+1. **The fps regex was broken and had been for three commits.** It required `fps)` with the
+   bracket closing immediately, which stopped matching when the summary gained a
+   parenthetical label: the line now reads `(32.0 fps, palette included)`. Every
+   configuration VOIDed. The regex now accepts `fps,` or `fps)` and **keeps the
+   parenthesis as the selector on purpose**, because the summary prints two rates ~28%
+   apart and a looser match would silently take whichever came first.
+2. **`ChildEveryMs` is 250, not 1200, but the interval was NOT the cause of the sampling
+   gap.** Cutting it 4.8x tripled the WMI queries (20 -> 68) and left `MaxChildGapS` at
+   10.3 s against 11.4 s before. The most likely explanation is that the metric measures the
+   gap between child *discoveries* rather than between samples -- after all four children
+   are found there are legitimately no more -- but **that is UNVERIFIED**, and until it is,
+   the 10.3 s figure should not be read as a bound on the error.
