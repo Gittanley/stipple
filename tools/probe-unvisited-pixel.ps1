@@ -69,9 +69,22 @@ param(
   # case -- level 6 puts the missing cell at (63,0), x=63 >= 33, so it has NONE, and
   # the old comment at rd_blocks_cuda.cu:1058 claiming "33x17 -> 1 at (31, 0)" cannot
   # be reproduced from ComputeCurveLevel.  (31,0) is the level-5 cell.
+  #
+  # Four geometries were added while landing the fused gather: 512x480, 256x192, 320x240
+  # and 480x512.  Two of them (512x480, 256x192) have an unvisited pixel and were NOT in
+  # the set, so the earlier claim that only the four >= 1024-wide geometries have one was
+  # wrong by omission -- the rule held, the enumeration was incomplete.  The other two
+  # are the falsifying side: 320x240 (320 not a power of two) and 480x512 (taller than
+  # wide) must have none, and the run asserts that they do.
+  #
+  # 512x480 was briefly believed to falsify the rule, on the strength of an IMAGE-path
+  # run that printed no unvisited line.  That was a wrong inference from a gated log:
+  # the report is guarded on the list being non-empty, so no line means the print did not
+  # run.  It is in the list now so the doubt stays recorded where it can be re-checked.
   [string[]]$Geometries = @(
     "1920x1080", "1280x720", "768x1024", "720x1280", "640x360", "854x480",
-    "1024x768", "1024x1024", "2048x2048", "4096x2160"
+    "1024x768", "1024x1024", "2048x2048", "4096x2160",
+    "512x480", "256x192", "320x240", "480x512"
   ),
   [int]$Frames = 8
 )

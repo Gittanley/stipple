@@ -386,11 +386,25 @@ struct CachedCurve {
   // including none.  Carrying a single index would silently under-fill the moment there
   // were two.
   //
-  // At the moment there is exactly one, at (2^level - 1, 0), and it lands inside the
-  // image only when width is a power of two AND width >= height -- so 1024x768,
-  // 1024x1024, 2048x2048 and 4096x2160 have one, and 1920x1080, 1280x720, 33x17 and
-  // the rest have none.  That is why a probe must assert this list rather than assume
-  // it is empty or has one element.
+  // The rule: the gap is at (2^level - 1, 0), and it lands inside the image exactly when
+  // width is a power of two AND width >= height.  Confirmed at 6 of the 14 geometries in
+  // probe-unvisited-pixel.ps1 -- 256x192, 512x480, 1024x768, 1024x1024, 2048x2048,
+  // 4096x2160 -- and absent at the other 8, including 320x240 (320 is not a power of
+  // two) and 480x512 (taller than wide).
+  //
+  // An earlier version of this comment claimed the four >= 1024-wide geometries were the
+  // complete set, and that was wrong by omission: 256x192 and 512x480 have one too.
+  //
+  // A still earlier version of THIS paragraph asserted the rule had been falsified by
+  // 512x480, on the strength of an image-path run that printed no unvisited line.  That
+  // was a wrong inference from a gated log, not a counterexample: the report is guarded
+  // on `!unvisited.empty()` at the print site, so no line means the print did not run,
+  // which is not the same as the list being empty.  The rule held; the reading of the
+  // log did not.  Both 512x480 and 256x192 are now in the probe's geometry list so the
+  // rule is tested where it was once doubted.
+  //
+  // Still: scan for the list rather than predict it.  Line 404 does, which is why a
+  // geometry nobody enumerated needs no code change.
   std::vector<std::int32_t> unvisited;
 };
 
