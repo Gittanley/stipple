@@ -53,7 +53,7 @@ Decode, dither and encode all run at once, at about 51 fps on a 2014-era 6-core 
 with a GTX 1650 SUPER. So 5 minutes of **60 fps** footage took 5 minutes 53 seconds —
 about 1.17x its own duration, while 30 fps footage would come out faster than real
 time. What that number does *not* measure is the GPU —
-[two thirds of it is decode and encode](#what-the-fps-number-means-in-practice), so a
+[63% of it is decode and encode](#what-the-fps-number-means-in-practice), so a
 faster CPU, RAM or disk makes it faster with the same GPU.
 
 > ### Made by an AI — "Space Bunny"
@@ -317,8 +317,8 @@ H.264.
 ### Concurrency, and the RAM it uses
 
 Decode, dither and encode all run at once, and the tool will use the machine you give it.
-On the benchmark machine, thread-time totals 647 s against a 352 s wall, so every core is
-busy — and roughly two thirds of that is decode and encode rather than GPU work. The GPU
+On the benchmark machine, thread-time totals 675.6 s against a 352 s wall, so every core is
+busy — and 63% of that is decode and encode rather than GPU work. The GPU
 is not usually the constraint; see
 [what the fps number means](#what-the-fps-number-means-in-practice).
 
@@ -371,7 +371,7 @@ so ~1 h 46 m for 3 hours). Whether this beats real time depends on your source r
 it is worth checking rather than assuming.
 
 **Do not quote the 51 fps at anyone.** It is one low-bitrate, already-compressed file of
-grey low-saturation material on a 2014-era 6-core Xeon, and two thirds of the thread-time
+grey low-saturation material on a 2014-era 6-core Xeon, and 63% of the thread-time
 is decode and encode rather than GPU work — so a faster CPU, NVMe or more memory
 bandwidth moves this number with the same GPU, and a faster GPU will not fix a pipeline
 that is not GPU-bound. Read which stage is largest in your own `busy time` line before

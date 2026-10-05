@@ -154,7 +154,7 @@ whole pipeline — reader, batcher, GPU workers, encoder — on OpenCL. Measured
 same palette and the same 16-frame batches:
 
 ```
-decoded RGBA   447.8 MB   (60 frames x 1920x1080 x 4)
+decoded RGBA   497.7 MB   (60 frames x 1920x1080 x 4)
 blocks  sha256 FB9E83D42F4B2279F2DC2DAABCA8E296C252B201557B4ED3A28D6D241EA697ED
 opencl  sha256 FB9E83D42F4B2279F2DC2DAABCA8E296C252B201557B4ED3A28D6D241EA697ED
 ```
@@ -291,6 +291,20 @@ SUPER):
 The middle row is the one that matters: with the data path held equal, the engines were
 already within 8% of each other. The entire 2.2x was bytes on the wire -- 8 per pixel
 against 3. Per stage, from `RD_OCL_TIMING=1` over 38 batches, OpenCL's three kernels
+
+CORRECTION: there is no `RD_OCL_TIMING` in this codebase. It appears nowhere under
+`src/` or `include/` -- the only occurrence anywhere is the citation itself and a
+comment in `tools/probe-opencl.cpp`. So the per-stage comparison below was not produced
+by a flag a reader can set, and the 6410 ms / 6124 ms pair cannot be reproduced or
+checked by anyone following this document.
+
+What DOES exist now, added after that text was written: `RD_OCL_IO=1`, which prints an
+`[io]` line with five separate byte buckets and a conservation assertion comparing the
+measured H2D total against `width x height x frames x bytes_per_pixel` computed from the
+run's own inputs. That checks the byte volume exactly and is immune to the run-to-run
+drift documented elsewhere -- which is the property a per-stage millisecond comparison
+lacked. It does not break the stage down the way the quoted numbers do, so this
+measurement is recorded as unreproducible rather than replaced.
 *plus* its readback came to 6410 ms against CUDA's 6124 ms of whole-batch dither+IO, so
 the walk was never the problem.
 

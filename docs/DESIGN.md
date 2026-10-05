@@ -1298,6 +1298,14 @@ calls became one `cudaStreamSynchronize` at the end.
 **1.38x**, with no change to the arithmetic -- 135/135 bit-exact before and after,
 which is the check that matters for a change of this kind.
 
+(the two figures give 61108 / 43480 = **1.405x**, so "1.38x" is 1.8% below its own
+numbers; the per-frame figures agree, 101.0 / 71.9 = 1.405. Use 1.4x. The change was a
+combined one -- a persistent device cache, cudaHostAlloc staging, eight cudaMalloc and
+cudaFree removals including a 531 MB one, and a curve rebuild -- so no single part of it
+may be credited with the whole 1.4x. There is a separate claim elsewhere in this
+document that attributes it to pinned staging alone, and that attribution is not
+supported by anything measured here.)
+
 ### The one that mattered: the error queue belongs in registers
 
 The persistent-cache work above took the dither stage to 72 ms/frame. The next
@@ -1448,7 +1456,7 @@ it as reviewed rather than verified.
   Transfers are no longer the bottleneck. A per-block memo table is the main
 - **The dither kernels are memory-bound** (~890 ms of each 1030 ms launch).
   constant 100% load needs N device states on N streams, not one.
-  pinned staging took the dither stage 1.38x faster (101 -> 72 ms/frame), but
+  pinned staging took the dither stage 1.4x faster (101 -> 72 ms/frame), but
 - **GPU utilisation is still one batch at a time.** The persistent device cache and
   produce frames.
   its durability and its verification are done; the segment decode does not
@@ -1648,6 +1656,14 @@ Six threads instead of one buys 0.8 fps, not the 5x the arithmetic suggests. It 
 reading 8 bytes and writing 16, so ~48 GB of traffic against a memory system that
 delivers a small fraction of that per core. Adding cores adds contention, not
 throughput. The `decode` stage figure gets *worse* with more threads for the same
+
+CORRECTION: the conversion count and the byte total are both wrong, by the same factor
+of 1.6. 605 x 2,073,600 = **1.255 billion** conversions, not two billion. At the stated
+8 B read + 16 B write = 24 B, that is **30.1 GB**, not ~48 GB. 48 GB is what you get by
+multiplying two billion by 24. The argument is unchanged in direction -- this is still
+bandwidth-bound, and still much more traffic than the memory system delivers per core --
+but the magnitude is 30.1 GB and the "five times" it implies above is smaller than
+quoted.
 reason, which is why the naive reading of that number is misleading.
 
 **What the three together establish.** ffmpeg needs ~5.0 s to decode the clip. The
@@ -1655,9 +1671,12 @@ reader's stage was taking ~14.7 s. So roughly 10 s of it was never ffmpeg at all
 it was the widening loop and the 20 GB of pipe traffic, and it is bandwidth-bound,
 which is exactly why neither more slots nor more threads nor more GPU workers moved
 it. The only fix is to not do the work: upload the uint16 bytes as they arrive and
-let the gather kernel widen them, which removes ~48 GB of host memory traffic and
+let the gather kernel widen them, which removes ~30.1 GB of host memory traffic and
 halves the H2D at the same time. That is the uint16 upload, still the largest single
 win available, and still gated on the video path having no automated bit-exactness
+
+(the figure is 30.1 GB, not 48 -- see the correction in round five: 1.255 billion
+conversions, not two billion, at 24 B each)
 check.
 
 28.3 fps after this round, 135/135 and `--self-test` PASSED.
@@ -1680,9 +1699,10 @@ exact: every uint16 is representable in a float's 24-bit mantissa, so there is
 nothing to round. The dither sees bit-identical input either way.
 
 **Why it was worth it.** The loop was the reader's dominant cost and it was
-bandwidth-bound, not compute-bound -- two billion conversions over 605 frames, each
-reading 8 bytes and writing 16, so ~48 GB of host memory traffic. That single fact
+bandwidth-bound, not compute-bound -- 1.255 billion conversions over 605 frames, each
+reading 8 bytes and writing 16, so ~30.1 GB of host memory traffic. That single fact
 explains every previous result: six threads on it bought 0.8 fps (round five) because
+the bus was the constraint; a deeper queue did nothing (round five) because the
 the bus was the constraint; a deeper queue did nothing (round five) because the
 reader was not buffer-starved; two GPU workers did nothing (round four) because the
 device was waiting on batches that did not exist yet. The device was idle 47% of its
@@ -1914,12 +1934,32 @@ per-pipe syscall overhead that could be parallelised away. Writing the same stre
 file instead of a pipe is *slower*, not faster:
 
 ```
-60-frame clip, 949 MB:  -> file 1046 ms = 0.93 GB/s     (pipe is ~1.26 GB/s)
+60-frame clip, 949 MB:  -> file 1046 ms = 0.93 GB/s     (949/1.046 = 0.907 GB/s)
 ```
 
 Which means the limit is the machine's data-movement capability, not the transport
 mechanism. A shared-memory or file-based redesign -- the two things that would move a
 pipe-bound reader -- cannot help, because the pipe is already the faster of the two.
+
+CORRECTION, and this is the most load-bearing number in the document, so it is worth
+being precise about what was wrong. `rgba64le` is 8 bytes per pixel, not 16. At 605
+frames of 1920x1080 that is 605 x 2,073,600 x 8 = 10.04 GB, so the rate is
+10.04 / 15.9 = **0.63 GB/s**, not 1.26. The 20 GB and the 1.26 GB/s are `float4`'s
+figures -- 16 B/px, which is what the dither uses internally, not what the decoder
+emits. The 60-frame row compounds it: 949 MB is neither width (float4 gives 497 MB,
+rgba64le 249 MB), and 949 / 1.046 = 0.907 GB/s rather than 0.93.
+
+The conclusion survives, and survives more strongly than it did: at 0.63 GB/s against a
+pipe, the file path at 0.907 GB/s is FASTER than the pipe, not slower -- the sentence
+above inverted its own two numbers. So "the limit is data movement, not the transport"
+still holds, and "a file-based redesign cannot help because the pipe is faster" does
+NOT: on these figures the file is the faster of the two, and a file-based reader is
+exactly the redesign this paragraph rules out. That argument needs re-measuring before
+anyone relies on it.
+
+Everything downstream that cites this rate -- the "the pipe is the floor" argument, the
+projection to 55-60 fps, the download-size arithmetic -- inherits both errors and is
+quoted here as unsettled rather than silently carried forward.
 A file-based scheme is also unusable for the real workload: 2-3 hours of raw
 `rgba64le` is hundreds of gigabytes, which is why it is not on the table regardless of
 speed.
@@ -2018,7 +2058,17 @@ on `RD_KERNEL_TIMING=1`. Same answer, no privileges, no replay.
 | yuv444 | 5.6 | 356.2 | 5.2 | 367.0 ms |
 | yuv444-prepass | 7.7 | 351.5 | 5.2 | 364.4 ms |
 
-So **the walk is 88-95% of the dither stage**, and the gather and scatter are noise.
+So **the walk is 94-97% of the dither stage**, and the gather and scatter are noise.
+
+(The range was quoted as 88-95%, which its own table contradicts: the three rows give
+93.9%, 97.1% and 96.5%, so two of the three fall outside the stated band. Corrected to
+match the table rather than the other way round.)
+
+One naming note, since the table is quoted elsewhere: the first column is labelled
+`input` but the instrument prints `gather` -- `rd_blocks_cuda.cu`'s `[kern]` line emits
+gather/walk/scatter and there is no `input` column. In the prepass row that window also
+spans the prepass as well as the gather, so the 7.7 is two things and is not directly
+comparable with the 6.0 above it.
 This is what the last three rounds could not see: the yuv path's penalty is not in the
 conversion at all, it is entirely in the walk -- which is why the coalesced pre-pass
 changed nothing. Two hypotheses killed, and the cost located.
@@ -2050,10 +2100,25 @@ The reader is the floor by 7.6 s. **Doubling the walk's speed would change the d
 throughput by nothing at all.** This is the clearest statement of where the ceiling is:
 the dither is 88-95% one kernel, and there is still slack to spare underneath it.
 
-**What is left in the walk.** It is latency-bound, not throughput-bound: 163.8 ms for
-33.18 M pixels is ~11800 cycles per pixel, against a few hundred for the arithmetic. The
-64-double register queue is what allows so little occupancy. The one large lever left
-is reducing that register pressure, and the single attempt at it backfired by 54%.
+**What is left in the walk.** It is latency-bound, not throughput-bound. The
+evidence for that is `launch__registers_per_thread 255` and the resulting occupancy
+below 20% (measured, three runs, 2.3% spread -- see the register/occupancy table
+below), which starves the machine of warps to hide the dependent-load chain behind.
+The 64-double register queue is what allows so little occupancy. The one large lever
+left is reducing that register pressure, and the single attempt at it backfired by 54%.
+
+CORRECTION: this paragraph used to carry the arithmetic "163.8 ms for 33.18 M pixels is
+~11800 cycles per pixel, against a few hundred for the arithmetic", and it was wrong by
+996x. 0.1638 s / 33.18e6 px is 4.94 ns per pixel, which at any plausible clock is
+single-digit CYCLES per pixel -- not 11800. Worse, the 2.40 GHz figure it would have
+divided by is this machine's CPU clock (a Xeon E5-2620 v3, quoted in the machine
+description above), while 163.8 ms is a GPU kernel time; no GPU clock is stated
+anywhere in this document, so a cycle count here had no denominator to begin with.
+
+The number also contradicted itself: a budget of single-digit cycles per pixel cannot
+accommodate "a few hundred" cycles of arithmetic, so the comparison was not merely
+mis-scaled, it was impossible. The conclusion survived only because the register and
+occupancy counters support it directly. That is the citation to use.
 
 There is also a colour-index cache in `d_select_index` -- a 6-bit-per-channel hash
 lookup that would remove the octree descent and the ancestor scan entirely -- and the
@@ -2108,6 +2173,14 @@ and the two candidates are the ones this document has been chipping at: the pipe
 
 **What "not ffmpeg" would actually mean.** Dropping ffmpeg for the CUDA video decoder
 API would remove the pipe, because NVDEC writes into device memory and a 9.35 GB
+
+(The 9.35 GB does not correspond to 605 frames at any width this document uses:
+9.35e9 / (605 x 2,073,600) = 7.45 B/px, and the widths in play are 1.5 (yuv420p),
+3 (yuv444), 8 (rgba64le) and 16 (float4). At rgba64le's 8 B/px the clip is 10.04 GB and
+9.35 GB would be 564 frames. The neighbouring "3.5 GB instead of 9.35 GB" comparison
+has the same problem: 605 frames at 3 B/px is 3.76 GB, not 3.5. Recorded rather than
+silently carried, because the ratio between them is roughly right even though neither
+absolute figure is.)
 download over PCIe is ~1.3 s against the pipe's ~11 s. Reader 16.2 s -> ~2.5 s, and
 then the wall becomes the encoder at 10.2 s, or 8.8 s if the encoder is also fed
 `yuv444p` (3.5 GB instead of 9.35 GB, via a palette->YUV table the scatter indexes).
@@ -2128,6 +2201,25 @@ sustained load -- 35.7, 34.3, 32.8 over three back-to-back runs late in a long s
 against 35.6-36.1 early on. Every comparison that decided something here was A/B'd
 interleaved within a short window, so the conclusions hold; the absolute numbers do not
 travel.
+
+MEASURED, and larger than the numbers above suggest. Those three late runs span 8.1%
+on their own, while the early pair spans 1.4%, so "a few percent" was already too
+tight. A direct A/B of two binaries differing only in an unrelated I/O change, run
+today with 7 interleaved reps per arm at 800x600 and 5 at 1920x1080, measured
+**18.8% and 24.8% spread between identical binaries** on the dither+IO stage.
+
+So the practical floor for distinguishing a change from noise on this machine is
+roughly 25%, not 3%. Consequences, stated rather than buried:
+
+- Any single unreplicated run differing by less than that decides nothing. Several
+  figures in this document are quoted that way and are marked as unverified below
+  rather than deleted, because deleting them would lose the record of what was tried.
+- `docs/OPENCL.md` gives a separate estimate of "around 15%" for run-to-run spread.
+  That is the same order as what was measured here, and the two are now consistent
+  rather than 5-7x apart.
+- The one A/B run today that this bit returned |t| = 0.67 against a threshold of 2.1,
+  i.e. inside noise, on a change whose byte count was exact and whose speedup claim was
+  not. That is what being under this floor looks like in practice.
 ### Round thirteen: the walk is at a local optimum, proved with counters
 
 Nsight Compute (from an elevated shell) on `BlkIndexWalkKernel`, 16 frames of 1080p:
@@ -2173,7 +2265,11 @@ algorithm would move it, and that means giving up bit-exactness.
 **What this changes about priorities.** The walk is 88-95% of a stage that is 8.9 s of a
 17.0 s wall, with the reader at 16.4 s. There is now 7.5 s of slack under the dither
 stage, and no way to spend it. The pipeline is pinned at ~35.5 fps by whichever stage is
-largest, and the largest is a pipe carrying 9.35 GB at 0.86 GB/s.
+largest, and the largest is a pipe carrying 9.35 GB at 0.86 GB/s.  (The volume is
+unsettled -- see the correction in round seventeen: 9.35 GB matches no width at 605
+frames, where rgba64le gives 10.04 GB. The 0.86 GB/s pipe rate is also superseded: the
+same measurement that produced it gives 0.63 GB/s for the pipe and 0.907 GB/s for a
+file, i.e. the file is faster, which is the opposite of what this sentence concludes.)
 
 Verified: 135/135, `--self-test` PASSED, 605 frames, 35.4 fps mean over three reps.
 Note the walk measures 167.3 ms here against 163.8 earlier and the machine drifts
