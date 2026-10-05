@@ -414,7 +414,43 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         const ColorTree& tree, std::size_t width,
                         std::size_t height, RgbaF* batch, int frames,
                         int block, unsigned char* raw_out, std::size_t out_pixels,
-                        bool out_yuv444, std::string* error_out) {
+                        bool out_yuv444, std::string* error_out,
+                        const unsigned char* gather_raw,
+                        std::size_t gather_frame_bytes, int gather_layout,
+                        int gather_channels) {
+  // FUSED GATHER.  `gather_layout != 0` means the caller handed us the decoder's bytes
+  // and there is no float4 buffer to read, so every pixel this engine needs is widened
+  // here, on demand.  `gbase` is that frame's slice; recomputed per frame because the
+  // stride is the frame's, not the batch's.
+  const bool fused_gather = (gather_layout != 0) && (gather_raw != nullptr);
+
+  // One pixel the reader would have widened, produced in place.  Transcribed from
+  // RawToFloats (rd_video.cpp) and RawYuv444ToFloats, byte for byte INCLUDING the
+  // synthesised opaque alpha, because the interleaved scatter has always read source
+  // alpha from the float buffer for visited pixels and the encoder has always received
+  // that value.  SwsYuvToRgb16 comes from rd_types.h, which is the single source.
+  auto gather_pixel = [=](const unsigned char* gbase, std::size_t p) -> RgbaF {
+    RgbaF px;
+    if (gather_layout == 3) {                       // planar 8-bit 4:4:4
+      const std::size_t plane = out_pixels;         // == width * height
+      std::uint16_t rgb[3];
+      SwsYuvToRgb16(gbase[p], gbase[plane + p], gbase[2 * plane + p], rgb);
+      px.r = static_cast<float>(rgb[0]);
+      px.g = static_cast<float>(rgb[1]);
+      px.b = static_cast<float>(rgb[2]);
+      px.a = static_cast<float>(65535.0);
+    } else {                                        // interleaved uint16
+      const std::uint16_t* q =
+          reinterpret_cast<const std::uint16_t*>(gbase) +
+          p * static_cast<std::size_t>(gather_channels);
+      px.r = static_cast<float>(q[0]);
+      px.g = static_cast<float>(q[1]);
+      px.b = static_cast<float>(q[2]);
+      px.a = gather_channels == 4 ? static_cast<float>(q[3])
+                                  : static_cast<float>(65535.0);
+    }
+    return px;
+  };
   // `raw_out != nullptr && out_pixels > 0` selects the fused output.  Everything below
   // is written so the two paths produce identical bytes: the fused path reproduces the
   // convert pass's arithmetic EXACTLY rather than approximately, including the places
@@ -522,7 +558,13 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
   }
 
   for (int f = 0; f < frames; ++f) {
-    RgbaF* frame = batch + static_cast<std::size_t>(f) * pixels;
+    // `frame` is the float4 buffer this fusion is removing, so it is only formed when
+    // the caller still supplies one. `gbase` is this frame's slice of the raw bytes.
+    RgbaF* frame = fused_gather ? nullptr
+                                : batch + static_cast<std::size_t>(f) * pixels;
+    const unsigned char* gbase =
+        fused_gather ? gather_raw + static_cast<std::size_t>(f) * gather_frame_bytes
+                     : nullptr;
     for (int b = 0; b < nblocks; ++b) {
       // Each block starts from a zeroed queue, exactly as the kernel does, so the
       // host and device produce identical output.
@@ -532,7 +574,13 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
       const int end = (begin + block < n) ? (begin + block) : n;
       for (int i = begin; i < end; ++i) {
         RgbaD pixel;
-        associate_alpha_pixel(palette.associate_alpha, frame[curve[i]], &pixel);
+        // Fused gather: widen the decoder's byte for this one visit. Unfused: read the
+        // pre-widened float the reader produced. Same value either way -- that is the
+        // claim the oracle checks, and it is not checkable by reading.
+        associate_alpha_pixel(palette.associate_alpha,
+                              fused_gather ? gather_pixel(gbase, static_cast<std::size_t>(curve[i]))
+                                           : frame[curve[i]],
+                              &pixel);
         for (int k = 0; k < kErrorQueueLength; ++k) {
           const double w = kErrorRelativeWeight * params.diffusion * weights[k];
           pixel.r += w * error[k].r;
@@ -616,7 +664,12 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
         // "fixed" in one change.
         std::uint16_t* u = reinterpret_cast<std::uint16_t*>(raw_out) +
                            static_cast<std::size_t>(f) * out_pixels * 4;
-        const RgbaF& src = frame[pixel_index];
+        // Source alpha for a VISITED pixel, which with the float buffer gone has to come
+        // from the raw bytes. In the interleaved case that is channel 3; in the planar
+        // case the reader synthesised 65535 and so does gather_pixel, which is why the
+        // yuv444 writer is unaffected by this.
+        const RgbaF src = fused_gather ? gather_pixel(gbase, pixel_index)
+                                       : frame[pixel_index];
         u[4 * pixel_index + 0] = static_cast<std::uint16_t>(fr);
         u[4 * pixel_index + 1] = static_cast<std::uint16_t>(fg);
         u[4 * pixel_index + 2] = static_cast<std::uint16_t>(fb);
@@ -642,7 +695,8 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
     if (fused) {
       for (std::int32_t p : cached.unvisited) {
         const std::size_t pixel_index = static_cast<std::size_t>(p);
-        const RgbaF& s = frame[pixel_index];
+        const RgbaF s = fused_gather ? gather_pixel(gbase, pixel_index)
+                                     : frame[pixel_index];
         unsigned char* o = raw_out + static_cast<std::size_t>(f) * out_pixels * 3;
         if (out_yuv444) {
           const int r8 = static_cast<int>(clamp_to_quantum(s.r)) >> 8;

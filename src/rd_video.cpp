@@ -304,32 +304,10 @@ void RawToFloatsParallel(const std::uint16_t* raw, RgbaF* dst, std::size_t pixel
   for (std::thread& t : pool) t.join();
 }
 
-// swscale's 8-bit YUV -> 16-bit RGB, bit-exact.  PORTED from the device's
-// d_sws_yuv_to_rgb16 rather than derived a third time, because a near-equivalent here
-// is a hue shift: the device comment above that function records that an earlier float
-// approximation of the same matrix produced a measurably different picture.
-inline std::uint16_t SwsClip16(int x) {
-  const int v = x + (1 << 15);
-  if (v < 0) return 0;
-  if (v > 65535) return 65535;
-  return static_cast<std::uint16_t>(v);
-}
-
-inline void SwsYuvToRgb16(unsigned y, unsigned u, unsigned v, std::uint16_t* out) {
-  int yy = static_cast<int>((y - 128u) * 512u);
-  const int uu = static_cast<int>((u - 128u) * 512u);
-  const int vv = static_cast<int>((v - 128u) * 512u);
-  yy += 0x10000;
-  yy -= 8192;                              // yuv2rgb_y_offset
-  yy *= 9539;                              // yuv2rgb_y_coeff
-  yy += (1 << 13) - (1 << 29);
-  const int ri = vv * 13075;               // yuv2rgb_v2r_coeff
-  const int gi = vv * -6660 + uu * -3209;  // v2g, u2g
-  const int bi = uu * 16525;               // yuv2rgb_u2b_coeff
-  out[0] = SwsClip16((ri + yy) >> 14);
-  out[1] = SwsClip16((gi + yy) >> 14);
-  out[2] = SwsClip16((bi + yy) >> 14);
-}
+// SwsClip16 and SwsYuvToRgb16 now live in include/rd_types.h, which rd_riemersma.h
+// already pulls in, so the host dither engine can do this widening per visit without
+// copying the matrix a fifth time. See the comment there for why it is ported rather
+// than derived.
 
 // Planar 8-bit 4:4:4 -> RgbaF, for the host paths.  This is the conversion the host
 // never had.
@@ -2940,7 +2918,22 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // Names the RESOLVED engine.  use_gpu is settled at :2531 and cpu_threads at :2609,
   // both above here.  c5efb68 was a crash because a neighbouring condition named the
   // REQUESTED branch instead.
-  const bool host_touches_pixels = !use_gpu || opt.gpu_float_out || cpu_threads > 0;
+  //
+  // WAS: !use_gpu || opt.gpu_float_out || cpu_threads > 0, which is now WRONG in the
+  // other direction -- it under-claims, so the float buffer was still allocated for
+  // every configuration. With the gather fused, the host worker widens the decoder's
+  // own bytes per visit, so `b.pixels` has no consumer in any configuration except
+  // one: a GPU asked to RETURN float4. That is the whole condition.
+  //
+  // The three cases, and why each is what it is:
+  //   GPU, not gpu_float_out -- gathers on the DEVICE from b.in() (upload_u16 and
+  //     emit_u16, established by experiment, not by inspection).
+  //   host worker              -- gathers on the HOST from b.in(), fused.
+  //   writer's convert         -- skipped, because both set raw_ready, so it never
+  //     sweeps b.pixels.
+  // The one that still needs float4 is gpu_float_out, where the device hands floats
+  // back. Hence the condition is `&&`, not `||`.
+  const bool host_touches_pixels = use_gpu && opt.gpu_float_out;
   const std::size_t per_batch =
       static_cast<std::size_t>(batch) *
       ((host_touches_pixels ? pixels * sizeof(RgbaF) : 0) + in_frame_bytes +
@@ -3572,10 +3565,25 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // whatever the PREVIOUS batch left in that buffer.  Right frame count, right
         // palette, plausible picture, wrong pixels.
         std::string cpu_err;
+        // Fused gather: hand the engine the decoder's bytes and the stride between
+        // frames, and let it widen per visit. `b.pixels.data()` is passed but will be
+        // nullptr on most configurations now -- `host_touches_pixels` no longer
+        // allocates it -- and the engine does not read `batch` when gather_layout != 0.
+        //
+        // Layout 3 is planar 8-bit 4:4:4, which is what `use_yuv444` decodes to;
+        // anything else here is the interleaved uint16 path. `use_yuv420` never reaches
+        // this call: the host refusal above it returns first, because 4:2:0 chroma has
+        // to be reconstructed and this engine has no upsampler for it.
+        const int gather_layout = use_yuv444 ? 3 : 4;
+        // `b.in()` is uint16*; the planar layout is the SAME memory viewed as bytes,
+        // which is how the reader already hands it to RawYuv444ToFloatsParallel. No
+        // separate 8-bit buffer exists -- the cast is the whole difference.
         RiemersmaBlocksCpu(palette, params, tree, info.width, info.height,
                            b.pixels.data(), b.frames, std::max(16, opt.block),
                            reinterpret_cast<unsigned char*>(b.out()), pixels,
-                           out_yuv444, &cpu_err);
+                           out_yuv444, &cpu_err,
+                           reinterpret_cast<const unsigned char*>(b.in()),
+                           in_frame_bytes, gather_layout, dec_channels);
         if (!cpu_err.empty()) {
           // Hard stop, not a note.  Reported once per process because this runs on
           // every host worker on every batch.

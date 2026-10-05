@@ -222,13 +222,34 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                         unsigned char* raw_out = nullptr,
                         std::size_t out_pixels = 0,
                         bool out_yuv444 = true,
+                        // FUSED GATHER.  When `gather_raw` is non-null the engine widens
+                        // the decoder's own bytes per visit instead of reading `batch`,
+                        // and `batch` is then never dereferenced -- which is what lets
+                        // the caller drop the float4 buffer entirely.
+                        //
+                        // `gather_layout`: 0 = not fused (read `batch`, unchanged
+                        // behaviour); 3 = planar 8-bit 4:4:4, three planes of `pixels`
+                        // bytes in Y, Cb, Cr order; 4 = interleaved uint16.
+                        // `gather_frame_bytes` is the per-frame stride in `gather_raw`,
+                        // which is the caller's `in_frame_bytes`.
+                        // `gather_channels` is 3 or 4 for the interleaved case only.
+                        //
+                        // The arithmetic below is transcribed from RawToFloats and
+                        // RawYuv444ToFloats rather than re-derived, including the
+                        // synthesised 65535 alpha, because that alpha is what the
+                        // encoder has always received and re-deriving it would be the
+                        // fifth independent version of this widening.
                         // Error channel, same convention as the two GPU engines: written
                         // only on failure, never on success, and a null pointer is
                         // tolerated.  This exists because the function returns void, so a
                         // refusal used to leave the caller believing the fused output had
                         // been written when it had not -- and the caller then skipped its
                         // convert and encoded the PREVIOUS batch's bytes.
-                        std::string* error_out = nullptr);
+                        std::string* error_out = nullptr,
+                        const unsigned char* gather_raw = nullptr,
+                        std::size_t gather_frame_bytes = 0,
+                        int gather_layout = 0,
+                        int gather_channels = 0);
 
 // The Hilbert visit order for a frame, and the map from a pixel back to the visit
 // that owns it.  Exposed so a port of this engine to another accelerator (see

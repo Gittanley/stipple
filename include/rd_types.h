@@ -57,6 +57,45 @@ struct RgbaF {
   float r = 0.0f, g = 0.0f, b = 0.0f, a = 0.0f;
 };
 
+// swscale's 8-bit YUV -> 16-bit RGB, bit-exact.  THIS IS THE SINGLE SOURCE.
+//
+// It was in rd_video.cpp's anonymous namespace, which is a problem the moment a
+// second translation unit needs the same arithmetic bit for bit -- and the project
+// now has four independent derivations of this matrix: the CUDA kernel
+// d_sws_yuv_to_rgb16, the OpenCL scatter_yuv444 kernel, the host copy that lived
+// in rd_video.cpp, and whatever the reader would have needed. A near-equivalent is
+// a hue shift: the comment on the device version records that an earlier float
+// approximation of this same matrix produced a measurably different picture, and
+// that is why it was ported rather than derived.
+//
+// It lives here rather than in a new header because rd_riemersma.h already includes
+// this one, so both the video pipeline and the host dither engine see it without
+// either including the other's header -- an engine TU including rd_video.h would
+// invert the layering.
+inline std::uint16_t SwsClip16(int x) noexcept {
+  const int v = x + (1 << 15);
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return static_cast<std::uint16_t>(v);
+}
+
+inline void SwsYuvToRgb16(unsigned y, unsigned u, unsigned v,
+                           std::uint16_t* out) noexcept {
+  int yy = static_cast<int>((y - 128u) * 512u);
+  const int uu = static_cast<int>((u - 128u) * 512u);
+  const int vv = static_cast<int>((v - 128u) * 512u);
+  yy += 0x10000;
+  yy -= 8192;                              // yuv2rgb_y_offset
+  yy *= 9539;                              // yuv2rgb_y_coeff
+  yy += (1 << 13) - (1 << 29);
+  const int ri = vv * 13075;               // yuv2rgb_v2r_coeff
+  const int gi = vv * -6660 + uu * -3209;  // v2g, u2g
+  const int bi = uu * 16525;               // yuv2rgb_u2b_coeff
+  out[0] = SwsClip16((ri + yy) >> 14);
+  out[1] = SwsClip16((gi + yy) >> 14);
+  out[2] = SwsClip16((bi + yy) >> 14);
+}
+
 // quantize.c: #define ErrorQueueLength 16
 inline constexpr int kErrorQueueLength = 16;
 
