@@ -1721,7 +1721,13 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   const int cols = opt.im_palette
                        ? static_cast<int>(want)
                        : static_cast<int>(std::ceil(std::sqrt(static_cast<double>(want))));
-  const int rows = (want + cols - 1) / cols;
+  // `want` is int64_t and is only capped when --palette-frames is absent (:1284), so
+  // this narrowing cannot be waved off with "it is small".  It is safe because `rows`
+  // is about sqrt(want), not want: `cols` is ceil(sqrt(want)) on the line above, so
+  // rows overflows int only once want exceeds (2^31)^2 = 4.6e18, and any want that
+  // large fails allocating the montage several lines earlier.  Stated rather than
+  // left implicit, so the next reader is not left guessing which of the two it is.
+  const int rows = static_cast<int>((want + cols - 1) / cols);
   const std::size_t montage_w = static_cast<std::size_t>(cols) * cell_w;
   const std::size_t montage_h = static_cast<std::size_t>(rows) * cell_h;
   const std::size_t montage_pixels = montage_w * montage_h;
@@ -1870,8 +1876,13 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     // Concurrency is capped rather than one-thread-per-sample: on a spinning disk
     // thirty simultaneous seeks thrash the head, and past about six the returns
     // flatten anyway.
+    // Clamp in 64-bit and narrow afterwards, rather than letting std::min<int> do the
+    // narrowing: that instantiation is what produced the least readable warning in the
+    // build (MSVC prints the target as `const _Ty`, `_Ty=int`, because _Ty is this
+    // call's template parameter and not a type anyone can grep for).  Narrowing after
+    // the clamp is provably safe rather than incidentally safe -- the value is <= 6.
     const int workers =
-        std::max(1, std::min<int>(want, 6));
+        static_cast<int>(std::max<std::int64_t>(1, std::min<std::int64_t>(want, 6)));
     std::vector<std::uint8_t> placed(static_cast<std::size_t>(want), 0);
     std::atomic<int> next_sample{0};
     // Completion count, as opposed to `next_sample` which counts *attempts*.
@@ -3455,7 +3466,8 @@ bool VideoProcess(const std::string& in, const std::string& out,
           int64_t waited = 0;
           for (;;) {
             if (!ready.empty()) {
-              const int64_t since = NowMs() - static_cast<double>(last_gpu_ms.load());
+              const int64_t since = static_cast<int64_t>(
+                  NowMs() - static_cast<double>(last_gpu_ms.load()));
               // The GPU moved recently, so it is keeping up: let it go first.
               if (waited >= budget || since > budget) break;
             } else if (eof || failed) {

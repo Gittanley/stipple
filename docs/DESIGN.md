@@ -3783,3 +3783,37 @@ in the previous section: a check with the wrong shape cannot see the bug it was
 nearest to.  probe-video-invariance.ps1 does compare host against device and does
 pass -- because the default input mode is the one combination that was already
 correct.
+
+## Correction: the R1 per-frame saving was wrong twice, and the right number is 66,355,200 B
+
+Commit `891ada9` published the saving from fusing the encoder's convert into the host
+scatter as **99,532,800 B per frame**. That figure is not a per-frame quantity at all:
+2,073,600 px x 3 B/px x 16 frames = 99,532,800 is the size of one **batch-16 slot**.
+Labelling a per-slot byte count as a per-frame one is the same error shape as the four
+documented in this file already -- a byte count carried over from a different quantity.
+
+It was then corrected to 72,576,000 B, which is also wrong, in the opposite direction.
+72,576,000 is the traffic that *used to happen*, not the traffic that stopped:
+
+| per frame, 1920x1080, yuv444p | bytes |
+|---|---:|
+| before: scatter writes `b.pixels` at 16 B/px (RgbaF) | 33,177,600 |
+| before: convert reads `b.pixels` at 16 B/px | 33,177,600 |
+| before: convert writes `b.out()` at 3 B/px | 6,220,800 |
+| **total before** | **72,576,000** |
+| after: scatter writes `b.out()` directly at 3 B/px | 6,220,800 |
+| **net saving** | **66,355,200** = 63.28 MiB |
+
+The 3 B/px write did not disappear; it **relocated** from the convert pass into the
+scatter, so counting it as removed overstates the saving by exactly 6,220,800 B. What
+R1 removed is two 16 B/px passes -- the scatter's now-dead RgbaF write and the convert's
+read of it.
+
+The commit's "16.10% of 229.85 MiB" also does not divide: 94.92 / 229.85 is 41.29%. And
+229.85 MiB/frame cannot be reconstructed from source under any convention tried, so that
+denominator should not be used until someone rebuilds it from a stated rule.
+
+**A coincidence to avoid confusing.** This saving, 66,355,200 B, and the pending gather
+fusion's 66,355,213 B are **13 bytes apart and entirely unrelated quantities** -- R1's is
+two 16 B/px passes, the fusion's is the reader's widening plus the gather's read
+reduction. They are not one figure and a typo of the other.

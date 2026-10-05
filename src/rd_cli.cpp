@@ -64,6 +64,14 @@ struct Options {
 };
 
 void PrintUsage() {
+  // The lone argument below is for the single bare `%d` in this format string, which
+  // states the real --colors ceiling.  It was written without one, so `%d` read past
+  // the end of the argument list -- undefined behaviour -- and `--help` printed
+  // "the parser requires 2..0" in the very sentence explaining that --colors 0 does
+  // not exist.  MSVC caught it as C4473; it went unread because the build's other
+  // warnings are narrowing conversions, and C4473 is the only one that means the
+  // program is already wrong.  The bound comes from rd::kMaxColormapSize, the same
+  // value the refusal at the --colors parse prints, so the two cannot disagree.
   std::printf(
       "rdither -- ImageMagick 7.1.2-31 Q16-HDRI Riemersma dithering\n"
       "\n"
@@ -183,7 +191,8 @@ void PrintUsage() {
       "  rdither --engine approx --approx-iters 32 --verify in.png out.png\n"
       "  rdither --max-ram-mb 64 --colors 16 huge.tif out.png\n"
       "  rdither --video --colors 16 --cpu-threads 0 in.mp4 out.mp4\n"
-      "  rdither --video --colors 16 --video-lossless in.mp4 out.mkv\n");
+      "  rdither --video --colors 16 --video-lossless in.mp4 out.mkv\n",
+      rd::kMaxColormapSize);
 }
 
 bool ParseSize(const char* text, std::size_t* out) {
