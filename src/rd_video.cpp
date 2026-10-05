@@ -2915,9 +2915,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // under-claiming today rather than over-claiming, so this is a correctness fix and
   // not a safety one -- but it is the whole reason the 4050 MiB reaches the queue.
   //
-  // Names the RESOLVED engine.  use_gpu is settled at :2531 and cpu_threads at :2609,
+  // Names the RESOLVED engine.  use_gpu is settled at :2720 and cpu_threads at :2702,
   // both above here.  c5efb68 was a crash because a neighbouring condition named the
-  // REQUESTED branch instead.
+  // REQUESTED branch instead.  (The line numbers were 2531 and 2609 until edits above
+  // this one moved them; a citation that has drifted is worse than none, because it
+  // reads as if it were checked.)
   //
   // WAS: !use_gpu || opt.gpu_float_out || cpu_threads > 0, which is now WRONG in the
   // other direction -- it under-claims, so the float buffer was still allocated for
@@ -3074,7 +3076,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
     //
     // So the predicate names the RESOLVED engine, not the request.  That distinction
     // has bitten this file before: c5efb68 was a crash because the condition named the
-    // requested branch.  use_gpu is resolved at :2531 and cpu_threads at :2609, both
+    // requested branch.  use_gpu is resolved at :2720 and cpu_threads at :2702, both
     // above this point, so all three inputs are known here.
     // host_touches_pixels is declared once above, where the RAM budget uses it, so the
     // figure reported and the memory actually taken cannot drift apart.

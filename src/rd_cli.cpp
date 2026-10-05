@@ -1189,7 +1189,10 @@ int main(int argc, char** argv) {
         ++i;
         opt.video_opt.mem_fraction = parsed_d;
       }
-      rd::g_video_memory_fraction = opt.video_opt.mem_fraction;
+      // The assignment to rd::g_video_memory_fraction that used to be here is gone. It
+      // was the only reference to that global outside its own declaration and
+      // definition, so --mem-fraction wrote a value nothing ever read. The flag still
+      // works: rd_video.cpp reads opt.mem_fraction directly.
     } else if (arg == "--video-pix-fmt") {
       if (!NeedsValue(argc, i, "--video-pix-fmt")) return 2;
       opt.video_opt.pix_fmt = argv[++i];
@@ -1684,12 +1687,24 @@ int main(int argc, char** argv) {
   // still using IM's half-rule.  Reading it off the palette makes the two agree by
   // construction instead of by two implementations being kept in step.
   const bool associate_alpha = palette->associate_alpha;
-  if (image.has_alpha && !associate_alpha) {
-    std::fprintf(stderr,
-                 "[dither] note: associate_alpha cleared -- at most 2 colours in a grey "
-                 "colorspace, matching ImageMagick's SetAssociatedAlpha. The tree is "
-                 "8-child rather than 16-child and carries no alpha term.\n");
-  }
+  // The diagnostic that used to stand here is UNREACHABLE, and deliberately not deleted
+  // silently. It was:
+  //
+  //   if (image.has_alpha && !associate_alpha) { ... "associate_alpha cleared" ... }
+  //
+  // It fired only when the palette declined an alpha the image had. It no longer can.
+  // ImBuildPalette now tests qi->colorspace rather than source->colorspace, and it sets
+  // qi->colorspace = UndefinedColorspace -- upstream's GetQuantizeInfo default, and what
+  // `magick -colors N` passes -- so `grey_colorspace` is always false and the rule
+  // reduces to `alpha_trait != UndefinedPixelTrait`, which is exactly `image.has_alpha`.
+  // The two agree by construction rather than by two implementations being kept in step,
+  // which was the whole point of reading the flag off the palette.
+  //
+  // WHY IT MATTERS THAT THIS IS UPSTREAM-SHAPED: SetAssociatedAlpha's grey-colorspace
+  // clause is dead code upstream too, for the same reason. Setting qi->colorspace to a
+  // grey value is the only thing that would revive it -- and this branch with it.
+  // Re-enable it here rather than assuming the note is no longer wanted.
+  (void)associate_alpha;
   std::unique_ptr<rd::ColorTree> tree(new rd::ColorTree());
   if (!opt.palette_import.empty()) {
     // Reuse the tree ImReadPalette already built FROM the palette.  Rebuilding it

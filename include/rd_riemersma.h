@@ -46,7 +46,14 @@ namespace rd {
 
 // Fraction of *physical* RAM the video pipeline may spend on in-flight frame
 // buffers.  Set from --mem-fraction; 0 means auto.
-extern double g_video_memory_fraction;
+// `g_video_memory_fraction` was removed from here. It was declared here, defined in
+// rd_riemersma_cpu.cpp and assigned by the --mem-fraction parse, and NOTHING EVER READ
+// IT: the video pipeline reads opt.mem_fraction directly (rd_video.cpp:2215). So the
+// global was a second copy of a value with no consumer, and --mem-fraction appeared to
+// configure something that had no effect.
+//
+// Worth stating because the FLAG is not dead and still works. The defect was a parallel
+// channel, not a dead option.
 
 // Gravity directions, matching the subset ImageMagick uses for the curve.
 enum class Gravity : int { kWest = 0, kEast = 1, kNorth = 2, kSouth = 3 };

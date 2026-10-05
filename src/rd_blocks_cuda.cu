@@ -105,7 +105,19 @@ __global__ void BlkIndexWalkKernel(const float* __restrict__ cx,
                                    const DevNode* __restrict__ nodes, int n,
                                    int nblocks, int frame_pitch, int block_size,
                                     unsigned char* __restrict__ out_index) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int, and `--batch-frames` has no upper clamp anywhere in the program, so
   // this product does pass INT_MAX (2,147,483,647).  nblocks = ceil(n/block) and
   // n = pixels+1, so the first overflowing batch is 530,112 frames at 1920x1080
@@ -121,8 +133,9 @@ __global__ void BlkIndexWalkKernel(const float* __restrict__ cx,
 
   // Which frame this work item belongs to, and which block within it.  Each
   // frame is an independent walk, so each keeps its own error state.
-  const int frame = slot / nblocks;
-  const int local = slot - frame * nblocks;
+  const int frame = static_cast<int>(slot / nblocks);
+  const int local =
+      static_cast<int>(slot - static_cast<std::int64_t>(frame) * nblocks);
   const float* frame_cx = cx + static_cast<std::size_t>(frame) * n * 4;
 
   const int begin = local * block_size;
@@ -233,7 +246,19 @@ __global__ void BlkScatterKernel(float4* __restrict__ pixels,
                                 const double* __restrict__ palette, int n,
                                 int frame_pitch, int pixel_pitch, int assoc,
                                 std::uint16_t* __restrict__ u16) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic.  n = pixels+1, so at
   // 1920x1080 n * frame_pitch passes INT_MAX (2,147,483,647) at --batch-frames
   // 1036 (2,148,250,436) and at 7680x4320 at 65 (2,156,544,065); the product then
@@ -241,8 +266,8 @@ __global__ void BlkScatterKernel(float4* __restrict__ pixels,
   // writes nothing -- so the download below returns the raw cudaMalloc bytes of
   // d_pixels/d_u16 and the caller exits 0.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const int pixel = curve[i];
   // Skip positions that a later visit supersedes; without this the scatter's
   // last-writer would be whichever thread happened to run last.
@@ -310,15 +335,27 @@ __global__ void BlkScatterYuv444Kernel(const int* __restrict__ curve,
                                        const double* __restrict__ palette, int n,
                                        int frame_pitch, int pixel_pitch, int assoc,
                                        unsigned char* __restrict__ yuv) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
   // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
   // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and the
   // planar output buffer keeps whatever cudaMalloc returned -- three bytes per
   // pixel, which the encoder consumes directly.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const int pixel = curve[i];
   if (owner[pixel] != i) return;
   const double* p = palette + 4 * static_cast<int>(index[slot]);
@@ -410,15 +447,27 @@ template <typename T>
 __global__ void BlkGatherKernel(const float4* __restrict__ pixels,
                                 const int* __restrict__ curve, T* __restrict__ cx,
                                 int n, int frame_pitch, int pixel_pitch) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
   // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
   // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
   // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
   // memory and still exits 0.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const float4 p =
       pixels[static_cast<std::size_t>(frame) * pixel_pitch + curve[i]];
   T* dst = cx + static_cast<std::size_t>(frame) * n * 4 + 4 * i;
@@ -445,15 +494,27 @@ __global__ void BlkGatherU16Kernel(const std::uint16_t* __restrict__ pixels,
                                    const int* __restrict__ curve,
                                    T* __restrict__ cx, int n, int frame_pitch,
                                    int pixel_pitch, int channels) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
   // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
   // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
   // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
   // memory and still exits 0.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const std::uint16_t* p =
       pixels + (static_cast<std::size_t>(frame) * pixel_pitch + curve[i]) * channels;
   T* dst = cx + static_cast<std::size_t>(frame) * n * 4 + 4 * i;
@@ -540,15 +601,27 @@ __global__ void BlkGatherYuv444Kernel(const unsigned char* __restrict__ planes,
                                       const int* __restrict__ curve,
                                       T* __restrict__ cx, int n, int frame_pitch,
                                       int pixel_pitch) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
   // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
   // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
   // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
   // memory and still exits 0.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const int pix = curve[i];
   // Planar 4:4:4 is three planes per frame, so frame f's luma starts at
   // f * 3 * pixel_pitch, not f * pixel_pitch.  The latter reads frame f-1's U and
@@ -605,15 +678,27 @@ __global__ void BlkGatherYuv420Kernel(const unsigned char* __restrict__ planes,
                                       const int* __restrict__ curve,
                                       T* __restrict__ cx, int n, int frame_pitch,
                                       int pixel_pitch, int w, int h) {
-  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  // int64, not int.  `blockIdx.x * blockDim.x + threadIdx.x` is computed in unsigned
+  // int and then narrowed, so past INT_MAX it wraps NEGATIVE; the guard two lines below
+  // compares it against a positive int64, a negative value passes, and the kernel writes
+  // out of bounds.  The guard was already widened to int64 earlier, which fixed the
+  // comparison but left the value it compares already wrapped -- the two halves have to
+  // move together.
+  //
+  // `n`, `nblocks` and `frame_pitch` are all int, so once the guard has passed, `frame`
+  // is below frame_pitch and `i` is below n.  The casts back to int are therefore
+  // value-preserving, not truncating, and they keep the index arithmetic below in the
+  // type it was written for.
+  const std::int64_t slot =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // int*int; see BlkIndexWalkKernel for the full arithmetic (1920x1080 first
   // overflows at --batch-frames 1036, 7680x4320 at 65).  The int product wraps
   // NEGATIVE past INT_MAX, `slot >= negative` is true for every thread, and d_cx
   // keeps whatever cudaMalloc returned -- so the walk dithers uninitialised device
   // memory and still exits 0.  Bound widened; `slot` left int.
   if (slot >= static_cast<std::int64_t>(n) * frame_pitch) return;
-  const int frame = slot / n;
-  const int i = slot - frame * n;
+  const int frame = static_cast<int>(slot / n);
+  const int i = static_cast<int>(slot - static_cast<std::int64_t>(frame) * n);
   const int pix = curve[i];
   const int x = pix % w;
   const int y = pix / w;
@@ -1380,9 +1465,22 @@ std::string RiemersmaBlocksCuda(const Palette& palette, const DitherParams& para
   // The walk is one thread per (frame, block); gather and scatter are one thread
   // per (frame, position), i.e. block_size times more.  Sharing the walk's grid
   // here silently leaves most pixels unwritten.
-  const int grid_walk = static_cast<int>((slots + threads - 1) / threads);
-  const int grid_pixel = static_cast<int>(
-      (static_cast<std::int64_t>(n) * frames + threads - 1) / threads);
+  const std::int64_t grid_walk_64 = (slots + threads - 1) / threads;
+  const std::int64_t grid_pixel_64 =
+      (static_cast<std::int64_t>(n) * frames + threads - 1) / threads;
+  // Both grids are narrowed to int for the launch, and CUDA's grid.x limit is 2^31-1,
+  // so a value past that wraps NEGATIVE and the launch fails with an error nobody
+  // attributes to an overflow.  Unreachable in practice -- it needs slots/threads above
+  // 2.1e9, which at 256 threads is 5.5e11 slots, far past what 4 GB of VRAM holds -- but
+  // "unreachable" is not a reason to narrow silently, and the kernels' own `slot` is
+  // int64 for exactly this reason.  Refuse loudly rather than wrap.
+  if (grid_walk_64 > 2147483647LL || grid_pixel_64 > 2147483647LL) {
+    return std::string("grid too large: walk ") + std::to_string(grid_walk_64) +
+           ", pixel " + std::to_string(grid_pixel_64) +
+           " exceeds the CUDA grid.x limit of 2147483647";
+  }
+  const int grid_walk = static_cast<int>(grid_walk_64);
+  const int grid_pixel = static_cast<int>(grid_pixel_64);
 
   KernelTiming kt;
   if (kt.on) cudaEventRecord(kt.beg[0], stream);

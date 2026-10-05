@@ -15,7 +15,8 @@
 
 namespace rd {
 
-double g_video_memory_fraction = 0.0;
+// g_video_memory_fraction used to be defined here. Nothing read it; see the note in
+// include/rd_riemersma.h where its declaration was.
 
 namespace {
 
