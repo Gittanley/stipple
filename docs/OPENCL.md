@@ -299,12 +299,32 @@ by a flag a reader can set, and the 6410 ms / 6124 ms pair cannot be reproduced 
 checked by anyone following this document.
 
 What DOES exist now, added after that text was written: `RD_OCL_IO=1`, which prints an
-`[io]` line with five separate byte buckets and a conservation assertion comparing the
-measured H2D total against `width x height x frames x bytes_per_pixel` computed from the
-run's own inputs. That checks the byte volume exactly and is immune to the run-to-run
-drift documented elsewhere -- which is the property a per-stage millisecond comparison
-lacked. It does not break the stage down the way the quoted numbers do, so this
-measurement is recorded as unreproducible rather than replaced.
+`[io]` line with SIX separate byte buckets -- `h2d`, `d2h`, `host_copy`, `d2d`, `fill` and
+`dump` -- and a conservation assertion comparing the measured H2D total against
+`width x height x frames x bytes_per_pixel` computed from the run's own inputs. That
+checks the byte volume exactly and is immune to the run-to-run drift documented
+elsewhere -- which is the property a per-stage millisecond comparison lacked. It does not
+break the stage down the way the quoted numbers do, so this measurement is recorded as
+unreproducible rather than replaced.
+
+`fill` was the sixth bucket, added because a `clEnqueueFillBuffer` writes DEVICE memory
+with no source buffer and so crossed no boundary -- it landed in none of the other five,
+which made it invisible. Measured on a 256x192 eight-frame clip:
+
+| configuration | `d2d` | `fill` |
+|---|---|---|
+| `yuv444` in, `yuv444p` out | 1,179,648 B in 1 xfer | 0 |
+| `rgba64le` in, `yuv444p` out | **0** | 1,179,648 B in 3 xfer |
+
+Before `fill` existed the second row printed `d2d=0` and read as clean, while writing
+1,179,648 B of device bytes that the scatter then overwrote. Note the two rows are the
+SAME 1,179,648 B -- `256 x 192 x 3 x 8` exactly -- reached by two different routes, which
+is the fact the bucket was added to make visible.
+
+`fill` is NOT host traffic and must not be added to any bandwidth figure derived from the
+other five: it moves nothing between host and device. It is recorded as bytes WRITTEN,
+which is the only honest measure available for an operation with no source, and it is
+also the number that shows how much of the work a later kernel discarded.
 *plus* its readback came to 6410 ms against CUDA's 6124 ms of whole-batch dither+IO, so
 the walk was never the problem.
 

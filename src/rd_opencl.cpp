@@ -722,11 +722,22 @@ struct IoTally {
   std::uint64_t d2h = 0;
   std::uint64_t host_copy = 0;
   std::uint64_t d2d = 0;
+  // clEnqueueFillBuffer writes DEVICE MEMORY with no source buffer, so it crossed no
+  // boundary and landed in none of the four above.  That made it invisible: a config
+  // whose pre-fill is three fills printed `d2d=0`, which reads as clean, while writing
+  // 99,532,800 B per batch of bytes the scatter then overwrote.
+  //
+  // `fill` is NOT host traffic and must not be folded into any bandwidth figure derived
+  // from the other buckets -- it moves nothing between host and device.  It is here so
+  // that `d2d=0` stops being ambiguous between "nothing happened" and "something
+  // happened that nothing counts".
+  std::uint64_t fill = 0;
   std::uint64_t dump = 0;
   std::uint64_t h2d_calls = 0;
   std::uint64_t d2h_calls = 0;
   std::uint64_t host_copy_calls = 0;
   std::uint64_t d2d_calls = 0;
+  std::uint64_t fill_calls = 0;
   std::uint64_t dump_calls = 0;
 };
 
@@ -810,6 +821,25 @@ cl_int CopyBytes(cl_command_queue queue, cl_mem src, cl_mem dst, std::size_t src
   const cl_int e = clEnqueueCopyBuffer(queue, src, dst, src_off, dst_off, bytes, 0,
                                        nullptr, nullptr);
   if (e == CL_SUCCESS && io != nullptr) CountBytes(&io->d2d, &io->d2d_calls, bytes);
+  return e;
+}
+
+// The only way this file issues a clEnqueueFillBuffer.  Exists for the same reason
+// MakeBuffer and CopyBytes exist: so that every device write lands in a bucket, and so
+// that the four raw call sites cannot drift apart again.
+//
+// `pattern_size` is passed through rather than assumed, because it must be 1, 2, 4, 8
+// ... -- passing 3 is CL_INVALID_VALUE on any conformant runtime, which is the bug
+// recorded at the call site below.
+cl_int FillBytes(cl_command_queue queue, cl_mem dst, const void* pattern,
+                 std::size_t pattern_size, std::size_t offset, std::size_t bytes,
+                 IoTally* io) {
+  const cl_int e = clEnqueueFillBuffer(queue, dst, pattern, pattern_size, offset, bytes,
+                                       0, nullptr, nullptr);
+  // Count the BYTES WRITTEN, not bytes moved: a fill has no source, so `bytes` is the
+  // only honest measure of the work it did, and it is the number that shows how much of
+  // it the scatter went on to overwrite.
+  if (e == CL_SUCCESS && io != nullptr) CountBytes(&io->fill, &io->fill_calls, bytes);
   return e;
 }
 
@@ -1575,14 +1605,11 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
       const std::size_t plane3 = yuv_bytes / 3;
       const cl_uchar luma_fill = 0;
       const cl_uchar chroma_fill = 128;
-      e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &luma_fill, 1, 0, plane3, 0,
-                              nullptr, nullptr);
+      e = FillBytes(ctx->queue, b_out_yuv, &luma_fill, 1, 0, plane3, &io);
       if (e == CL_SUCCESS)
-        e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &chroma_fill, 1, plane3,
-                                plane3, 0, nullptr, nullptr);
+        e = FillBytes(ctx->queue, b_out_yuv, &chroma_fill, 1, plane3, plane3, &io);
       if (e == CL_SUCCESS)
-        e = clEnqueueFillBuffer(ctx->queue, b_out_yuv, &chroma_fill, 1, 2 * plane3,
-                                plane3, 0, nullptr, nullptr);
+        e = FillBytes(ctx->queue, b_out_yuv, &chroma_fill, 1, 2 * plane3, plane3, &io);
     }
     if (e != CL_SUCCESS) return fail("fill(yuv444 out)");
   } else if (want_u16) {
@@ -1618,8 +1645,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
       // value -- but deterministic, which is the property that matters, and this
       // combination is not what the video pipe uses.
       const cl_uint zero = 0;
-      e = clEnqueueFillBuffer(ctx->queue, b_out16, &zero, sizeof(zero), 0,
-                              u16_bytes, 0, nullptr, nullptr);
+      e = FillBytes(ctx->queue, b_out16, &zero, sizeof(zero), 0, u16_bytes, &io);
     }
     if (e != CL_SUCCESS) return fail("fill(u16 out)");
   }
@@ -1835,7 +1861,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
         "colours=%d  mode=%s  (%llu B/px in)\n"
         "[io] h2d=%llu B in %llu xfer  |  d2h=%llu B in %llu xfer  |  "
         "host_copy=%llu B in %llu xfer  |  d2d=%llu B in %llu xfer  |  "
-        "dump=%llu B in %llu xfer\n"
+        "fill=%llu B in %llu xfer  |  dump=%llu B in %llu xfer\n"
         "[io] conservation: uploaded %llu B, expected %llu B "
         "(%zux%zu x%d frames x %llu B/px)  delta=%lld B\n",
         static_cast<unsigned long long>(width),
@@ -1850,6 +1876,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
         static_cast<unsigned long long>(io.host_copy_calls),
         static_cast<unsigned long long>(io.d2d),
         static_cast<unsigned long long>(io.d2d_calls),
+        static_cast<unsigned long long>(io.fill),
+        static_cast<unsigned long long>(io.fill_calls),
         static_cast<unsigned long long>(io.dump),
         static_cast<unsigned long long>(io.dump_calls),
         static_cast<unsigned long long>(uploaded),
