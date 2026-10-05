@@ -3920,3 +3920,121 @@ of traffic from it; what remains is the serial sampling itself.
    gap between child *discoveries* rather than between samples -- after all four children
    are found there are legitimately no more -- but **that is UNVERIFIED**, and until it is,
    the 10.3 s figure should not be read as a bound on the error.
+
+## Three structural changes, and what is and is not measured
+
+### The reader's widening is fused into the host gather
+
+The host pipeline widened the decoder's bytes into a float4 buffer, and the gather read
+that back once per visit without ever writing it. That was a whole pass per frame, and it
+is now gone: the engine takes the raw bytes plus the frame stride and widens per visit.
+
+`host_touches_pixels` had to change shape, from
+
+    !use_gpu || opt.gpu_float_out || cpu_threads > 0        (was: allocated in configs that never read it)
+
+to
+
+    use_gpu && opt.gpu_float_out                              (one config still needs float4)
+
+With the widening fused there is exactly one configuration that still reads float4: a GPU
+asked to RETURN float4. The GPU gathers on-device from `b.in()`, the host worker now
+gathers on-host from `b.in()`, and the writer's convert is skipped because both set
+`raw_ready`. The old condition under-claimed, so the buffer was allocated in
+configurations with no reader -- which is why the saving is RAM the machine was already
+not using, rather than a saving it was previously spending.
+
+**The alpha is load-bearing and was nearly got wrong.** The interleaved scatter reads
+SOURCE alpha for visited pixels, because with `associate_alpha` off the scatter never
+wrote `.a`, so the encoder has always received that value. Deleting the float buffer means
+re-deriving it from the raw bytes, and the planar case's synthesised opaque 65535 has to be
+reproduced too. That arithmetic was transcribed from `RawToFloats` and
+`RawYuv444ToFloats` rather than re-derived -- a fifth independent version of the same
+widening is exactly how the alpha would have changed silently.
+
+**A coincidence to not be confused by.** This change's byte saving and R1's are 13 bytes
+apart and are unrelated quantities:
+
+| | bytes/frame | what it is |
+|---|---:|---|
+| R1 (encode convert fused into the scatter) | 66,355,200 | two 16 B/px passes |
+| gather fusion (this change) | 66,355,213 | the widening plus the gather's read reduction |
+
+Anyone seeing both figures will assume one is a typo of the other. Neither is.
+
+### `SwsClip16` / `SwsYuvToRgb16` have one home
+
+They lived in `rd_video.cpp`'s anonymous namespace, which is a problem the moment a second
+translation unit needs the same arithmetic bit for bit -- and the project had FOUR
+independent derivations of this matrix: CUDA `d_sws_yuv_to_rgb16`, OpenCL
+`scatter_yuv444`, the host copy, and whatever the reader needed. A near-equivalent is a hue
+shift; the device comment records an earlier float approximation producing a measurably
+different picture. They now live in `include/rd_types.h`, which `rd_riemersma.h` already
+includes, so neither TU includes the other's header.
+
+### The kernel `slot` was int32, and the guard was already int64
+
+Seven kernels computed `const int slot = blockIdx.x * blockDim.x + threadIdx.x`, which is
+unsigned arithmetic narrowed to int. Past INT_MAX that wraps NEGATIVE, and the bounds
+guard -- widened to int64 in an earlier change -- compares it against a positive bound, so
+a negative value PASSES and the kernel writes out of bounds. Widening the comparison while
+the value it compares was already wrapped fixes nothing; the two halves have to move
+together.
+
+`frame` and `i` stay int, deliberately: `n`, `nblocks` and `frame_pitch` are all int, so
+once the guard has passed, `frame` is below `frame_pitch` and `i` is below `n`. The casts
+back are value-preserving rather than truncating, which is why C4244 remains zero.
+
+The two grid dimensions were narrowed from int64 to int with no bound check, against a CUDA
+`grid.x` limit of 2^31-1. Unreachable in practice -- it needs 5.5e11 slots at 256 threads,
+far past 4 GB of VRAM -- but the kernels are int64 for this reason, so the launch config
+now refuses loudly instead of narrowing silently.
+
+### Dead scaffolding, three items
+
+`g_video_memory_fraction` was declared, defined, and assigned by the `--mem-fraction`
+parse, and read by NOTHING -- the video pipeline reads `opt.mem_fraction` directly. So the
+flag wrote a value with no consumer. The FLAG is not dead and still works; the defect was a
+parallel channel. The `associate_alpha cleared` diagnostic became unreachable once
+`ImBuildPalette` started testing `qi->colorspace`; SetAssociatedAlpha's greyscale clause
+is dead code upstream for the same reason, so the note records that reviving the clause
+means reviving the diagnostic.
+
+### Verification status, stated plainly
+
+| change | evidence |
+|---|---|
+| gather fusion | byte-identical on 8 arms (cpu/cuda x batch 16/4 x planar/interleaved) against a pre-change baseline; cpu==cuda==opencl at 6 geometries; `probe-unvisited-pixel` 6 of 6 |
+| int64 slot | build clean, C4244 = 0; AE unchanged on 6 fixtures x 3 engines; video oracle unchanged |
+| dead scaffolding | no behavioural surface to test |
+
+**The full suite has NOT been run against the gather fusion or the int64 slot.** The owner's
+machine crashed during a gate run, and `video determinism` -- 427 s of a ~650 s gate, 8 runs
+per case -- is the stage that pins every core. The last tree the suite measured green is
+`8494247`. Everything after it is unverified by the suite, and that includes a commit whose
+only content is adding a counter.
+
+### F1: written, measured identical, reverted -- and NOT disproven
+
+OpenCL's planar pre-fill was a whole-frame device copy, 6,220,800 B/frame at 1080p, whose
+only purpose was to give the unvisited pixels their source value -- typically ONE pixel. It
+was replaced by a per-pixel kernel gated on `owner[p] < 0`. `d2d` measured 1,179,648 B ->
+0 on a 256x192 eight-frame clip, and the short oracle reported byte-identical output at six
+geometries with all three engines agreeing.
+
+The suite then reported `opencl FAIL 1 of 8 runs produced no output`.
+
+**That result is contaminated and is cited here in neither direction.** It came from the run
+in which the machine crashed, and a process killed by a crash produces exactly "no output".
+There is no usable evidence against the change.
+
+The coverage question WAS settled, in the change's favour, and is recorded so the next
+attempt need not re-derive it. `rd_riemersma_cpu.cpp` builds owner last-writer-wins from
+the curve itself -- `(*owner)[(*out)[i]] = i` -- so `owner[P] >= 0` IMPLIES an `i` exists
+with `curve[i] == P` and `owner[P] == i`. The scatter writes `curve[i]` exactly when
+`owner[curve[i]] == i`. So owner>=0 implies the scatter writes P, owner<0 implies a fill
+writes P, and the two cover every pixel. **There is no coverage hole.** The hypothesis that
+there was one was mine, it was wrong, and it cost a tool call to chase.
+
+What remains genuinely unknown is whether the added OpenCL kernel perturbs context
+construction or interacts with the DMA'd output buffer. Nothing cheap settles that.
