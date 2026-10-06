@@ -441,10 +441,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
-            libmagickwand-dev ffmpeg pocl-opencl-icd clinfo \
+            imagemagick libmagickwand-dev ffmpeg pocl-opencl-icd clinfo \
           || sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
-            libmagick-dev ffmpeg pocl-opencl-icd clinfo
+            imagemagick libmagick-dev ffmpeg pocl-opencl-icd clinfo
           echo "--- versions ---"
           cmake --version | head -1
           (c++ --version || g++ --version) | head -1
@@ -452,16 +452,24 @@ jobs:
           ffmpeg -version | head -1
 
       - name: Report what this runner actually provides
-        # Recorded in the log because a green run on an unexpected toolchain is
-        # not the same evidence as a green run on the expected one -- the same
-        # reasoning as the Windows job's toolchain step.
+        # A REPORTING STEP MUST NEVER BE ABLE TO FAIL THE BUILD.  This one did, on its
+        # first run: `magick -version` exited non-zero because libmagickwand-dev
+        # installs the LIBRARY and the `magick` CLI is a separate package, so under
+        # `bash -e` the step died BEFORE build.sh ever ran.  The job then reported
+        # `if [ "skipped" = "success" ]` -- accurate, and useless, because it
+        # described a step that had not been attempted.
+        #
+        # So `set +e` here, and every probe below ends in `|| true`.  A toolchain
+        # that differs from expectations is information to print, not a reason to stop:
+        # the next step is the one that judges anything.
         run: |
+          set +e
           echo "runner: $RUNNER_OS $RUNNER_ARCH"
           echo "--- OpenCL platforms (pocl is OpenCL-on-CPU; that is the point) ---"
-          clinfo -l 2>/dev/null || echo "clinfo found no platform"
-          echo "--- ImageMagick configure-time facts that matter for bit-exactness ---"
-          magick -version
-          magick identify -list format 2>/dev/null | grep -i -E '^\s*(PNG|JPEG)' || true
+          clinfo -l 2>/dev/null || echo "clinfo found no platform (opencl stage will skip)"
+          echo "--- ImageMagick facts that matter for bit-exactness ---"
+          magick -version 2>&1 | head -4 || echo "magick CLI not found"
+          magick identify -list format 2>&1 | grep -i -E "(PNG|JPEG)" || echo "(format list unavailable)"
 
       - name: Build
         id: build
@@ -485,7 +493,24 @@ jobs:
           {
             echo "### Linux build"
             echo
-            if [ "${{ steps.build.outcome }}" = "success" ]; then
+          # Three outcomes, not two.  The first run produced "skipped" because an
+          # EARLIER step failed first, and the else branch then said "build.sh failed"
+          # -- which was false, and worse than useless: it named a cause that had not
+          # been tried.  A summary that blames the wrong step is the same defect as a
+          # check whose standard was authored from a different configuration.
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo "build.sh configured and compiled on ubuntu-latest."
+            echo
+            echo "**This is not yet a claim that Linux is supported.** The ImageMagick"
+            echo "flavour CMakeLists.txt understands is \`windows\` or \`conda\`, both of"
+            echo "which expect MSVC import libraries. If this step passed, either a"
+            echo "\`linux\` flavour has been added since this job was written, or the"
+            echo "build succeeded without linking ImageMagick. Check which."
+          elif [ "${{ steps.build.outcome }}" = "skipped" ]; then
+            echo "**build.sh was never run.** A step before it failed, so this says"
+            echo "nothing about Linux and nothing about build.sh. Read the step above"
+            echo "this one for the real cause."
+          else
               echo "build.sh configured and compiled on ubuntu-latest."
               echo
               echo "**This is not yet a claim that Linux is supported.** The ImageMagick"
