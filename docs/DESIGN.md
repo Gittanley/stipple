@@ -4038,3 +4038,26 @@ there was one was mine, it was wrong, and it cost a tool call to chase.
 
 What remains genuinely unknown is whether the added OpenCL kernel perturbs context
 construction or interacts with the DMA'd output buffer. Nothing cheap settles that.
+
+### F1 resolved: landed at f7adb98, and the FAIL was contamination
+
+The unknown above was settled by a gate that ran to completion. F1 is in the tree, and the
+`opencl FAIL 1 of 8 runs produced no output` did not reproduce -- opencl reported one pixel
+set over 8 runs with no divergence. That FAIL came from the run in which the owner's
+machine crashed, and a process killed by a crash produces exactly "no output", so it was
+never evidence about the code.
+
+`fill_unvisited_yuv444` replaces the whole-frame copy with one thread per `(frame, pixel)`
+that writes the pixel's three source bytes only where `owner[pixel] < 0`. Measured `d2d`
+1,179,648 B -> 0, and 0 on all four 1080p batches of a 60-frame clip: 373 MB of
+device-to-device traffic removed on a two-second clip, with h2d and d2h unchanged and
+conservation delta 0.
+
+The kernel uses `ulong slot` where the other seven use `int`, and that is deliberate rather
+than inconsistent. Their product is `n * frames`; this one is `npix * frames`, which is
+larger and therefore overflows `int` sooner. `frame` and `pixel` stay `int` because both are
+provably in range once `npix` and `frames` are, which is why C4244 stays 0.
+
+Verified at BOTH sides of the unvisited rule, which is what makes the check worth anything:
+4 of the oracle's 6 geometries have an unvisited pixel and 2 do not, so a fill that ran
+unconditionally would pass the 2 and fail the 4.
