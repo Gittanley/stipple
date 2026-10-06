@@ -954,6 +954,47 @@ struct Ctx {
   cl_kernel k_walk = nullptr;
   cl_kernel k_scatter = nullptr;
   cl_kernel k_scatter_u16 = nullptr;
+
+  // F3: the six clip-invariant uploads, hoisted out of the per-batch path.
+  //
+  // Every one is byte-identical for every batch of a clip, and together they are
+  // ~16.6 MB re-uploaded every batch -- 38 times over a 605-frame clip at batch 16,
+  // which is ~630 MB of transfer contributing nothing to the output.
+  //
+  // THE KEY IS EVERY INPUT TO THE DERIVATION, and nothing else:
+  //   b_curve, b_owner  <- (width, height), via BlockCurveOrder/BlockCurveOwner
+  //   b_nodes, b_search <- tree, assoc
+  //   b_pal             <- palette
+  //   b_w               <- a constant formula, so it never invalidates anything
+  // An identical key therefore PROVABLY means identical content, because every input
+  // that can change the content is in the key.
+  //
+  // Two things this deliberately does NOT key on.  `hnodes` and `hsearch` are locals
+  // rebuilt on every call, so keying on their .data() would be keying on whether the
+  // allocator happened to return the same block -- an accident, not a contract, and it
+  // would work in testing and fail later.  And curve/owner come from a THREAD-LOCAL
+  // SINGLE-ENTRY cache (rd_riemersma_cpu.cpp:750), whose pointer is stable within a clip
+  // but can repeat with different content after a geometry change -- which is exactly why
+  // width and height are in the key and the pointer alone is not.
+  //
+  // No lock is taken, for the reason the slot comment above gives: SlotFor returns with
+  // g_mu released and the slot is then owned exclusively, exactly as the kernels are.
+  cl_mem b_curve = nullptr;
+  cl_mem b_owner = nullptr;
+  cl_mem b_nodes = nullptr;
+  cl_mem b_search = nullptr;
+  cl_mem b_pal = nullptr;
+  cl_mem b_w = nullptr;
+  const void* ck_tree = nullptr;
+  const void* ck_palette = nullptr;
+  std::size_t ck_width = 0;
+  std::size_t ck_height = 0;
+  int ck_assoc = -1;
+  // hpal is at most a few hundred bytes, so comparing it costs nothing measurable and
+  // closes the one hole a pointer key cannot: a palette MUTATED IN PLACE between batches
+  // would keep &palette identical while changing what b_pal ought to contain.
+  std::vector<double> ck_pal_shadow;
+
   std::string detail;
   bool built = false;
 };
@@ -1440,22 +1481,93 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // settled question on every launch.
   cl_mem b_cx = clCreateBuffer(g_context, CL_MEM_READ_WRITE, cx_bytes, nullptr, &e);
   cl_mem b_idx = clCreateBuffer(g_context, CL_MEM_WRITE_ONLY, idx_bytes, nullptr, &e);
-  cl_mem b_curve = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
-                              curve->size() * sizeof(int), curve->data(), false, &io, &e);
-  cl_mem b_owner = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
-                              owner->size() * sizeof(int), owner->data(), false, &io, &e);
-  cl_mem b_nodes = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
-                              hnodes.size() * sizeof(ClNode), hnodes.data(), false, &io, &e);
-  cl_mem b_search = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
-                               hsearch.size() * sizeof(ClSearch), hsearch.data(), false, &io, &e);
-  cl_mem b_pal = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
-                            hpal.size() * sizeof(double), hpal.data(), false, &io, &e);
-  cl_mem b_w = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY, sizeof(hweights),
-                          hweights, false, &io, &e);
+  cl_mem b_curve = nullptr;
+  cl_mem b_owner = nullptr;
+  cl_mem b_nodes = nullptr;
+  cl_mem b_search = nullptr;
+  cl_mem b_pal = nullptr;
+  cl_mem b_w = nullptr;
 
-  cl_mem all[13] = {b_pix, b_in16, b_out16, b_in_yuv, b_out_yuv,
-                    b_cx, b_idx, b_curve, b_owner,
-                    b_nodes, b_search, b_pal, b_w};
+  // F3: these six are identical for every batch of a clip, and ~16.6 MB of them --
+  // almost all of it b_curve and b_owner -- were re-uploaded every batch.  The key and
+  // the two things it deliberately does not use are documented on the Ctx fields.
+  //
+  // hnodes, hsearch and hpal are still BUILT every batch.  They are small -- the tree is
+  // a few hundred nodes at the colour counts this engine accepts -- so skipping their
+  // construction would save noise while moving code across a hundred lines.  What is
+  // skipped is the upload, which is the whole of the 16.6 MB.
+  const bool f3_hit = ctx->b_curve != nullptr &&
+                      ctx->ck_width == width && ctx->ck_height == height &&
+                      ctx->ck_tree == static_cast<const void*>(&tree) &&
+                      ctx->ck_palette == static_cast<const void*>(&palette) &&
+                      ctx->ck_assoc == assoc &&
+                      ctx->ck_pal_shadow.size() == hpal.size() &&
+                      (hpal.empty() || std::memcmp(ctx->ck_pal_shadow.data(), hpal.data(),
+                                                  hpal.size() * sizeof(double)) == 0);
+
+  if (f3_hit) {
+    b_curve = ctx->b_curve;
+    b_owner = ctx->b_owner;
+    b_nodes = ctx->b_nodes;
+    b_search = ctx->b_search;
+    b_pal = ctx->b_pal;
+    b_w = ctx->b_w;
+  } else {
+    // Release the previous set before building the new one, so a key change never
+    // holds two sets at once.  Null on the first batch, hence the single test: on a
+    // hit they are all non-null together, since the set is stored only when complete.
+    if (ctx->b_curve != nullptr) {
+      clReleaseMemObject(ctx->b_curve);
+      clReleaseMemObject(ctx->b_owner);
+      clReleaseMemObject(ctx->b_nodes);
+      clReleaseMemObject(ctx->b_search);
+      clReleaseMemObject(ctx->b_pal);
+      clReleaseMemObject(ctx->b_w);
+    }
+    b_curve = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                         curve->size() * sizeof(int), curve->data(), false, &io, &e);
+    b_owner = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                         owner->size() * sizeof(int), owner->data(), false, &io, &e);
+    b_nodes = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                         hnodes.size() * sizeof(ClNode), hnodes.data(), false, &io, &e);
+    b_search = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                          hsearch.size() * sizeof(ClSearch), hsearch.data(), false, &io, &e);
+    b_pal = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY,
+                       hpal.size() * sizeof(double), hpal.data(), false, &io, &e);
+    b_w = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_ONLY, sizeof(hweights),
+                     hweights, false, &io, &e);
+    // A partial set must NOT reach the cache: the next batch's key would match it and
+    // reuse half-built state, which is a far worse failure than re-uploading.  So the
+    // set is stored only when all six exist, and released here when they do not.
+    if (b_curve == nullptr || b_owner == nullptr || b_nodes == nullptr ||
+        b_search == nullptr || b_pal == nullptr || b_w == nullptr) {
+      if (b_curve != nullptr) clReleaseMemObject(b_curve);
+      if (b_owner != nullptr) clReleaseMemObject(b_owner);
+      if (b_nodes != nullptr) clReleaseMemObject(b_nodes);
+      if (b_search != nullptr) clReleaseMemObject(b_search);
+      if (b_pal != nullptr) clReleaseMemObject(b_pal);
+      if (b_w != nullptr) clReleaseMemObject(b_w);
+      return std::string("opencl: clip-invariant upload failed (") + ClErrorName(e) + ")";
+    }
+    ctx->b_curve = b_curve;
+    ctx->b_owner = b_owner;
+    ctx->b_nodes = b_nodes;
+    ctx->b_search = b_search;
+    ctx->b_pal = b_pal;
+    ctx->b_w = b_w;
+    ctx->ck_width = width;
+    ctx->ck_height = height;
+    ctx->ck_tree = static_cast<const void*>(&tree);
+    ctx->ck_palette = static_cast<const void*>(&palette);
+    ctx->ck_assoc = assoc;
+    ctx->ck_pal_shadow = hpal;
+  }
+
+  // The six F3 buffers are NOT in here.  They belong to the slot, not to the batch, and
+  // release_all() runs on every return path -- including a launch failure part way
+  // through the pipeline -- so listing them would free the cache the next batch reuses,
+  // turning a saved upload into a use-after-free.
+  cl_mem all[7] = {b_pix, b_in16, b_out16, b_in_yuv, b_out_yuv, b_cx, b_idx};
   // Releases every buffer, then says what went wrong.  Split from the reporting so
   // it can run on the success path too, and so the pipeline lambda below can report
   // a launch failure without releasing anything out from under its caller.
