@@ -43,11 +43,42 @@ $ErrorActionPreference = 'Continue'
 if (-not $Rdither) { $Rdither = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Release\rdither.exe' }
 if (-not (Test-Path $Rdither)) { "cannot run: no rdither at $Rdither"; exit 2 }
 
+# IS OPENCL ACTUALLY AVAILABLE IN THIS BUILD?  Asked before anything else, because the
+# first version of this probe did not, and CI caught it: the `nocuda` job builds with
+# RD_WITH_OPENCL=OFF, so every run here exited 1 and the stage reported
+#
+#     FAIL first geometry: rdither exit 1
+#     cache invalidation: FAILED (exit 1)   ->   verify.ps1 exit=1
+#
+# on a tree whose other stages were entirely green.  A check that CANNOT RUN has to say
+# so and exit 2; exiting 1 turns an absent engine into a red build, which is both wrong
+# and the reason nobody trusts a red pipeline.
+#
+# The shared helper is used rather than a second, local detection: rd-engine-probe.ps1
+# already knows this project's refusal strings, and its final branch deliberately
+# assumes runnable on anything UNRECOGNISED so a real fault surfaces instead of being
+# absorbed into a skip.  Copying the strings here would create a second answer to the
+# same question, and one that would drift.
+. "$PSScriptRoot\rd-engine-probe.ps1"
+
 # Unique work directory: two concurrent instances must not share files, for the reason
 # probe-opencl-exact.ps1 records at length -- a contaminated comparison reports findings
-# that are its own debris.
+# that are its own debris.  Created HERE rather than after the engine probe below,
+# because the probe writes its fixture into it.
 $Dir = Join-Path $env:TEMP ('rdcache_' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+$probePng = Join-Path $Dir 'probe.png'
+& magick -size 8x8 xc:'#4080C0' $probePng 2>&1 | Out-Null
+if (-not (Test-Path $probePng)) { "cannot run: magick produced no fixture"; exit 2 }
+$avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('opencl') -Fixture $probePng
+$oclWhy = $avail['opencl']
+if ($oclWhy) {
+  "cannot run: $oclWhy"
+  "This stage checks the OpenCL clip-invariant cache, so a build without the engine"
+  "cannot check it. Reported as 'cannot run' (exit 2) rather than as a failure."
+  exit 2
+}
 
 if (-not (Get-Command ffmpeg -EA SilentlyContinue)) { "cannot run: no ffmpeg on PATH"; exit 2 }
 

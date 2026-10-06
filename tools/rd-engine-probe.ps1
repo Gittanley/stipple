@@ -50,6 +50,19 @@ function Get-RdEngineAvailability {
 
   foreach ($eng in $Engines) {
     Remove-Item -EA SilentlyContinue $png
+    # $Rdither is QUOTED, and that is the whole fix.  Unquoted, PowerShell parses the
+    # leading -R of a value like /home/runner/work/dither 2/build/rdither.exe as the
+    # parameter -Rdither, and then tries to cast the NEXT token to the type of that
+    # nonexistent parameter.  On this machine the path contains a space and the word
+    # "code", so the fragment it tried to convert was literally `code`:
+    #
+    #     The input string 'code' was not in a correct format.
+    #
+    # which names a directory rather than the bug, and kills the whole function --
+    # including the caller that only wanted to know an engine was unavailable.  The
+    # same class of defect as the -RD_WITH_CUDA typo below: one character, and the
+    # failure points somewhere else entirely.  Quoting is also just correct; the bare
+    # form only worked when the path had no space in it.
     $msg = (& $Rdither --engine $eng --colors 2 $Fixture $png 2>&1) -join "`n"
     $rc = $LASTEXITCODE
     $made = Test-Path $png
@@ -60,7 +73,19 @@ function Get-RdEngineAvailability {
     if ($msg -match 'this build has no OpenCL') {
       $result[$eng] = 'this build has no OpenCL (configure with -DRD_WITH_OPENCL=ON)'
     } elseif ($msg -match 'this build has no CUDA') {
-      $result[$eng] = 'this build has no CUDA (configure with -RD_WITH_CUDA=ON)'
+      # This said -RD_WITH_CUDA=ON, ONE dash short of the flag.  PowerShell parses a
+      # leading -R as a parameter name, so it tried to convert the fragment to an int
+      # and the whole function died with
+      #
+      #     The input string 'code' was not in a correct format.
+      #
+      # 'code' is the tail of the path "...\dither code gen\dither 2\...", so the
+      # message named a directory rather than the bug.  It only fires on the CUDA
+      # branch, which is the one verify.ps1 calls at startup, so a build without CUDA
+      # raised it -- and the caller saw a non-terminating-looking exit rather than a
+      # skip report.  Same single-character shape as the other five defects in ci.yml's
+      # header: a value nobody typed twice the same way.
+      $result[$eng] = 'this build has no CUDA (configure with -DRD_WITH_CUDA=ON)'
     } elseif ($msg -match 'no CUDA device') {
       $result[$eng] = 'no CUDA device on this machine'
     } else {
