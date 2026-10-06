@@ -407,6 +407,29 @@ if (Test-Path $vinv) {
   }
 }
 
+  # And a seventh: is the OpenCL clip-invariant cache actually skipping the upload it
+  # exists to skip?  Every other stage here runs ONE geometry per process, so the
+  # cache's invalidation branch is never taken, and a key that failed to notice a
+  # change would pass all of them.  This probe is the only thing that looks.
+  #
+  # It asserts on the TRANSFER COUNT, not the byte count.  The six clip-invariant
+  # buffers ARE six of the first batch's seven transfers, so 7 -> 1 is the cache
+  # firing at any geometry -- while the byte delta scales with the Riemersma level
+  # and varies about 37x across the geometries measured (784,984 B at 256x192
+  # against 29,082,116 B at 1920x1080).  A byte threshold authored from the 1080p
+  # figure failed a cache that was working perfectly at 256x192, which is why the
+  # check is written this way.
+  $cinv = Join-Path $PSScriptRoot 'tools\probe-cache-invalidation.ps1'
+  if (Test-Path $cinv) {
+  Write-Host ""
+  & pwsh -NoProfile -File $cinv -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "cache invalidation: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "cache invalidation: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+  }
+
 # ---- where the time went --------------------------------------------------------
 #
 # Printed unconditionally, and attributed per stage, because "the suite takes 25-35
