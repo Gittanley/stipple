@@ -122,8 +122,18 @@ fi
 if [ "$IM_OK" = "0" ]; then
   echo "  [warn] ImageMagick 7 development files were not found."
   echo "         This script is expected to FAIL at the configure step, because"
-  echo "         CMakeLists.txt has no `linux` ImageMagick flavour yet -- it knows"
-  echo "         only `windows` and `conda`, both of which want MSVC .lib files."
+  # Single quotes, NOT double.  Inside double quotes bash performs command
+  # substitution on backticks, so `linux` and `windows` were EXECUTED as commands:
+  #
+  #     ./build.sh: line 125: linux: command not found
+  #     ./build.sh: line 126: windows: command not found
+  #
+  # and `conda` -- which does exist on some machines -- ran `conda --version` and
+  # printed its entire help text.  A reader looking for the ImageMagick error found
+  # a wall of conda usage instead, because the line that should have named the cause
+  # had replaced it with noise.  Single quotes suppress substitution entirely.
+  echo '         CMakeLists.txt has no `linux` ImageMagick flavour yet -- it knows'
+  echo '         only `windows` and `conda`, both of which want MSVC .lib files.'
   echo "         See the banner at the top of this file."
   echo "         On Debian/Ubuntu, try:"
   echo "           sudo apt install libmagickwand-dev"

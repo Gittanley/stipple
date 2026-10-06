@@ -451,6 +451,57 @@ jobs:
           magick --version | head -2
           ffmpeg -version | head -1
 
+      - name: Build ImageMagick 7 Q16-HDRI from source
+        # WHY FROM SOURCE, and not from apt.  The previous version of this job
+        # installed libmagickwand-dev and fell back to libmagick-dev, and the log
+        # said what that actually got:
+        #
+        #     libmagickcore-6.q16-dev  libmagickwand-6-head...
+        #
+        # Ubuntu 24.04 (noble) ships IMAGE MAGICK 6.  This project targets ImageMagick
+        # 7: MagickCore/MagickCore.h, the single `magick` multi-tool binary, and
+        # Q16-HDRI.  So the apt route cannot supply the thing bit-exactness is defined
+        # against, and a `linux` FLAVOUR written against the distro package would be
+        # a flavour for the wrong major version.
+        #
+        # Q16-HDRI specifically, because the whole suite is a bit-exactness comparison
+        # against this library and quantum depth is not a detail: 8-bit and 16-bit
+        # quantise differently, and an HDRI build differs from a non-HDRI one in
+        # rounding.  A Linux check against the wrong build would be worse than none,
+        # because it would compare against a reference the project does not target.
+        #
+        # Pin the tag rather than tracking main.  The Windows job pins 7.1.2-31; this
+        # pins the same series, so a Linux-vs-Windows disagreement is about the
+        # platform rather than about two different library versions.
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends \
+            git libtool pkg-config \
+            libjpeg-dev libpng-dev libtiff-dev libwebp-dev liblzma-dev \
+            libxml2-dev libfreetype6-dev liblcms2-dev libopenjp2-7-dev \
+            libheif-dev libraw-dev libexif-dev
+          IM=ImageMagick
+          TAG=7.1.2-31
+          git clone --depth 1 --branch "$TAG" https://github.com/ImageMagick/ImageMagick.git im-src
+          cd im-src
+          ./configure --prefix=/opt/im --with-quantum-depth=16 --with-hdri=yes \
+            --without-perl --without-x --disable-openmp \
+            --with-modules=no --with-magick-plus-plus=no
+          make -j"$(nproc)"
+          make install
+          cd ..
+          echo "--- the build we actually got ---"
+          /opt/im/bin/magick -version | head -3
+          # Assert it is 7 and Q16, not merely that it exists.  A quiet fall back to
+          # IM6 would otherwise produce a green run comparing against the wrong library.
+          /opt/im/bin/magick -version | grep -q "ImageMagick 7" || { echo "not ImageMagick 7"; exit 1; }
+          /opt/im/bin/magick -version | grep -qE "Q16" || { echo "not Q16"; exit 1; }
+          test -f /opt/im/include/ImageMagick-7/MagickCore/MagickCore.h || {
+            echo "no MagickCore.h under /opt/im/include"; ls -R /opt/im/include | head -40; exit 1; }
+          echo "IMAGEMAGICK_ROOT=/opt/im" >> "$GITHUB_ENV"
+          echo "/opt/im/bin" >> "$GITHUB_PATH"
+          echo "/opt/im/lib" >> "$GITHUB_PATH"
+
       - name: Report what this runner actually provides
         # A REPORTING STEP MUST NEVER BE ABLE TO FAIL THE BUILD.  This one did, on its
         # first run: `magick -version` exited non-zero because libmagickwand-dev
