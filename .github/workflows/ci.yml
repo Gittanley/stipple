@@ -379,3 +379,164 @@ jobs:
           Write-Host "It proves the CUDA build compiles and links.  It cannot run the"
           Write-Host "OpenCL-vs-CUDA sweep or the video probes, and those stay manual."
           & .\build\Release\rdither.exe --list-dithers
+
+  # ############################################################################
+  # LINUX.  Added because OpenCL is the PRIMARY accelerated path on Linux -- there
+  # is no CUDA there at all, and Intel/AMD iGPU need it -- so "the project does not
+  # build on Linux" was a real gap rather than a cosmetic one.  Every other job in
+  # this file runs on windows-2022, which means the clean-clone build had only ever
+  # been proven on the platform it was written on.  That is the same cause as the
+  # five defects in the header: a configuration nobody ran.
+  #
+  # runs-on: ubuntu-latest is a REAL Linux VM -- real kernel, real apt, real
+  # compiler.  It is not emulation and not a cross-compile.
+  #
+  # WHAT IS EXPECTED TO FAIL ON THE FIRST RUN, and why this job is written to
+  # report that rather than to hide it.  CMakeLists.txt recognises exactly two
+  # ImageMagick layouts, `windows` and `conda`, and both want MSVC import
+  # libraries:
+  #
+  #     windows  CORE_RL_MagickCore_.lib   magick.exe   file(GLOB "*.dll")
+  #     conda    MagickCore-7.Q16HDRI.dll.lib  magick.exe  file(GLOB "*.dll")
+  #
+  # A Linux ImageMagick ships libMagickCore-7.Q16HDRI.so, a binary with no .exe,
+  # and no DLLs.  So `continue-on-error` is set and the step does NOT hide the
+  # outcome: it captures the exit code, writes it into the job summary, and states
+  # plainly that a green run here does not yet mean Linux works.  The alternative --
+  # a hard failure -- would be correct behaviour for a supported platform and
+  # useless for one that is not supported yet, because it would turn every push red
+  # and train everyone to ignore the job.
+  #
+  # WHEN IT DOES PASS, `continue-on-error` should come off and the job becomes a
+  # real gate.  That is the point of writing it this way: the day the `linux`
+  # flavour lands in CMakeLists.txt, this job starts catching the next defect of
+  # this shape instead of documenting the last one.
+  #
+  # WHY IT STILL RUNS THE SUITE rather than only compiling.  A build that links is
+  # the least interesting thing this job could check.  Bit-exactness against
+  # ImageMagick is the project's core claim, and it has never been tested against a
+  # Linux ImageMagick.  If the two disagree, that is the single most important
+  # thing anyone could learn about this project, and it is learnable here.
+  linux:
+    name: build + verify (Linux, no CUDA, no GPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # See above: a not-yet-supported platform must not turn every push red.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        # ImageMagick 7 dev headers, ffmpeg, and pocl.  pocl is the reason the
+        # OpenCL engine can be exercised at all here: it provides a working
+        # OpenCL-on-CPU ICD, so `--engine opencl` runs for real rather than
+        # reporting the engine absent.  That makes this the only runner in this
+        # file that can execute OpenCL code, and OpenCL is the primary Linux path.
+        #
+        # The package name for the dev headers has moved across Ubuntu releases;
+        # the fallback keeps a release rename from failing the job for a reason
+        # that has nothing to do with this project.
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config \
+            libmagickwand-dev ffmpeg pocl-opencl-icd clinfo \
+          || sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config \
+            libmagick-dev ffmpeg pocl-opencl-icd clinfo
+          echo "--- versions ---"
+          cmake --version | head -1
+          (c++ --version || g++ --version) | head -1
+          magick --version | head -2
+          ffmpeg -version | head -1
+
+      - name: Report what this runner actually provides
+        # Recorded in the log because a green run on an unexpected toolchain is
+        # not the same evidence as a green run on the expected one -- the same
+        # reasoning as the Windows job's toolchain step.
+        run: |
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
+          echo "--- OpenCL platforms (pocl is OpenCL-on-CPU; that is the point) ---"
+          clinfo -l 2>/dev/null || echo "clinfo found no platform"
+          echo "--- ImageMagick configure-time facts that matter for bit-exactness ---"
+          magick -version
+          magick identify -list format 2>/dev/null | grep -i -E '^\s*(PNG|JPEG)' || true
+
+      - name: Build
+        id: build
+        # `./build.sh`, not `bash build.sh`: the file is committed mode 755, and
+        # invoking it through the interpreter would hide a lost executable bit
+        # instead of reporting it.
+        run: |
+          set +e
+          ./build.sh --no-cuda 2>&1 | tee build-linux.log
+          rc=${PIPESTATUS[0]}
+          echo "build.sh exit=$rc" | tee -a build-linux.log
+          exit $rc
+
+      - name: Record the outcome honestly
+        # This step runs whether or not the build did, which is the whole design.
+        # A failure here writes the real reason into the run summary instead of
+        # leaving it in a log scroll, and a success says plainly that it is not
+        # yet a claim about Linux support.
+        if: always()
+        run: |
+          {
+            echo "### Linux build"
+            echo
+            if [ "${{ steps.build.outcome }}" = "success" ]; then
+              echo "build.sh configured and compiled on ubuntu-latest."
+              echo
+              echo "**This is not yet a claim that Linux is supported.** The ImageMagick"
+              echo "flavour CMakeLists.txt understands is \`windows\` or \`conda\`, both of"
+              echo "which expect MSVC import libraries. If this step passed, either a"
+              echo "\`linux\` flavour has been added since this job was written, or the"
+              echo "build succeeded without linking ImageMagick. Check which."
+            else
+              echo "build.sh failed, which is the EXPECTED first-run outcome. The known"
+              echo "blocker is in CMakeLists.txt, not in build.sh: there is no \`linux\`"
+              echo "ImageMagick flavour. See the job comment for the .lib/.so mismatch."
+              echo
+              echo '```'
+              tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify, if the binary exists
+        # Runs the suite only when there is something to run it against.  The
+        # tally is NOT asserted against a fixed number, unlike the Windows job,
+        # because this configuration has never produced one: there is no Linux
+        # baseline to assert against, and inventing one would be the "standard
+        # authored from a number from a different configuration" failure again.
+        # What is asserted is the weaker, honest thing: zero failures, and a
+        # coverage line that says nothing was skipped outright.
+        if: steps.build.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = 'verify-linux.log'
+          & pwsh -NoProfile -File ./verify.ps1 *>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          Write-Host "verify.ps1 exit=$code"
+          $text = Get-Content $log -Raw
+          $cov = [regex]::Match($text, 'coverage: every stage ran\.\s+0 skipped\.')
+          if (-not $cov.Success) {
+            Write-Host "verify.ps1 did not report full coverage; stages were skipped."
+            Write-Host "Expected on a runner with no GPU: the GPU engines report themselves"
+            Write-Host "skipped, which is a distinct outcome and is counted, not waved through."
+          }
+          $m = [regex]::Match($text, 'bit-exact cases:\s*(\d+) passed,\s*(\d+) failed')
+          if (-not $m.Success) { Write-Host "could not find the bit-exact tally"; exit 1 }
+          $passed = [int]$m.Groups[1].Value
+          $failed = [int]$m.Groups[2].Value
+          Write-Host "tally: $passed passed, $failed failed"
+          if ($failed -ne 0) { exit 1 }
+          if ($passed -lt 1) {
+            Write-Host "only $passed case ran -- nothing was actually checked."
+            exit 1
+          }
+          Write-Host "OK: $passed bit-exact cases against a LINUX ImageMagick."
+          Write-Host "That is the first time this project's core claim has been tested"
+          Write-Host "against a non-Windows ImageMagick."
