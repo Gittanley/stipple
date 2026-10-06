@@ -536,6 +536,46 @@ __kernel void scatter_yuv444(__global const int* curve, __global const int* owne
   yuv[base + 2 * (ulong)pixels_per_frame] =
       (uchar)(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
 }
+
+// F1 -- the unvisited-pixel pre-fill, without the whole-frame copy.
+//
+// Riemersma() visits 4^L - 1 cells and the trailing ForgetGravity visit lands on the
+// first one again, so the grid's LAST cell is never dithered.  The float path gets
+// this for free -- b_pix is COPY_HOST_PTR from the caller, so an unvisited pixel
+// still holds its source value -- but a device buffer does not: it holds whatever the
+// driver left there, and that value goes straight into the encoder.  The old code
+// copied the ENTIRE input frame device-to-device so every unvisited pixel kept its
+// source value: yuv_bytes read plus yuv_bytes written, every batch, to preserve
+// typically ONE pixel in 2,073,600.
+//
+// owner is built last-writer-wins from the curve itself (rd_riemersma_cpu.cpp:
+// (*owner)[(*out)[i]] = i), and scatter_yuv444 writes a pixel exactly when
+// owner[pixel] == i.  So owner >= 0 means the scatter WILL overwrite that pixel, and
+// owner < 0 means nothing else will.  The two cover every pixel: none missed, none
+// written twice.  That is the whole correctness argument, and it is structural rather
+// than measured -- it does not depend on how many pixels go unvisited, which is why
+// it holds at every geometry.
+//
+// The scan still reads owner once per pixel, but owner is npix ints and stays in
+// cache, so real traffic collapses from 2*yuv_bytes to ~3 bytes per unvisited pixel
+// per frame.  Measured on a 256x192 8-frame clip: d2d 1,179,648 B -> 0.
+__kernel void fill_unvisited_yuv444(__global const int* owner,
+                                     __global const uchar* src,
+                                     __global uchar* dst,
+                                     int npix, int frames) {
+  const ulong slot = get_global_id(0);
+  const ulong total = (ulong)npix * (ulong)frames;
+  if (slot >= total) return;
+  const int frame = (int)(slot / (ulong)npix);
+  const int pixel = (int)(slot - (ulong)frame * (ulong)npix);
+  if (owner[pixel] >= 0) return;
+  // Same plane arithmetic as scatter_yuv444, so the two agree bit for bit on where a
+  // pixel lives: Y at base, U at base + npix, V at base + 2*npix.
+  const ulong base = (ulong)frame * 3 * (ulong)npix + (ulong)pixel;
+  dst[base] = src[base];
+  dst[base + npix] = src[base + npix];
+  dst[base + 2 * (ulong)npix] = src[base + 2 * (ulong)npix];
+}
 )CLC";
 
 // ---------------------------------------------------------------------------
@@ -907,6 +947,10 @@ struct Ctx {
   // different decoder, and the difference would be blamed on the dither.
   cl_kernel k_gather_yuv444 = nullptr;
   cl_kernel k_scatter_yuv444 = nullptr;
+  // F1: replaces a whole-frame device-to-device copy with a per-pixel write gated on
+  // owner < 0.  One entry per slot like every other kernel, because clSetKernelArg
+  // mutates the object and two slots cannot share one.
+  cl_kernel k_fill_unvisited_yuv = nullptr;
   cl_kernel k_walk = nullptr;
   cl_kernel k_scatter = nullptr;
   cl_kernel k_scatter_u16 = nullptr;
@@ -1064,7 +1108,7 @@ bool BuildSlotLocked(int n) {
     return false;
   }
 
-  struct { const char* name; cl_kernel* out; } kernels[7] = {
+  struct { const char* name; cl_kernel* out; } kernels[8] = {
       {"gather", &s.k_gather}, {"gather_u16", &s.k_gather_u16},
       {"walk", &s.k_walk},
       {"scatter", &s.k_scatter}, {"scatter_u16", &s.k_scatter_u16},
@@ -1072,6 +1116,7 @@ bool BuildSlotLocked(int n) {
       // use CUDA's default data path instead of being confined to rgba64le.
       {"gather_yuv444", &s.k_gather_yuv444},
       {"scatter_yuv444", &s.k_scatter_yuv444},
+      {"fill_unvisited_yuv444", &s.k_fill_unvisited_yuv},
   };
   for (auto& kn : kernels) {
     cl_kernel k = clCreateKernel(prog, kn.name, &e);
@@ -1585,7 +1630,22 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // straight device-to-device copy, no conversion and no rounding.  That is also
     // what the CUDA fill does on this path, so the two engines agree on it.
     if (in_yuv444) {
-        e = CopyBytes(ctx->queue, b_in_yuv, b_out_yuv, 0, 0, yuv_bytes, &io);
+      // F1: this WAS a whole-frame clEnqueueCopyBuffer of yuv_bytes, whose only
+      // purpose was to give unvisited pixels their source value -- typically one pixel
+      // per frame.  Now a per-pixel write gated on owner < 0; see the kernel's comment
+      // for why that covers every pixel with no gap.  The scatter that writes the
+      // visited pixels runs later, at the run_pipeline call, so between them every
+      // pixel is written exactly once.
+      const std::size_t gf = global_for(static_cast<std::size_t>(np) *
+                                        static_cast<std::size_t>(frames));
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 0, sizeof(cl_mem), &b_owner);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 1, sizeof(cl_mem), &b_in_yuv);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 2, sizeof(cl_mem), &b_out_yuv);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 3, sizeof(int), &np);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 4, sizeof(int), &frames);
+      e = clEnqueueNDRangeKernel(ctx->queue, ctx->k_fill_unvisited_yuv, 1, nullptr,
+                                 &gf, &local, 0, nullptr, nullptr);
+      if (e == CL_SUCCESS) e = clFinish(ctx->queue);
       } else {
       // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so fill
       // with neutral black (Y=0, and 128 for the chroma centre) rather than leave
