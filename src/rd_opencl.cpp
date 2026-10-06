@@ -990,6 +990,17 @@ struct Ctx {
   std::size_t ck_width = 0;
   std::size_t ck_height = 0;
   int ck_assoc = -1;
+  // `&tree` alone is NOT enough to identify the tree.  A tree can be freed and a
+  // DIFFERENTLY SIZED one allocated at the same address, which an allocator will do
+  // quite happily -- and then &tree is unchanged, the cache hits, and the cached b_nodes
+  // is sized for the tree that is gone.  b_nodes is sized from tree.nodes().size(), so
+  // the kernels would index past the end of the device buffer.
+  //
+  // The CUDA engine already guards this and hashes exactly these two fields, so this
+  // mirrors it rather than inventing a third answer.  See HashPaletteAndTree in
+  // src/rd_blocks_cuda.cu, which mixes node_count and color_count for the same reason.
+  std::size_t ck_tree_nodes = 0;
+  int ck_tree_colors = 0;
   // hpal is at most a few hundred bytes, so comparing it costs nothing measurable and
   // closes the one hole a pointer key cannot: a palette MUTATED IN PLACE between batches
   // would keep &palette identical while changing what b_pal ought to contain.
@@ -1501,6 +1512,10 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
                       ctx->ck_tree == static_cast<const void*>(&tree) &&
                       ctx->ck_palette == static_cast<const void*>(&palette) &&
                       ctx->ck_assoc == assoc &&
+                      // Not decoration: a differently sized tree at the same address
+                      // would otherwise reuse a b_nodes sized for the old one.
+                      ctx->ck_tree_nodes == tree.node_count() &&
+                      ctx->ck_tree_colors == tree.color_count() &&
                       ctx->ck_pal_shadow.size() == hpal.size() &&
                       (hpal.empty() || std::memcmp(ctx->ck_pal_shadow.data(), hpal.data(),
                                                   hpal.size() * sizeof(double)) == 0);
@@ -1560,6 +1575,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     ctx->ck_tree = static_cast<const void*>(&tree);
     ctx->ck_palette = static_cast<const void*>(&palette);
     ctx->ck_assoc = assoc;
+    ctx->ck_tree_nodes = tree.node_count();
+    ctx->ck_tree_colors = tree.color_count();
     ctx->ck_pal_shadow = hpal;
   }
 
