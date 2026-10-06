@@ -11,6 +11,13 @@
 *.yaml text eol=lf
 *.md   text eol=lf
 
+# Shell scripts, for the same reason in the other direction: sh and bash treat a
+# trailing CR as part of the command, so a CRLF build.sh fails on Linux with an
+# error naming the wrong thing -- `cmake\r: command not found` is the classic.
+# Pinning it here keeps the file correct in the WORKING TREE on Windows too, not
+# merely in the repository, so a check run on this side sees what a Linux side runs.
+*.sh   text eol=lf
+
 # Binary assets: never touch these.
 *.png binary
 *.jpg binary
