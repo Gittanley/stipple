@@ -260,8 +260,12 @@ the *speed* on your GPU is not a claim anyone can make for you yet —
 `cl_khr_fp64`, and [docs/OPENCL.md](docs/OPENCL.md) explains what to do with that.
 
 It runs **video** as well as images, on the same input modes, and is within about
-**1.2–1.3×** of CUDA's wall clock on 1080p60 — measured, 3 interleaved runs of 600
-frames. It was long documented as "2.7× slower than CUDA", which was an artefact of
+**1.07×** of CUDA's wall clock on 1080p60 - measured, 3 interleaved runs of 600 frames
+on this machine: CUDA 15.7 / 16.0 / 17.4 s and OpenCL 16.9 / 17.1 / 17.2 s, which is
+1.04× on the mean and 1.07× on the best of three. This read "1.2-1.3×" when written;
+both engines got faster since, the OpenCL side by the per-pixel unvisited fill and the
+cached clip-invariant buffers. Read the ratio as a range, not a constant.
+It was long documented as "2.7× slower than CUDA", which was an artefact of
 comparing the two engines on *different data paths*: OpenCL could only take rgba64le
 at 8 bytes per pixel while CUDA defaults to planar yuv444p at 3, and the 2.67× of extra
 traffic was the entire apparent gap. On the same path the engines were within 8% even

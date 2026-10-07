@@ -563,7 +563,18 @@ compile errors above were only findable because the log was there.
   before/after table in the planar 4:4:4 section above is the real figure: **1.26x**
   of CUDA's wall clock, both engines on `yuv444p`, 600 frames of 1080p60, 3
   interleaved runs. It is quoted as "1.2-1.3x" in the README because a single
-  machine cannot support three digits. An earlier version of this bullet said
+  machine cannot support three digits.
+
+  **Superseded, 2026-10-07.** Re-measured, same clip, same flags, 3 interleaved
+  runs: CUDA 15.7 / 16.0 / 17.4 s and OpenCL 16.9 / 17.1 / 17.2 s, so **1.04x** on
+  the mean and **1.07x** on the best of three, against the 1.26x recorded above.
+  Both engines got faster; the OpenCL side gained the per-pixel unvisited fill (F1)
+  and the cached clip-invariant buffers (F3), together removing ~989 MB of device
+  traffic per 60-frame 1080p clip. The README now quotes 1.07x with the raw numbers
+  beside it. The conclusion is unchanged and strengthened: on the same data path the
+  two engines are within a few percent of each other.
+
+  An earlier version of this bullet said
   performance was unknown and quoted a 10-frame 160x90 run; that clip is almost
   entirely process start-up and driver init, so the number was meaningless in both
   directions, and the bullet predated the steady-state measurement. What remains
