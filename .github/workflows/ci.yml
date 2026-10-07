@@ -391,26 +391,31 @@ jobs:
   # runs-on: ubuntu-latest is a REAL Linux VM -- real kernel, real apt, real
   # compiler.  It is not emulation and not a cross-compile.
   #
-  # WHAT IS EXPECTED TO FAIL ON THE FIRST RUN, and why this job is written to
-  # report that rather than to hide it.  CMakeLists.txt recognises exactly two
-  # ImageMagick layouts, `windows` and `conda`, and both want MSVC import
-  # libraries:
+  # WHAT IS EXPECTED TO FAIL, and why this job reports it rather than hiding it.
   #
-  #     windows  CORE_RL_MagickCore_.lib   magick.exe   file(GLOB "*.dll")
-  #     conda    MagickCore-7.Q16HDRI.dll.lib  magick.exe  file(GLOB "*.dll")
+  # THE BLOCKER HAS MOVED TWICE, and this comment tracked the first one for a commit
+  # after it stopped being true.  Recording that, because the failure mode is the point:
   #
-  # A Linux ImageMagick ships libMagickCore-7.Q16HDRI.so, a binary with no .exe,
-  # and no DLLs.  So `continue-on-error` is set and the step does NOT hide the
-  # outcome: it captures the exit code, writes it into the job summary, and states
-  # plainly that a green run here does not yet mean Linux works.  The alternative --
-  # a hard failure -- would be correct behaviour for a supported platform and
-  # useless for one that is not supported yet, because it would turn every push red
-  # and train everyone to ignore the job.
+  #   1. CMakeLists.txt knew only `windows` and `conda`, both wanting MSVC import
+  #      libraries (CORE_RL_MagickCore_.lib, magick.exe, *.dll).  A Linux
+  #      ImageMagick ships libMagickCore-7.Q16HDRI.so, no .exe, no DLLs, and Ubuntu
+  #      24.04 ships ImageMagick 6 anyway -- so there was nothing to write a flavour
+  #      for.  FIXED: the runner builds IM7 Q16-HDRI from source, and CMakeLists.txt
+  #      has a `linux` flavour.  Configure now completes.
   #
-  # WHEN IT DOES PASS, `continue-on-error` should come off and the job becomes a
-  # real gate.  That is the point of writing it this way: the day the `linux`
-  # flavour lands in CMakeLists.txt, this job starts catching the next defect of
-  # this shape instead of documenting the last one.
+  #   2. THE CURRENT BLOCKER, and it is the source, not the build system: five files
+  #      include <windows.h> unconditionally -- rd_source.cpp, rd_checkpoint.cpp,
+  #      rd_progress.cpp, rd_cli.cpp, rd_video.cpp -- and the Windows API surface is
+  #      not merely headers.  CreateFileMapping wants mmap, GetConsoleMode wants
+  #      isatty/termios.  rd_source.cpp:6 is where the build stops.
+  #
+  # `continue-on-error` stays for the same reason either way: a hard failure on an
+  # unsupported platform turns every push red and trains everyone to ignore the job.
+  # The step does not hide the outcome -- it writes the real reason into the run
+  # summary and names which of the two blockers above it is.
+  #
+  # WHEN IT DOES PASS, this becomes a real gate and `continue-on-error` comes off.
+  # That is what writing it this way is for.
   #
   # WHY IT STILL RUNS THE SUITE rather than only compiling.  A build that links is
   # the least interesting thing this job could check.  Bit-exactness against
@@ -570,9 +575,23 @@ jobs:
               echo "\`linux\` flavour has been added since this job was written, or the"
               echo "build succeeded without linking ImageMagick. Check which."
             else
-              echo "build.sh failed, which is the EXPECTED first-run outcome. The known"
-              echo "blocker is in CMakeLists.txt, not in build.sh: there is no \`linux\`"
-              echo "ImageMagick flavour. See the job comment for the .lib/.so mismatch."
+              echo "build.sh failed, which is the EXPECTED outcome on a machine with no"
+              echo "POSIX port of this source tree yet."
+              echo
+              echo "WHAT IS DONE: ImageMagick 7 Q16-HDRI builds from source on the runner,
+              echo "and CMakeLists.txt has a \`linux\` flavour for it. Both landed, and the
+              echo "configure step completes."
+              echo
+              echo "WHAT IS NOT DONE: the source is Windows-only. Five files include"
+              echo "windows.h unconditionally, and the Windows API surface is not just
+              echo "headers -- CreateFileMapping needs mmap, GetConsoleMode needs isatty /
+              echo "termios. So this job stops at the first such include, which is"
+              echo "src/rd_source.cpp:6. The build log above names the exact line."
+              echo
+              echo "This text was written when the blocker was the missing CMake
+              echo "flavour, and it stayed after that was fixed. A summary naming a
+              echo "blocker that no longer exists sends the next reader after the wrong
+              echo "thing."
               echo
               echo '```'
               tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
