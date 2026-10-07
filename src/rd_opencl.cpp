@@ -1756,8 +1756,14 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // Same reason as below, and easier here: a planar 4:4:4 source and a planar
     // 4:4:4 output have the SAME layout -- Y, then U, then V, each npix bytes per
     // frame -- so the unvisited pixel can keep the source's own three bytes with a
-    // straight device-to-device copy, no conversion and no rounding.  That is also
-    // what the CUDA fill does on this path, so the two engines agree on it.
+    // straight device-to-device copy, no conversion and no rounding.
+    //
+    // BlkFillUnvisitedKernel in rd_blocks_cuda.cu already did exactly this on the CUDA
+    // side, so the OpenCL kernel below is its counterpart rather than an independent
+    // idea: the two engines already agreed on WHAT to write, and only the MECHANISM
+    // differed (CUDA a per-pixel kernel, OpenCL a whole-frame copy).  Converting the
+    // copy to a kernel is therefore the change that makes the two implementations match,
+    // which is what a mirror is for.
     if (in_yuv444) {
       // F1: this WAS a whole-frame clEnqueueCopyBuffer of yuv_bytes, whose only
       // purpose was to give unvisited pixels their source value -- typically one pixel
