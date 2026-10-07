@@ -2936,15 +2936,28 @@ divided by cores available, and neither factor moved.
 This is the same conclusion as round twenty, with a much better instrument. The older table
 in *Where the CPU goes* estimated the split; this measures it, and the split is the answer:
 
-| | core-s | share |
+| | core-s | share of the 1390 the parts sum to |
 |---|---|---|
-| x264 encode, `veryfast` | ~1240 | **~89%** |
-| rdither (reader, writer, worker) | 121 | 7.6% |
-| h264 decode + 4:4:4 | ~29 | 1.8% |
+| x264 encode, `veryfast` | ~1240 | **~89.2%** |
+| rdither (reader, writer, worker) | 121 | **8.7%** |
+| h264 decode + 4:4:4 | ~29 | **2.1%** |
+| | **1390** | **100%** |
+
+
+> **Correction, appended at the point of the claim.** The share column above originally
+> read 89% / 7.6% / 1.8%, and those numbers came from **two different denominators**: the
+> parts sum to **1390** while the total printed beside them read **1590**, leaving 200
+> core-s unaccounted. Against its own parts rdither is **8.71%**, not 7.6%. The "11% wall
+> improvement" further down inherited the same bad denominator: the measured ceiling is
+> **18.5%** (`1 / 0.844`).
+>
+> The conclusion is unaffected and is now the whole point of the passage: **the encoder is
+> the ceiling and it is preset-locked by standing instruction.** The size of the available
+> prize is 18.5% of wall, not 11%. Derivation is in the correction further down this file.
 
 **89% of all CPU in this pipeline is the encoder**, and the encoder is preset-locked by
 standing instruction. Even a zero-cost decode and a zero-cost dither -- both impossible --
-would cap out at an 11% wall improvement. There is no fps left outside the preset. Every
+would cap out at an 18.5% wall improvement. There is no fps left outside the preset. Every
 other knob is already recorded as measured-neutral: `--queue-depth` 3..8, `--batch-frames
 32`, ffmpeg thread caps, two GPU workers, 64 MiB pipe buffer, and `--encode-threads` 2/3/4/5
 (re-confirmed above: every cap is worse than auto, and by *total CPU*, not just wall time).

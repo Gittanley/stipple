@@ -165,8 +165,23 @@ if ($text -match '\(([\d.]+) fps[,)]') { $fps = [double]$Matches[1] }
 
   # rdither's own wall, from inside the process.  Different from the stopwatch and
   # not comparable with it; printed so the gap is visible instead of assumed.
+  #
+  # The regex did NOT require a leading pipe and every row printed `inner wall n/a`
+  # while the very same value sat in the stage breakdown a few lines below.  Measured on
+  # the run that exposed it: the stage line read
+  #
+  #     busy time : wall 18460 ms (palette 4085 of it)
+  #
+  # and `\|\s*wall\s+(\d+)\s+ms` does not match that, because there is no pipe -- the
+  # character before "wall" is a colon.  Every row therefore reported n/a for a number
+  # that was present, which is the same failure as the fps regex this file already
+  # documents: a message changing shape under a probe that reads it as text.
+  #
+  # `wall\s+(\d+)\s+ms` matches, and cannot pick up the progress bar's rate because that
+  # is printed as `(32.0 fps, palette included)` -- a different unit and a different
+  # word.  Verified against the captured string rather than assumed.
   $inner = $null
-  if ($text -match '\|\s*wall\s+(\d+)\s+ms') { $inner = [double]$Matches[1] / 1000.0 }
+  if ($text -match 'wall\s+(\d+)\s+ms') { $inner = [double]$Matches[1] / 1000.0 }
 
   [pscustomobject]@{
     Label     = $Label
@@ -216,9 +231,6 @@ foreach ($c in $configs) {
   $r = Measure-Config -Label $c.L -Extra $c.E
   $rows += $r
 
-  # Why this row is unusable, named, rather than published as a number.  Ordered by
-  # how much it would have misled: a crashed run first, because it produces a
-  # plausible core-s total and a 0.0 fps.
   # Why this row is unusable, named, rather than published as a number.  Ordered by
   # how much it would have misled: a crashed run first, because it produces a
   # plausible core-s total and a 0.0 fps.
