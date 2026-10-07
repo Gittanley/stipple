@@ -191,7 +191,26 @@ void PrintUsage() {
       "  rdither --engine approx --approx-iters 32 --verify in.png out.png\n"
       "  rdither --max-ram-mb 64 --colors 16 huge.tif out.png\n"
       "  rdither --video --colors 16 --cpu-threads 0 in.mp4 out.mp4\n"
-      "  rdither --video --colors 16 --video-lossless in.mp4 out.mkv\n",
+      "  rdither --video --colors 16 --video-lossless in.mp4 out.mkv\n"
+      "\n"
+      "Diagnostics.  All are environment variables, all are off unless set, and none\n"
+      "changes what the program computes -- they print, or they select a path that is\n"
+      "already bit-identical, or both:\n"
+      "  RD_KERNEL_TIMING=1   per-kernel gather/walk/scatter milliseconds\n"
+      "  RD_CC_STATS=1        octree search cost: nodes and descent steps per pixel.\n"
+      "                         REQUIRES RD_KERNEL_TIMING=1 as well -- the print sits\n"
+      "                         inside the timing block, so setting this alone produces\n"
+      "                         no output and looks like a broken build.  The build must\n"
+      "                         also be configured with -DRD_CC_STATS=ON, because the\n"
+      "                         counters are compile-time gated: counting per node visit\n"
+      "                         cost a measured 2.5x on the dither stage, so a runtime\n"
+      "                         flag is not an option.\n"
+      "  RD_FLAT_SEARCH=0     force the recursive palette search, for A/B-ing it\n"
+      "                         against the flat one.  Same picture either way; below\n"
+      "                         16 colours the flat search wins.\n"
+      "  RD_OCL_IO=1          per-transfer byte counts for the OpenCL engine\n"
+      "  RD_OCL_DUMP=1        dump device buffers after a batch (large)\n"
+      "  RD_TRACE=1           per-visit trace (very large)\n",
       rd::kMaxColormapSize);
 }
 
