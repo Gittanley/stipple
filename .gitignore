@@ -96,3 +96,33 @@ Thumbs.db
 # Wikimedia Commons URLs recorded in docs/examples/SOURCES.md; the dithered
 # outputs in docs/examples/ are what gets committed.
 *.orig.jpg
+
+# ---------------------------------------------------------------------------
+# artifacts/ -- scratch, and one thing that is deliberately NOT portable
+# ---------------------------------------------------------------------------
+#
+# Everything here is either regenerated on demand or machine-specific:
+#
+#   gate_*.log, cpubudget*.log, build_*.log   run transcripts, overwritten each run
+#   geom_oracle.ps1, fuse_oracle.ps1          the SHORT oracles, written during the
+#                                              session that needed them.  Untracked, so
+#                                              they are not a documented interface --
+#                                              the gate does not invoke them.
+#   colors32_findings.md                      the measurement write-up for the
+#                                              --colors 32 investigation
+#   video_pixels_baseline.txt                THE ONE THAT MATTERS, and the reason this
+#                                              entry exists at all.
+#
+# That baseline is a SHA256 per engine per colour count, captured on the machine that
+# captured it.  Committing it would make every OTHER machine's first run fail for a
+# reason that has nothing to do with its own code: a different GPU produces a different
+# hash legitimately, and the probe would report DIFFER against a baseline recorded on
+# somebody else's silicon.  A check that is red on arrival teaches people to ignore it.
+#
+# So the PROBE is tracked (tools\probe-video-pixels.ps1) and the baseline is not.  Each
+# machine writes its own with -Write BEFORE a risky change and compares after.  It is
+# evidence about that machine, which is the only kind of evidence a hash can be.
+#
+# The whole directory was previously untracked-but-not-ignored, which is the state
+# `git add -A` exists to turn into an accident.
+artifacts/
