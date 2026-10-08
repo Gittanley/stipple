@@ -233,6 +233,10 @@ rdither --colors 16 --verify photo.png out.png
 
 # GPU.  'blocks' is the fastest, and NOT the same output: ~1.7% of pixels differ
 # from the cpu engine above.  See "Where bit-exactness holds" before choosing.
+# (That 1.7% is the IMAGE path.  On --video, blocks is bit-identical to the cpu
+# engine -- measured 0 of 37,324,800 differing components over 6 frames spanning a
+# 600-frame 1080p clip.  In video the choice that moves pixels is --input-mode,
+# not --engine.)
 rdither --colors 16 --engine blocks photo.png out.png
 ```
 
@@ -310,7 +314,25 @@ dithering is held constant:
 **5.8 dB is not a colourimetric nuance, it is a different picture.** If you have 4:2:0
 footage and care about fidelity, use `yuv444` or `rgba64`. On a true 4:4:4 source every
 mode agrees exactly (`yuv444` vs `rgba64` is AE 0), so the choice only bites for 4:2:0
-input — which is most real footage.
+input - which is most real footage.
+
+**The byte column above is not a speed column, and the difference matters.** Halving
+pipe traffic does not halve wall clock. Measured end to end on the 600-frame 1080p bench
+clip, `--colors 16 --video-lossless`, `--engine blocks`, interleaved:
+
+| `--input-mode` | mean fps | vs `yuv444` |
+|---|---|---|
+| `rgba64` | 33.7 | 0.67x |
+| `yuv444` (default) | 50.5 | baseline |
+| `yuv420` | 53.2 | 1.05x |
+
+So the big step is the one already taken - `rgba64` to `yuv444` is **1.50x** - and
+`yuv444` to `yuv420` is **1.05x**. The reason is that `yuv420` does not merely move
+fewer bytes: it reconstructs 2x2 chroma on the device, which is real work that consumes
+much of the saving. **`yuv420` stays off the default for that reason.** (5% is also
+inside this machine's 10-25% run-to-run drift between identical binaries, so treat it as
+indicative rather than settled; `yuv444` is the default because it is not clearly worth
+the 5.8 dB.)
 
 **Output.** `--video-pix-fmt` defaults to `yuv444p` and that default is load-bearing:
 `yuv420p` output subsamples chroma over 2×2 blocks, averaging away the dither pattern
