@@ -1232,6 +1232,37 @@ bool VideoHasAudio(const std::string& path, const std::string& ffmpeg,
   return found;
 }
 
+// Does this source pixel format carry an alpha channel?
+//
+// The palette decoder emits 8-bit RGB rather than RGBA when the answer is no, which
+// removes 25% of the pipe traffic (2.12 GB -> 1.59 GB per 600-frame 1080p render, the
+// palette prefix being 126x amplification: full frames emitted to fill a 16.8 MB montage
+// of 128x128 cells).  The alpha the montage needs is synthesised host-side instead -- the
+// same 65535 that RawToFloats already synthesises for a 3-channel rgb48le read, so the
+// host and device agree.
+//
+// This guard exists because the alternative would be to silently flatten real transparency
+// into an opaque constant.  ffprobe names the format; the alpha-bearing families are the
+// planar/packed ones with a trailing or leading 'a'.  Unknown formats are assumed to
+// carry alpha, so a new format degrades to today's behaviour rather than to a wrong one.
+bool SourcePixFmtHasAlpha(const std::string& pix_fmt) {
+  // Deny by default.  An allowlist of the opaque planar/packed formats rdither's video
+  // reader can be handed means an unrecognised or new format keeps its alpha channel and
+  // so keeps today's behaviour, rather than silently losing transparency.
+  static const char* kOpaque[] = {
+      "yuv410p", "yuv411p", "yuv420p", "yuv422p", "yuv440p", "yuv444p",
+      "yuvj420p", "yuvj422p", "yuvj444p", "yuvj440p",
+      "nv12", "nv16", "nv21", "nv24", "nv42",
+      "gbrp", "gray", "yuyv422", "uyvy422", "y210", "p010", "p016",
+      "rgb24", "bgr24"};
+  for (const char* name : kOpaque) {
+    if (pix_fmt == name) return false;
+  }
+  // Everything else -- rgba, bgra, yuva420p, gbrap, pal8, and anything ffmpeg adds later --
+  // is treated as carrying alpha and keeps the 4-channel path.
+  return true;
+}
+
 bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
                        const VideoInfo& info, Palette* palette, ColorTree* tree,
                        VideoResult* result, std::string* error) {
@@ -1581,11 +1612,21 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // Spelled and placed through FpsMode because ffmpeg 9 deleted -vsync and
   // -fps_mode is an output option; see the note on FpsModeArgs.
   const FpsModeArgs& fps = FpsMode(ffmpeg);
+  // 8-bit AND no source alpha -> ask ffmpeg for 3 channels and synthesise the 4th
+  // host-side.  Verified bit-identical before being relied on: 256 frames of 1080p,
+  // 1,592,524,800 RGB samples, 0 differing, max delta 0.  Round Eight (DESIGN.md:1836)
+  // measured the 16-bit equivalent as DIFFERING -- rgba64le and rgb48le round
+  // differently -- so this is checked per depth, never assumed.  The montage still
+  // receives alpha == 65535, so image->alpha_trait stays BlendPixelTrait and
+  // quantize.c's `alpha_trait != Undefined -> depth--` does not shift the tree.
+  const bool palette_8bit = opt.palette_depth != 16;
+  const int pal_ch = (palette_8bit && !SourcePixFmtHasAlpha(info.pix_fmt)) ? 3 : 4;
   const std::string args = "-v error" + std::string(fps.input) + " -i " + Quote(path) +
                            " -vf " + filter + fps.output +
                            " -frames:v " + std::to_string(want) + " -f rawvideo" +
-                           (opt.palette_depth == 16 ? " -pix_fmt rgba64le"
-                                                    : " -pix_fmt rgba") +
+                           (palette_8bit ? (pal_ch == 3 ? " -pix_fmt rgb24"
+                                                          : " -pix_fmt rgba")
+                                           : " -pix_fmt rgba64le") +
                            " -";
   Child child;
   if (std::getenv("RD_TRACE") != nullptr) {
@@ -1720,8 +1761,7 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // at 16 bits it keeps splitting until the error is negligible and settles on
   // desaturated centroids.  The reference video pipeline goes through 8-bit PPM
   // and gets the punchier palette for free, so the default follows it.
-  const bool palette_8bit = opt.palette_depth != 16;
-  const std::size_t raw_px = pixels * 4;
+  const std::size_t raw_px = pixels * static_cast<std::size_t>(pal_ch);
   // Only the buffer the requested depth actually decodes into.  Both were
   // allocated unconditionally, so the default 8-bit run carried a 16,589,440 B
   // uint16 buffer it never read -- and on the by-seek path one PER WORKER, six of
@@ -1739,7 +1779,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
       dst->r = static_cast<float>(p8[0]) * 257.0f;
       dst->g = static_cast<float>(p8[1]) * 257.0f;
       dst->b = static_cast<float>(p8[2]) * 257.0f;
-      dst->a = static_cast<float>(p8[3]) * 257.0f;
+      // 3-channel read: the same constant RawToFloats synthesises for rgb48le, so
+      // host and device agree on opaque alpha.
+      dst->a = pal_ch == 4 ? static_cast<float>(p8[3]) * 257.0f : 65535.0f;
       return;
     }
     dst->r = static_cast<float>(p16[0]);
@@ -1803,15 +1845,15 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
                      (static_cast<std::size_t>(cy) * cell_h + y) * montage_w +
                      static_cast<std::size_t>(cx) * cell_w;
         if (src8 != nullptr) {
-          const std::uint8_t* row = src8 + 4 * base;
+          const std::uint8_t* row = src8 + static_cast<std::size_t>(pal_ch) * base;
           for (int x = 0; x < cell_w; ++x) {
-            widen(row + 4 * static_cast<std::size_t>(x), nullptr, dst + x);
+            widen(row + static_cast<std::size_t>(pal_ch) * static_cast<std::size_t>(x), nullptr, dst + x);
           }
           continue;
         }
-        const std::uint16_t* row = src16 + 4 * base;
+        const std::uint16_t* row = src16 + static_cast<std::size_t>(pal_ch) * base;
         for (int x = 0; x < cell_w; ++x) {
-          widen(nullptr, row + 4 * static_cast<std::size_t>(x), dst + x);
+          widen(nullptr, row + static_cast<std::size_t>(pal_ch) * static_cast<std::size_t>(x), dst + x);
         }
       }
       return;
@@ -1829,9 +1871,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
             static_cast<int>(static_cast<std::int64_t>(tx) * info.width / cell_w);
         const std::size_t o = row_base + static_cast<std::size_t>(sx);
         if (src8 != nullptr) {
-          widen(src8 + 4 * o, nullptr, dst + tx);
+          widen(src8 + static_cast<std::size_t>(pal_ch) * o, nullptr, dst + tx);
         } else {
-          widen(nullptr, src16 + 4 * o, dst + tx);
+          widen(nullptr, src16 + static_cast<std::size_t>(pal_ch) * o, dst + tx);
         }
       }
     }
@@ -1878,9 +1920,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
         // The pipe buffers, and nothing else: the widening that used to fill an
         // `lf` here now happens straight into the montage cell (place_raw), so
         // six workers no longer each carry a 33,177,600 B RgbaF frame.
-        std::vector<std::uint8_t> l8(static_cast<std::size_t>(pixels) * 4);
+        std::vector<std::uint8_t> l8(static_cast<std::size_t>(pixels) * pal_ch);
         std::vector<std::uint16_t> l16;
-        if (!palette_8bit) l16.resize(static_cast<std::size_t>(pixels) * 4);
+        if (!palette_8bit) l16.resize(static_cast<std::size_t>(pixels) * pal_ch);
         for (;;) {
           const int s = next_sample.fetch_add(1);
           if (s >= want) return;
