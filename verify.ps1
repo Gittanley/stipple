@@ -409,6 +409,28 @@ if (Test-Path $ag) {
   }
 }
 
+# And an eighth: the palette/reader overlap.  The flag is OPT-IN and off by default,
+# which is exactly why this needs gating -- an unexercised code path is the one most
+# likely to rot, and the property that matters (the overlap must not change a single
+# pixel) cannot be seen from the default path at all.
+#
+# The probe asserts the arms differ in TIMING before comparing their pixels.  Without
+# that, a flag that silently stopped doing anything would make the A/B compare one
+# binary against itself and report a perfect pass -- the failure this whole comparison
+# shape exists to catch.
+#
+# Not in -Fast: it renders 4 x 300 frames of 1080p plus a negative control.
+$ov = Join-Path $PSScriptRoot 'tools\probe-palette-overlap.ps1'
+if (Test-Path $ov) {
+  Write-Host ""
+  & pwsh -NoProfile -File $ov -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "palette overlap: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "palette overlap: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
 # And a fifth: the image determinism probe again, pointed at VIDEO.  The image one
 # is a self-comparison across time rather than an engine-against-engine comparison,
 # which is the only shape of check that sees a fault both engines share -- and two

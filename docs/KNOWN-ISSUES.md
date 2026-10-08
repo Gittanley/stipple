@@ -210,7 +210,7 @@ already performed for VFR detection is the same shape of work.
   already walks the packet index, so it may be, but it has not been measured.
 - Whether any real mkv source in this project's intended use declares `nb_frames`.
 
-- Whether the by-seek path has the same truncation (its stride arithmetic differs).
+- ~~Whether the by-seek path has the same truncation~~ -- **resolved 2026-10-08: it is NOT affected.** Above 5000 frames the palette samples by seek, and each sample is an independent `-ss` to `s * step`, so the last one lands near the clip's end. There is no `-frames:v` count to truncate the run. The defect is confined to the sequential path, which is the short-clip path.
 - Whether an alpha-bearing source makes `SourcePixFmtHasAlpha` correct. **No fixture in the
   repository carries an alpha channel**, so that branch has never executed. See the
   `9df7e34` commit message.
@@ -268,3 +268,100 @@ and it was missing. Now:
 ```
 
 Both paths re-verified after the fix: bad path exits 2, normal run exits 0.
+
+
+---
+
+## 4. The palette/reader overlap is implemented, correct, and MEASURED SLOWER
+
+**Status:** implemented and byte-exact; **shipped opt-in** because it is a regression when
+on. Not a defect in the code -- a defect in the premise the change was built on.
+
+### What was built
+
+`RD_PALETTE_OVERLAP=1` starts the palette build on its own thread (`src/rd_cli.cpp`) so the
+reader fills its bounded queue while it runs. `PaletteGate` (`include/rd_video.h`) carries the
+in-flight palette; the dither workers call `gate.Wait()` immediately before dispatch, so a
+worker holding a decoded batch waits for the palette it is about to use. The report and both
+exit paths join the thread.
+
+### The measurement, which is the finding
+
+Two clips, so the finding is not one machine's mood on one afternoon.
+`--colors 16 --engine cuda --video-lossless`:
+
+| clip | arm | fps | palette | decode | **dither** | encode | wall |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `testsrc` 300 f, 0.3 MiB | default | 38.9 | 3517 | 3596 | **2999** | 2266 | 7711 |
+| `testsrc` 300 f | `=1` | **25.5** | 3951 | 4144 | **6059** | 2454 | 11744 |
+| `cpubench` 600 f, 14.8 MiB | default | 47.7 | 3708 | 8227 | **6203** | 4373 | 12568 |
+| `cpubench` 600 f | `=1` | **37.3** | 4197 | 5125 | **9331** | 8100 | 16069 |
+
+**34% slower on one clip, 22% on the other. The palette stage gets slower under concurrency in
+both** (3708 -> 4197 ms), and the wall gets worse in both.
+
+### The mechanism, which the worker-time breakdown makes visible
+
+**Dither time roughly doubles: 6203 -> 9331 ms on `cpubench`.** The palette thread is not
+filling idle capacity, it is taking cores away from the dither workers, so total work goes *up*
+and every later stage waits behind it. That is the whole of the loss, and it is visible in one
+number that the earlier measurements never looked at.
+
+Decode time *appears* to drop (8227 -> 5125 ms). That is not a saving: the reader blocks
+earlier against a full queue and so does less work before being throttled. Reading it as a win
+would be reading a bottleneck as an improvement.
+
+### Why, and why my earlier contention measurement did not find it
+
+An earlier measurement ran the two **ffmpeg decoders** concurrently and found no contention
+(palette 1864 -> 1800 ms, reader 4179 -> 4240 ms). That was true and it was too narrow: what
+actually contends is the palette's **ImageMagick quantise** over a 64 MiB montage against a
+reader pipeline that **already saturates every core**. The reader is the pipeline's floor, so
+running a CPU-heavy stage beside it does not fill idle time -- there is no idle time. The two
+overlap by contending.
+
+The same pattern is recorded elsewhere in this file's history: a 1.7% figure that was really
+the image path, and a saturation metric that could not see the failure it existed to catch.
+The general failure is measuring a *component* and generalising it to the *system*.
+
+### The probe's ratio is not a reliable direction, and that is worth knowing
+
+An earlier run of `tools\probe-palette-overlap.ps1` on its own 1080p fixture reported
+**1.452x -- the overlap winning**, against 0.78x measured here minutes later on `cpubench`.
+Both clips lose when measured with the worker-time breakdown above; the probe run was wrong,
+or at least not measuring a stable quantity.
+
+So the probe's **timing ratio must not be read as directional.** What it does assert -- the
+arms differ by far more than this machine's drift, so the flag demonstrably reached the code
+-- is sound and is the part that gates. A probe that reported a confident sign here would be
+reporting noise, and a reader who trusted it would draw the wrong conclusion, which is how
+the 1.452x nearly became the documented result.
+
+### Correctness, which does hold
+
+`tools\probe-palette-overlap.ps1`: **0 of 37,324,800 components differ** across six frames
+spread over the clip, worst delta 0. The two arms also differ in wall time by far more than
+this machine's 10-25% drift, which is what proves the flag reached the code -- without that,
+a flag that silently did nothing would make the A/B compare one binary with itself and report
+a perfect pass. A `--colors 32` negative control confirms the comparison detects differences.
+
+### Why opt-in rather than reverted
+
+The code is correct and the arithmetic can hold on a machine that is not already saturated
+(a GPU with idle cores, or a reader bound on I/O rather than CPU). Shipping a measured 22%
+regression as the **default** is not defensible, so the flag is inverted to
+`RD_PALETTE_OVERLAP=1` and costs nothing when unset.
+
+### What the spec got wrong
+
+`docs\superpowers\specs\2026-10-08-palette-read-overlap-design.md` predicted a 1091 ms
+(8.4%) win. The mechanism it assumed -- the reader runs at full speed beside the palette --
+is exactly what does not happen here. Section 6 of that spec listed CPU contention as
+"resolved" on the strength of a decoder-only measurement, which is the error above.
+
+### Not tested
+
+- Whether a machine with idle cores sees the predicted win. Untestable here: this one's reader
+  saturates.
+- The reader-fails-while-palette-builds path, and the interrupt-during-palette-window path, are
+  implemented but not exercised by any probe.

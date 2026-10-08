@@ -475,6 +475,32 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // 1 MiB, so both of these go on the heap.
   std::unique_ptr<rd::Palette> palette(new rd::Palette());
   std::unique_ptr<rd::ColorTree> tree(new rd::ColorTree());
+
+  // The palette is built on its own thread so the reader can start immediately.
+  // Everything that needs the palette -- the report below, and the dither workers --
+  // goes through the gate, and the join happens before any of them reads it.
+  //
+  // RD_PALETTE_OVERLAP=0 restores the original serial ordering.  It is not a debug
+  // convenience: it is the BASELINE ARM of tools\probe-palette-overlap.ps1, and the
+  // probe asserts the two arms differ in timing before comparing their pixels --
+  // otherwise a flag that silently did nothing would make the A/B compare one binary
+  // with itself and report a perfect pass.
+  // RD_PALETTE_OVERLAP=1 turns the overlap ON.  It is OFF by default because it was
+  // MEASURED SLOWER: 600 frames of 1080p, interleaved, 39.0 fps with the overlap against
+  // 50.8 fps without -- 24% slower, and the palette stage itself gets slower (3679 -> 4047
+  // ms) because the ImageMagick quantise competes with a reader pipeline that already
+  // saturates every core.  See the spec's section 6 and docs\KNOWN-ISSUES.md.
+  //
+  // The reader is the pipeline's floor.  Running a CPU-heavy palette build beside it does
+  // not fill idle time, because there is no idle time: the two overlap by contending.
+  //
+  // The code stays because the arithmetic can hold on a machine that is not already
+  // saturated -- a GPU with idle cores, or a reader bound on I/O rather than CPU.  But it is
+  // opt-IN, because shipping a measured 24% regression as the default is not defensible.
+  const char* overlap_env = std::getenv("RD_PALETTE_OVERLAP");
+  const bool overlap = (overlap_env != nullptr && overlap_env[0] == '1');
+  rd::PaletteGate gate;
+  std::thread palette_thread;
   rd::VideoResult result;
   if (!opt.palette_from.empty()) {
     // A .txt here used to fail with "improper image header", because this branch
@@ -538,56 +564,83 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       const rd::PaletteEntry& e = palette->entries[i];
       std::printf("  %2d: %9.1f %9.1f %9.1f\n", i, e.r, e.g, e.b);
     }
+  } else if (overlap && !opt.palette_only) {
+    // Overlapping: the palette builds here while the caller goes on to start the
+    // reader.  `result` is written by this thread and read by the main thread only
+    // after the join, so its palette_* fields need no synchronisation of their own.
+    palette_thread = std::thread([&] {
+      std::string pal_err;
+      if (!rd::VideoBuildPalette(in_path, opt, info, palette.get(), tree.get(),
+                                  &result, &pal_err)) {
+        gate.Fail(pal_err);
+        return;
+      }
+      gate.Publish(std::move(*palette), std::move(*tree));
+    });
   } else if (!rd::VideoBuildPalette(in_path, opt, info, palette.get(), tree.get(),
                                     &result, &error)) {
     std::fprintf(stderr, "error: %s\n", error.c_str());
     return 1;
-  }
-  const std::size_t tile = static_cast<std::size_t>(result.palette_tile);
-  // Mean saturation is reported because sampling many scenes into one montage
-  // dilutes the palette: the octree's centroids must then span the whole gamut
-  // and land on desaturated mid-tones, which reads as "dull and grey".  Making
-  // that a number is the only way to tune it.
-  if (!opt.palette_from.empty()) {
-    // Already reported above, from the adopted colormap.
-  } else if (result.palette_mosaic_w > 0) {
-    std::printf("palette    : %d colours from %d per-frame palettes, "
-                "%dx%d swatch mosaic, %.1f MiB, %.1f ms "
-                "(stage 1 %.0f ms), mean saturation %.1f%%, %d near-neutral\n",
-                result.palette_colors, result.palette_sampled,
-                result.palette_mosaic_w, result.palette_mosaic_h,
-                static_cast<double>(result.palette_pixels * sizeof(rd::RgbaF)) /
-                    (1024.0 * 1024.0),
-                result.palette_ms, result.palette_secondary_ms,
-                100.0 * rd::MeanPaletteSaturation(*palette),
-                result.palette_neutral);
   } else {
-    std::printf("palette    : %d colours from %d sampled frame(s), %zux%zu montage, "
-                "%.1f MiB, %.1f ms, mean saturation %.1f%%, %d near-neutral\n",
-                result.palette_colors, result.palette_sampled, tile, tile,
-                static_cast<double>(result.palette_pixels * sizeof(rd::RgbaF)) /
-                    (1024.0 * 1024.0),
-                result.palette_ms,
-                100.0 * rd::MeanPaletteSaturation(*palette),
-                result.palette_neutral);
+    gate.Publish(std::move(*palette), std::move(*tree));
   }
-  for (int i = 0; i < palette->count && i < opt.dump_palette_limit; ++i) {
-    const rd::PaletteEntry& e = palette->entries[i];
-    std::printf("  %2d: %9.1f %9.1f %9.1f\n", i, e.r, e.g, e.b);
-  }
+  // The report reads the gate rather than the moved-from unique_ptr: Publish took
+  // ownership with std::move, so *palette is empty from here on.
+  auto report_palette = [&] {
+      const std::size_t tile = static_cast<std::size_t>(result.palette_tile);
+      // Mean saturation is reported because sampling many scenes into one montage
+      // dilutes the palette: the octree's centroids must then span the whole gamut
+      // and land on desaturated mid-tones, which reads as "dull and grey".  Making
+      // that a number is the only way to tune it.
+      if (!opt.palette_from.empty()) {
+        // Already reported above, from the adopted colormap.
+      } else if (result.palette_mosaic_w > 0) {
+        std::printf("palette    : %d colours from %d per-frame palettes, "
+                    "%dx%d swatch mosaic, %.1f MiB, %.1f ms "
+                    "(stage 1 %.0f ms), mean saturation %.1f%%, %d near-neutral\n",
+                    result.palette_colors, result.palette_sampled,
+                    result.palette_mosaic_w, result.palette_mosaic_h,
+                    static_cast<double>(result.palette_pixels * sizeof(rd::RgbaF)) /
+                        (1024.0 * 1024.0),
+                    result.palette_ms, result.palette_secondary_ms,
+                    100.0 * rd::MeanPaletteSaturation(gate.palette()),
+                    result.palette_neutral);
+      } else {
+        std::printf("palette    : %d colours from %d sampled frame(s), %zux%zu montage, "
+                    "%.1f MiB, %.1f ms, mean saturation %.1f%%, %d near-neutral\n",
+                    result.palette_colors, result.palette_sampled, tile, tile,
+                    static_cast<double>(result.palette_pixels * sizeof(rd::RgbaF)) /
+                        (1024.0 * 1024.0),
+                    result.palette_ms,
+                    100.0 * rd::MeanPaletteSaturation(gate.palette()),
+                    result.palette_neutral);
+      }
+      for (int i = 0; i < palette->count && i < opt.dump_palette_limit; ++i) {
+        const rd::PaletteEntry& e = palette->entries[i];
+        std::printf("  %2d: %9.1f %9.1f %9.1f\n", i, e.r, e.g, e.b);
+      }
 
-  if (!opt.palette_export.empty()) {
-    if (!rd::ImWritePalette(*palette, opt.palette_export, &error)) {
-      std::fprintf(stderr, "error: --palette-export %s: %s\n",
-                   opt.palette_export.c_str(), error.c_str());
-      return 1;
-    }
-    std::printf("palette    : written to %s (%d colours; read it back with "
-                "--palette-from)\n",
-                opt.palette_export.c_str(), palette->count);
-  }
+      if (!opt.palette_export.empty()) {
+        if (!rd::ImWritePalette(gate.palette(), opt.palette_export, &error)) {
+          std::fprintf(stderr, "error: --palette-export %s: %s\n",
+                       opt.palette_export.c_str(), error.c_str());
+          return 1;
+        }
+        std::printf("palette    : written to %s (%d colours; read it back with "
+                    "--palette-from)\n",
+                    opt.palette_export.c_str(), gate.palette().count);
+      }
+  };
+  // Joining is what makes every read below safe, and it must happen on EVERY exit
+  // path: a detached thread outliving the interrupt handler, or writing into a
+  // result that has already been printed, is the failure this line exists to prevent.
+  auto join_palette = [&] {
+    if (palette_thread.joinable()) palette_thread.join();
+  };
 
   if (opt.palette_only) {
+    join_palette();
+    report_palette();
     std::printf("palette-only: stopping before the dither, as asked\n");
     return 0;
   }
@@ -605,13 +658,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   if (opt.segment_frames <= 0) {
     // No segmentation: run once, exactly as before.
     rd::InstallInterruptHandler();
-    // Published into a gate rather than passed by reference. Publishing is what lets
-    // a later change build the palette on its own thread: this call site stops caring
-    // WHICH, and stays the only place that decides. Synchronous for now.
-    rd::PaletteGate gate;
-    gate.Publish(std::move(*palette), std::move(*tree));
     const bool ok = rd::VideoProcess(in_path, out_path, opt, info, gate,
-                                          &result, &error);
+                                     &result, &error);
+    // The reader has been running for the whole palette build.  Join before reading any
+    // palette_* field, then report, then summarise.
+    join_palette();
     const bool interrupted = rd::Interrupted();
     rd::RemoveInterruptHandler();
     if (interrupted) return ReportInterrupted(out_path);
@@ -619,6 +670,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       std::fprintf(stderr, "error: %s\n", error.c_str());
       return 1;
     }
+    report_palette();
     PrintVideoSummary(result);
     return 0;
   }
@@ -698,8 +750,13 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // and the palette is identical for every segment anyway.  The overlap does not apply
   // here -- this path stays a serial prefix -- but the signature is uniform, so the gate
   // exists regardless.
+  // ONE gate for every segment, published once.  The overlap does NOT apply to this
+  // path: it stays a serial prefix, and the gate exists only because VideoProcess's
+  // signature is uniform.  (Per-segment publishing would also mean rd::Palette(*palette),
+  // a 2 MB stack copy -- sizeof(Palette) is 65536 x 32 B.)
   rd::PaletteGate seg_gate;
   seg_gate.Publish(std::move(*palette), std::move(*tree));
+  report_palette();
   for (int seg = 0; seg < seg_count; ++seg) {
     if (done[static_cast<std::size_t>(seg)]) continue;
     const std::int64_t first = static_cast<std::int64_t>(seg) * seg_frames;
