@@ -145,8 +145,126 @@ output. This is a decision about output, not about performance.
 
 ### Not yet tested
 
+- Whether the by-seek path has the same truncation. Its stride arithmetic differs (one seek
+  per sample rather than a `select` stride), so it may be immune, and that has not been checked.
+- Behaviour on VFR sources, where `info.frames` may be an estimate rather than a count.
+- ~~Whether an alpha-bearing source makes `SourcePixFmtHasAlpha` correct~~ -- **resolved
+  2026-10-08.** `tools\make-video-fixtures.ps1` now builds `clip_alpha.mkv` (`yuva420p` in
+  ffv1) and asserts both that the fixture carries alpha and that rdither keeps the
+  4-channel palette path for it. See item 3.
+
+---
+
+## 2. `nb_frames` is read but never counted, so a container that declares none yields a 1-frame palette
+
+**Status:** open. Confirmed by measurement 2026-10-08. Not patched -- see "why not".
+
+**Severity:** silent wrong output, same class as item 1. Right frame count in the file, exit 0,
+palette built from one frame.
+
+### The measurement
+
+Built a `yuva420p` / ffv1 clip (needed for item 3 below, and the first time this
+repository had any fixture carrying alpha):
+
+```
+ffprobe nb_frames      : N/A      <- what rdither reads
+ffprobe -count_frames  : 20       <- reality
+rdither prints         : 320x240, ffv1, yuva420p, 0 frames @ 10.000 fps
+rdither prints         : [video] palette: sampling 1 frame(s) of 0
+```
+
+The palette was built from **one** frame and the clip rendered 20, exit 0.
+
+### Cause
+
+`rd_video.cpp` takes `info.frames` from ffprobe's declared `stream=nb_frames` and never
+falls back to `-count_frames`. For a container that does not declare the field the value is
+`N/A` -> 0, and the clamp chain at `rd_video.cpp:1274-1276` degrades `want` to its floor of 1.
+
+### Why it is narrow but not exotic
+
+`nb_frames` is populated by mp4/h264 (the project's shipped shape) and absent from
+mkv/ffv1. So the trigger is "an mkv", which is a container this project already uses for its
+own fixtures -- `tests\clip1920_audio.mkv` and the new alpha fixture are both mkv. The
+18001-frame clip and the 600-frame bench clip are mp4 and are unaffected.
+
+### Why not patched
+
+A `nb_frames` -> `-count_frames` fallback means a **real** frame count on every such source,
+which changes `want`, which changes the montage, which changes the palette and therefore
+every video output from those sources. Same trade as item 1, same reason to defer: it is a
+decision about output, not about performance. Unlike item 1 this one has a defensible
+correct answer -- "count the frames" is right where "sample the whole clip" is arguable --
+so it is the more likely of the two to be approved.
+
+### Candidate fix, not applied
+
+In `VideoProbeInfo`, when the declared `nb_frames` is absent or 0, re-probe the same stream
+with `-count_frames`. Cheap (one extra demux pass, no decode), and the packet-index pass
+already performed for VFR detection is the same shape of work.
+
+### Not yet tested
+
+- Whether `-count_frames` on a long mkv is fast enough to be acceptable. The VFR probe
+  already walks the packet index, so it may be, but it has not been measured.
+- Whether any real mkv source in this project's intended use declares `nb_frames`.
+
 - Whether the by-seek path has the same truncation (its stride arithmetic differs).
 - Whether an alpha-bearing source makes `SourcePixFmtHasAlpha` correct. **No fixture in the
   repository carries an alpha channel**, so that branch has never executed. See the
   `9df7e34` commit message.
 - Behaviour on VFR sources, where `info.frames` may be an estimate rather than a count.
+---
+
+## 3. `SourcePixFmtHasAlpha` had no fixture and no check -- now it has both
+
+**Status:** closed 2026-10-08. Not a defect in the code; a gap in the checks around it.
+
+### What was wrong
+
+`SourcePixFmtHasAlpha` (`rd_video.cpp`) gates the 3-channel palette path added in `9df7e34`.
+It is deny-by-default, so an unrecognised format keeps 4 channels and keeps today's
+behaviour. That is the right default, and it was **completely untested**: no fixture in the
+repository carried an alpha channel, so the deny branch had never executed. A guard that
+defaults wrongly and is never exercised looks exactly like one that works.
+
+The `9df7e34` commit message says so, and said so at the time. This closes it.
+
+### What exists now
+
+`tools\make-video-fixtures.ps1` builds a third fixture, `clip_alpha.mkv` -- `yuva420p` in
+ffv1, 320x180, 30 frames -- and asserts three things:
+
+1. **It carries alpha.** `pix_fmt` must match `yuva*`. This is the assertion that matters,
+   because the failure mode is an encoder that accepts `-pix_fmt yuva420p` and emits
+   something else: `libvpx-vp9` was tried and silently produced `yuv420p`, a file with the
+   right shape and no alpha. A fixture that looks healthy and cannot test the thing it
+   exists to test is worse than no fixture, because it reports a pass.
+2. **rdither keeps the 4-channel palette path** for it, checked by tracing the actual
+   `palette-frames` spawn and asserting it does not ask for `rgb24`.
+3. It emits `CLIP_ALPHA=` for `verify.ps1` to read back, matching the existing
+   `CLIP=` / `CLIP_AUDIO=` convention.
+
+Verified in both directions: an alpha source (`yuva420p`) gets `-pix_fmt rgba`, and the
+no-alpha source (`yuv420p`) gets `-pix_fmt rgb24`. A guard proven only in one direction is
+half a guard.
+
+### Note on the alpha path being provably unchanged
+
+For an alpha source `pal_ch == 4`, so the format string is `" -pix_fmt rgba"` -- which is
+exactly what the code hardcoded before `9df7e34`. The alpha path cannot have regressed, by
+inspection rather than by test. That is why this is a check gap and not a suspected defect.
+
+### A regression introduced and fixed while adding this
+
+Adding the guard assertion exposed that `-Ffmpeg <bad path>` fell through to whatever
+`ffmpeg` was on PATH and **exited 0**. That is the floor this script is supposed to have,
+and it was missing. Now:
+
+```
+-Ffmpeg C:\nonexistent\ffmpeg.exe   ->  "cannot run: the ffmpeg given with -Ffmpeg does
+                                          not exist"   exit 2
+```
+
+Both paths re-verified after the fix: bad path exits 2, normal run exits 0.

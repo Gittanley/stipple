@@ -52,6 +52,13 @@ if (-not $Ffmpeg) {
   }
   $Ffmpeg = $cmd.Source
 }
+# An EXPLICITLY given path that does not exist must not fall through to whatever is on
+# PATH.  Without this, `-Ffmpeg C:\nonexistent\ffmpeg.exe` silently built the fixtures with
+# a different ffmpeg and exited 0, which is the floor this script is supposed to have.
+if ($Ffmpeg -and -not (Test-Path -LiteralPath $Ffmpeg) -and -not (Get-Command $Ffmpeg -ErrorAction SilentlyContinue)) {
+  Write-Host "cannot run: the ffmpeg given with -Ffmpeg does not exist: $Ffmpeg"
+  exit 2
+}
 if (-not $OutDir) {
   $OutDir = Join-Path ([IO.Path]::GetTempPath()) 'rd_video_fixtures'
 }
@@ -100,6 +107,7 @@ function Invoke-Ffmpeg([string[]]$FfmpegArgs, [string]$What) {
 
 $clip = Join-Path $OutDir 'clip.mp4'
 $clipAudio = Join-Path $OutDir 'clip_audio.mkv'
+$clipAlpha = Join-Path $OutDir 'clip_alpha.mkv'
 
 Write-Host "video fixtures -> $OutDir"
 
@@ -123,11 +131,28 @@ Invoke-Ffmpeg @('-y', '-hide_banner', '-loglevel', 'error',
   '-c:a', 'pcm_s16le', '-shortest',
   $clipAudio) 'audio clip'
 
+# yuva420p in ffv1/mkv -- a clip that CARRIES ALPHA, for SourcePixFmtHasAlpha
+# (rd_video.cpp).  Without this the guard's deny branch never executes, so nothing in
+# the repository can tell a working guard from a broken one: the 3-channel palette path
+# is only correct if the 4-channel path still happens to be taken for an alpha source,
+# and a fixture set with no alpha clip cannot see the difference.
+#
+# ffv1 because it is lossless and takes yuva420p directly.  Two encoders that were tried
+# and do NOT work for this: libvpx-vp9 silently produced yuv420p (alpha dropped), and
+# prores_ks produced yuva444p12le.  The first is the dangerous one -- it fails by
+# quietly producing a fixture that looks right and carries no alpha, which is exactly
+# the shape of fault the fixture exists to catch.  Hence the pix_fmt assertion below.
+Invoke-Ffmpeg @('-y', '-hide_banner', '-loglevel', 'error',
+  '-f', 'lavfi', '-i', "testsrc=size=$Size`:rate=$Rate",
+  '-frames:v', "$Frames", '-pix_fmt', 'yuva420p', '-c:v', 'ffv1',
+  $clipAlpha) 'alpha clip'
+
 # Assert what was built rather than trusting exit 0.  A fixture with the wrong shape
 # would make every check that uses it quietly meaningless, which is worse than no
 # fixture: it would report a pass.
 foreach ($pair in @(@{ path = $clip; want = $Frames; what = 'silent clip' },
-                    @{ path = $clipAudio; want = $Frames; what = 'audio clip' })) {
+                    @{ path = $clipAudio; want = $Frames; what = 'audio clip' },
+                    @{ path = $clipAlpha; want = $Frames; what = 'alpha clip' })) {
   if (-not (Test-Path $pair.path)) { throw "the $($pair.what) was not created" }
   $counted = & $ffprobe -v error -select_streams v:0 -count_frames `
     -show_entries stream=nb_read_frames -of default=nw=1:nk=1 $pair.path 2>&1 | Out-String
@@ -143,8 +168,43 @@ if (-not (& $ffprobe -v error -select_streams a:0 -show_entries stream=codec_nam
 }
 Write-Host '  audio stream present on the audio clip'
 
+# The alpha fixture must ACTUALLY carry alpha.  Asserting only the frame count is not
+# enough, because the failure mode for this fixture is an encoder that accepts
+# -pix_fmt yuva420p and emits something else -- a file with the right shape and no alpha,
+# which would make the guard's deny branch untestable while appearing healthy.
+$alphaFmt = (& $ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt `
+               -of default=nw=1:nk=1 $clipAlpha 2>&1 | Out-String).Trim()
+if ($alphaFmt -notlike 'yuva*') {
+  throw "the alpha clip's pixel format is '$alphaFmt', expected a yuva* format -- it carries no alpha, so SourcePixFmtHasAlpha's deny branch cannot be exercised"
+}
+Write-Host "  alpha clip carries alpha (pix_fmt=$alphaFmt)"
+
+# And assert the consequence in rdither's own terms: an alpha source must NOT take the
+# 3-channel palette path.  This is the check that would have caught a guard that defaults
+# the wrong way round.
+$rdither = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Release\rdither.exe'
+if (-not (Test-Path $rdither)) { $rdither = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\Debug\rdither.exe' }
+if (Test-Path $rdither) {
+  $prev = $env:RD_TRACE
+  $env:RD_TRACE = '1'
+  $traced = (& $rdither --video --colors 16 --engine cuda --palette-only `
+               $clipAlpha (Join-Path $OutDir 'alpha_probe_out.mkv') 2>&1 | Out-String)
+  if ($null -eq $prev) { Remove-Item Env:\RD_TRACE -EA SilentlyContinue } else { $env:RD_TRACE = $prev }
+  if ($traced -match 'palette-frames.*?-pix_fmt\s+rgb24') {
+    throw 'rdither asked the palette decoder for rgb24 on an alpha source -- SourcePixFmtHasAlpha returned false for an alpha pixel format'
+  }
+  if ($traced -notmatch 'palette-frames') {
+    Write-Host '  NOTE: no palette-frames spawn was traced, so the guard was NOT checked (engine or ffmpeg unavailable)'
+  } else {
+    Write-Host '  alpha source keeps the 4-channel palette path (no rgb24 requested)'
+  }
+} else {
+  Write-Host '  NOTE: rdither.exe not built, so the SourcePixFmtHasAlpha guard was NOT checked'
+}
+
 # Emitted as parseable lines so verify.ps1 can read the paths back rather than
 # re-deriving them and getting a different answer.
 Write-Host "CLIP=$clip"
 Write-Host "CLIP_AUDIO=$clipAudio"
+Write-Host "CLIP_ALPHA=$clipAlpha"
 exit 0

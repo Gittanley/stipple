@@ -295,6 +295,7 @@ if (Test-Path $det) {
 # someone assume the video path is now fully covered.
 $genClip = ''
 $genAudio = ''
+$genAlpha = ''
 # -Fast skips the two stages that need a 1080p clip, so it must not spend the time
 # generating one either.  The fixture generator is not free -- it renders and verifies
 # two clips through ffmpeg -- and on the fast path nothing would consume the result.
@@ -308,8 +309,14 @@ if ($needFixtures) {
     $fx = & pwsh -NoProfile -File $mk 2>&1 | Out-String
     $fxCode = $LASTEXITCODE
     foreach ($line in ($fx -split "`r?`n")) {
-      if ($line -match '^(CLIP|CLIP_AUDIO)=(.+)$') {
-        if ($Matches[1] -eq 'CLIP') { $genClip = $Matches[2].Trim() } else { $genAudio = $Matches[2].Trim() }
+      if ($line -match '^(CLIP|CLIP_AUDIO|CLIP_ALPHA)=(.+)$') {
+        switch ($Matches[1]) {
+          'CLIP'       { $genClip = $Matches[2].Trim() }
+          'CLIP_AUDIO' { $genAudio = $Matches[2].Trim() }
+          # Without this case CLIP_ALPHA= matched nothing, so the line was printed and
+          # thrown away -- an emitted path that no consumer read.
+          'CLIP_ALPHA' { $genAlpha = $Matches[2].Trim() }
+        }
       } elseif ($line.Trim()) { Write-Host "  $($line.TrimEnd())" }
     }
     if ($fxCode -ne 0) {
@@ -361,6 +368,27 @@ if (Test-Path $unv) {
     0 { }
     2 { Write-Host "unvisited pixel: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
+# A sixth: SourcePixFmtHasAlpha, the guard that decides whether the palette decoder gets 3
+# channels or 4.  It decides that on the SOURCE pixel format, and no fixture in this
+# repository carried alpha, so the deny branch had never executed -- a guard that defaults
+# correctly and is never exercised is indistinguishable from one that is broken.
+#
+# It is its own probe, not an assertion inside make-video-fixtures.ps1, because that
+# generator only runs when tests\clip1920.mp4 is MISSING (verify.ps1:301).  With both
+# committed clips present it never runs, so a check placed there is dead on every normal
+# checkout and the suite still reports green.  This builds its own 160x120 clips in a few
+# ms and needs no 1080p fixture, no engine parity and no GPU.
+$ag = Join-Path $PSScriptRoot 'tools\probe-alpha-guard.ps1'
+if (Test-Path $ag) {
+  Write-Host ""
+  & pwsh -NoProfile -File $ag -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "alpha guard: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "alpha guard: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
 
