@@ -450,10 +450,12 @@ class PaletteGate {
   std::unique_ptr<ColorTree> tree_;
 };
 
-// Full pipeline.  Requires a palette and tree from VideoBuildPalette.
+// Full pipeline.  Requires a palette and tree from VideoBuildPalette, reached through a
+// gate rather than by reference: the palette is built concurrently with this call, so
+// VideoProcess waits on the gate itself and no caller has to.
 bool VideoProcess(const std::string& in, const std::string& out,
                   const VideoOptions& opt, const VideoInfo& info,
-                  const Palette& palette, const ColorTree& tree,
+                  const PaletteGate& gate,
                   VideoResult* result, std::string* error);
 
 }  // namespace rd

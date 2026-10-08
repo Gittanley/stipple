@@ -605,8 +605,13 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   if (opt.segment_frames <= 0) {
     // No segmentation: run once, exactly as before.
     rd::InstallInterruptHandler();
-    const bool ok = rd::VideoProcess(in_path, out_path, opt, info, *palette,
-                                     *tree, &result, &error);
+    // Published into a gate rather than passed by reference. Publishing is what lets
+    // a later change build the palette on its own thread: this call site stops caring
+    // WHICH, and stays the only place that decides. Synchronous for now.
+    rd::PaletteGate gate;
+    gate.Publish(std::move(*palette), std::move(*tree));
+    const bool ok = rd::VideoProcess(in_path, out_path, opt, info, gate,
+                                          &result, &error);
     const bool interrupted = rd::Interrupted();
     rd::RemoveInterruptHandler();
     if (interrupted) return ReportInterrupted(out_path);
@@ -688,6 +693,13 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
 
   rd::InstallInterruptHandler();
   bool failed = false;
+  // ONE gate for every segment, published once.  Per-segment would be two bugs at once:
+  // rd::Palette(*palette) is a 2 MB copy on the stack (sizeof(Palette) is 65536 x 32 B),
+  // and the palette is identical for every segment anyway.  The overlap does not apply
+  // here -- this path stays a serial prefix -- but the signature is uniform, so the gate
+  // exists regardless.
+  rd::PaletteGate seg_gate;
+  seg_gate.Publish(std::move(*palette), std::move(*tree));
   for (int seg = 0; seg < seg_count; ++seg) {
     if (done[static_cast<std::size_t>(seg)]) continue;
     const std::int64_t first = static_cast<std::int64_t>(seg) * seg_frames;
@@ -704,7 +716,10 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     std::printf("segment %d/%d: frames %lld..%lld -> %s\n", seg + 1, seg_count,
                 static_cast<long long>(first),
                 static_cast<long long>(first + want - 1), seg_path.c_str());
-    if (!rd::VideoProcess(in_path, seg_path, opt, info, *palette, *tree,
+    // Segmented path: same gate, published once by the caller above and reused for
+    // every segment.  The palette is a serial prefix here and the overlap does not
+    // apply; the gate exists because VideoProcess's signature is uniform.
+    if (!rd::VideoProcess(in_path, seg_path, opt, info, seg_gate,
                           &seg_result, &error)) {
       std::fprintf(stderr, "error: segment %d: %s\n", seg + 1, error.c_str());
       failed = true;

@@ -2391,7 +2391,7 @@ const ColorTree& PaletteGate::tree() const { return *tree_; }
 
 bool VideoProcess(const std::string& in, const std::string& out,
                   const VideoOptions& opt, const VideoInfo& info,
-                  const Palette& palette, const ColorTree& tree,
+                  const PaletteGate& gate,
                   VideoResult* result, std::string* error) {
   // Both tools, once.  The second VideoFindTools further down used to ask for ffprobe
   // only, having already been handed ffmpeg -- two walks of the same PATH search for
@@ -3585,6 +3585,20 @@ bool VideoProcess(const std::string& in, const std::string& out,
       }
       Batch& b = slots[static_cast<std::size_t>(slot)];
       const double t0 = NowMs();
+        // The palette is built concurrently with this whole function, so a worker can reach
+        // here with a decoded batch and no palette yet.  Wait HERE rather than at the top of
+        // VideoProcess: the reader thread starts ~180 lines earlier, so a Wait() at function
+        // entry would block BEFORE the reader was ever spawned and the two stages would not
+        // overlap at all.  That version compiles, gates green, and saves nothing.
+        gate.Wait();
+        if (!gate.ok()) {
+          // The palette build failed while this worker was waiting.  Record it and unwind
+          // rather than dither against an absent palette; VideoProcess reports the error.
+          std::lock_guard<std::mutex> gate_lock(mu);
+          failed = true;
+          cv_done.notify_all();
+          return;
+        }
       // Whether the device wrote `b.raw` itself.  Only true when the uint16 output
       // was actually requested: if the GPU returns float4 (--gpu-float-out, or any
       // future path that does not convert on the device) the host still has to do
@@ -3629,12 +3643,12 @@ bool VideoProcess(const std::string& in, const std::string& out,
           // engine honours each one only when the matching pointer is also
           // supplied -- so this is the same three-way contract, not a new one.
           err = rd::RiemersmaBlocksOpencl(
-              palette, params, tree, info.width, info.height, b.pixels.data(),
+              gate.palette(), params, gate.tree(), info.width, info.height, b.pixels.data(),
               blocks, &device, raw_written ? b.out() : nullptr, gpu_index,
               blocks.upload_u16 ? b.in() : nullptr);
         } else {
           err = rd::RiemersmaBlocksCuda(
-              palette, params, tree, info.width, info.height, b.pixels.data(),
+              gate.palette(), params, gate.tree(), info.width, info.height, b.pixels.data(),
               blocks, &device, raw_written ? b.out() : nullptr, gpu_index,
               blocks.upload_u16 ? b.in() : nullptr);
         }
@@ -3677,7 +3691,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
         // `b.in()` is uint16*; the planar layout is the SAME memory viewed as bytes,
         // which is how the reader already hands it to RawYuv444ToFloatsParallel. No
         // separate 8-bit buffer exists -- the cast is the whole difference.
-        RiemersmaBlocksCpu(palette, params, tree, info.width, info.height,
+        RiemersmaBlocksCpu(gate.palette(), params, gate.tree(), info.width, info.height,
                            b.pixels.data(), b.frames, std::max(16, opt.block),
                            reinterpret_cast<unsigned char*>(b.out()), pixels,
                            out_yuv444, &cpu_err,
