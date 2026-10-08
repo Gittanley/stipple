@@ -126,3 +126,7 @@ Thumbs.db
 # The whole directory was previously untracked-but-not-ignored, which is the state
 # `git add -A` exists to turn into an accident.
 artifacts/
+
+# Per-plan scratch for the SDD/executing-plans skills: ledger, briefs, review
+# packages. Git history is the record; these are working state.
+.superpowers/

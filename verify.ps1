@@ -381,6 +381,23 @@ if (Test-Path $unv) {
 # committed clips present it never runs, so a check placed there is dead on every normal
 # checkout and the suite still reports green.  This builds its own 160x120 clips in a few
 # ms and needs no 1080p fixture, no engine parity and no GPU.
+# And a seventh: the built-in C++ self-test (`rdither --self-test`, rd_cli.cpp:1257).
+#
+# This one is easy to miss and was missed until the alpha-guard work: the gate has never
+# invoked --self-test, so every assertion in it ran only when somebody typed the flag by
+# hand.  A test nobody runs is not a gate, and the gate reporting EXIT=0 while a test was
+# never executed is the failure mode this suite exists to catch -- so it runs here.
+#
+# It is cheap (sub-second) and needs no GPU, no clip and no engine, so it belongs on every
+# run including -Fast.
+$stOut = & $Rdither --self-test 2>&1
+$stCode = $LASTEXITCODE
+if ($stOut) { $stOut | ForEach-Object { Write-Host "  $_" } }
+if ($stCode -ne 0) {
+  Write-Host "self-test: FAILED (exit $stCode)" -ForegroundColor Red
+  exit 1
+}
+
 $ag = Join-Path $PSScriptRoot 'tools\probe-alpha-guard.ps1'
 if (Test-Path $ag) {
   Write-Host ""

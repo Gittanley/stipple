@@ -26,7 +26,10 @@
 // *is* the batch: each (frame, block) pair is an independent walk.
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 
 #include "rd_im.h"
@@ -395,6 +398,57 @@ bool Interrupted();
 bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
                        const VideoInfo& info, Palette* palette, ColorTree* tree,
                        VideoResult* result, std::string* error);
+
+// A palette that may still be building.
+//
+// VideoProcess used to take `const Palette&` and `const ColorTree&`, which forced the
+// palette to EXIST before the pipeline could start -- and the palette is a serial prefix,
+// so the reader sat idle for its whole duration. This handle lets the build proceed on its
+// own thread while the reader fills its queue, and the dither workers wait on Wait().
+//
+// Thread-safety: Publish/Fail/Wait/ok/error are callable from any thread. palette() and
+// tree() are NOT synchronised, deliberately -- they are only reachable once Wait() has
+// returned and no writer runs afterwards, and a second check inside them would only hide
+// a bug rather than report it. Calling them before Wait() returns is a defect, not a
+// condition this class handles.
+class PaletteGate {
+ public:
+  // Publishes the built palette.  Called at most once, from the building thread.
+  //
+  // RVALUE references, and that is load-bearing rather than stylistic.  sizeof(Palette) is
+  // about 2 MB (`entries[kMaxColormapSize]`, 65536 x 32 B), so a by-value parameter is a
+  // 2 MB stack object in this function AND a 2 MB temporary at the call site -- two of them
+  // per call, which overflows the 1 MB default stack.  Found by the self-test dying with
+  // 0xC00000FD; the same rule already appears in rd_video.cpp, where Palette is described as
+  // living on the heap and "never as locals".  A by-value signature here breaks that rule
+  // while looking perfectly innocent.
+  void Publish(Palette&& palette, ColorTree&& tree);
+  // Records a failure.  Ignored if Publish has already run: the reader may already be
+  // waiting on a palette that is good, and a late failure must not invalidate it.
+  void Fail(std::string error);
+  // Blocks until Publish or Fail has been called.  Idempotent.
+  void Wait() const;
+  // True only after a successful Publish.
+  bool ok() const;
+  const std::string& error() const;
+  // Valid only after Wait() returned and ok() is true.
+  const Palette& palette() const;
+  const ColorTree& tree() const;
+
+ private:
+  mutable std::mutex mu_;
+  mutable std::condition_variable cv_;
+  bool done_ = false;
+  bool ok_ = false;
+  std::string error_;
+  // ON THE HEAP, and this is not a style preference.  sizeof(Palette) is about 2 MB --
+  // `PaletteEntry entries[kMaxColormapSize]`, 65536 entries x 32 B -- so a gate holding
+  // one by value is a 2 MB stack object and overflows the 1 MB default stack the instant
+  // anyone writes `PaletteGate gate;`, which is the only way anyone would write it.
+  // Found by the self-test dying with 0xC00000FD (STACK_OVERFLOW) the first time it ran.
+  std::unique_ptr<Palette> palette_;
+  std::unique_ptr<ColorTree> tree_;
+};
 
 // Full pipeline.  Requires a palette and tree from VideoBuildPalette.
 bool VideoProcess(const std::string& in, const std::string& out,

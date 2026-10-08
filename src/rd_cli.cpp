@@ -1298,7 +1298,91 @@ int main(int argc, char** argv) {
         }
         bad += (mismatches != 0) ? 1 : 0;
       }
-      std::printf("%s\n", bad == 0 ? "self-test PASSED" : "self-test FAILED");
+            // PaletteGate: the in-flight palette handle the video overlap uses.  Exercised here
+      // rather than only through the end-to-end probe because every later task depends on
+      // this type's blocking and publication semantics, and a probe that renders video
+      // would take minutes to tell us a Wait() never woke.
+      //
+      // Written to stderr, not stdout: stdout is block-buffered when redirected, so a crash
+      // anywhere in this block loses every preceding printf and tells us nothing about where
+      // it died.  stderr is unbuffered, so the last line printed is the one that crashed --
+      // which is how the two stack overflows below were localised rather than guessed at.
+      {
+        std::fprintf(stderr, "palette gate:\n");
+        int gbad = 0;
+        auto check = [&](const char* what, bool held) {
+          std::fprintf(stderr, "  %-34s %s\n", what, held ? "ok" : "FAIL");
+          std::fflush(stderr);
+          if (!held) ++gbad;
+        };
+
+        // A published gate wakes Wait, reports ok, and hands back the palette.
+        {
+          rd::PaletteGate gate;
+          auto p = std::make_unique<rd::Palette>();  // heap: sizeof(Palette) is ~2 MB
+          p->count = 3;
+          rd::ColorTree t;
+          gate.Publish(std::move(*p), std::move(t));
+          gate.Wait();
+          check("publish wakes Wait", gate.ok());
+          check("published palette has 3 colours", gate.palette().count == 3);
+        }
+
+        // A failed gate wakes Wait, reports not-ok, and carries the error string.
+        {
+          rd::PaletteGate gate;
+          gate.Fail("no ffmpeg on PATH");
+          gate.Wait();
+          check("fail wakes Wait", !gate.ok());
+          check("fail carries its message", gate.error() == "no ffmpeg on PATH");
+        }
+
+        // Fail after Publish must NOT clobber a palette that already landed: the reader may
+        // already be waiting on it and the palette is still usable.
+        //
+        // The assertion that matters is that the ERROR is not recorded.  Asserting ok() and
+        // the colour count here would be tautological -- Fail() never touches palette_ or
+        // ok_, so those hold with or without the guard.  The guard's whole effect is on
+        // error_, and deleting it (checked by mutation) leaves every other assertion
+        // passing, which is how that was found.
+        {
+          rd::PaletteGate gate;
+          auto p = std::make_unique<rd::Palette>();
+          p->count = 7;
+          rd::ColorTree t;
+          gate.Publish(std::move(*p), std::move(t));
+          gate.Fail("late failure");
+          gate.Wait();
+          check("late Fail does not clobber", gate.ok());
+          check("late Fail keeps 7 colours", gate.palette().count == 7);
+          check("late Fail records no error", gate.error().empty());
+        }
+
+        // Wait() on a gate nothing has touched yet must block until a publisher arrives.
+        // This is the property the whole overlap rests on, and the one a static check
+        // cannot see.
+        {
+          rd::PaletteGate gate;
+          std::atomic<bool> finished{false};
+          std::thread waiter([&] {
+            gate.Wait();
+            finished.store(true);
+          });
+          std::this_thread::sleep_for(std::chrono::milliseconds(40));
+          const bool woke_early = finished.load();
+          auto p = std::make_unique<rd::Palette>();
+          p->count = 1;
+          rd::ColorTree t;
+          gate.Publish(std::move(*p), std::move(t));
+          waiter.join();
+          check("Wait blocks until publish", !woke_early);
+          check("Wait returns after publish", finished.load());
+        }
+
+        bad += (gbad != 0) ? 1 : 0;
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+      }      std::printf("%s\n", bad == 0 ? "self-test PASSED" : "self-test FAILED");
       return bad == 0 ? 0 : 5;
     }
     PrintUsage();

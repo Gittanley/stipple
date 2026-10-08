@@ -2339,6 +2339,56 @@ class Pipeline {
   std::size_t slot_pinned_ = 0;
 };
 
+// PaletteGate methods.  Deliberately thin: the class exists so the palette can be built
+// while the reader runs, and every piece of policy about WHEN that is worth doing lives in
+// the callers, not here.
+void PaletteGate::Publish(Palette&& palette, ColorTree&& tree) {
+  // Allocated BEFORE the lock: a 2 MB allocation under a mutex the reader may already be
+  // blocked on is a stall nobody is measuring.
+  auto held_palette = std::make_unique<Palette>(std::move(palette));
+  auto held_tree = std::make_unique<ColorTree>(std::move(tree));
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    palette_ = std::move(held_palette);
+    tree_ = std::move(held_tree);
+    ok_ = true;
+    done_ = true;
+  }
+  cv_.notify_all();
+}
+
+void PaletteGate::Fail(std::string error) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    // A Publish that already landed wins.  The build thread can fail after publishing (a
+    // cleanup path that reports failure), and clobbering a good palette there would turn a
+    // completed render into an error for no reason.
+    if (done_) return;
+    error_ = std::move(error);
+    done_ = true;
+  }
+  cv_.notify_all();
+}
+
+void PaletteGate::Wait() const {
+  std::unique_lock<std::mutex> lock(mu_);
+  cv_.wait(lock, [this] { return done_; });
+}
+
+bool PaletteGate::ok() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return ok_;
+}
+
+const std::string& PaletteGate::error() const { return error_; }
+
+// palette() and tree() take no lock.  See the header: they are reachable only after Wait()
+// has returned, and locking them would suggest a guarantee the class deliberately does not
+// make (that they are safe to call concurrently with a late Fail).
+const Palette& PaletteGate::palette() const { return *palette_; }
+
+const ColorTree& PaletteGate::tree() const { return *tree_; }
+
 bool VideoProcess(const std::string& in, const std::string& out,
                   const VideoOptions& opt, const VideoInfo& info,
                   const Palette& palette, const ColorTree& tree,
