@@ -178,6 +178,20 @@ struct VideoOptions {
   // sees is unchanged.  Measured 541 fps decode against ~120 for software, on a
   // 6-core Haswell where the software decoder is competing with everything else.
   //
+  // SCOPE, because the sentence above is broader than the test behind it.  Bit-identity
+  // was verified per OUTPUT FORMAT, and only the three the reader actually asks for were
+  // checked.  Re-verified across all three (10 frames, byte-compared, 0 differing):
+  //     yuv420p   0 of  31,104,000
+  //     yuv444p   0 of  62,208,000
+  //     rgba64le  0 of 165,888,000
+  // A FOURTH format is not safe, and 8-bit `rgba` is the concrete counterexample: with
+  // `-hwaccel cuda`, 30.2% of samples differ (max delta 80) because NVDEC hands swscale an
+  // NV12-layout frame and the fast 8-bit yuv2rgb path upsamples chroma differently than it
+  // does from planar YUV420P.  `-vf format=yuv420p` restores identity -- and `format=nv12`
+  // reproduces the gap exactly, which is what makes it a cause rather than a coincidence.
+  // The palette decoder is the one caller that asks for 8-bit `rgba`, which is why its
+  // hwaccel experiment looked like a DECODE bug for an hour when it was a CONVERSION one.
+  //
   // The one caveat: on a *corrupt* stream, error concealment is implementation-defined
   // and hardware and software can pick different concealment.  Clean input is
   // unaffected.  Set 0 to force software.

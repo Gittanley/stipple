@@ -1725,9 +1725,14 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // attempted, not the one that was requested.
   Progress progress("palette", want, !opt.quiet);
 
-  // Cell size.  tile == 0 (the default) means full resolution: each sampled frame
-  // contributes every one of its pixels, which is what makes a single
-  // quantization of the strip behave like `magick f1 f2 ... +append -colors N`.
+  // Cell size.  The default is a 128px lattice tile (VideoOptions::palette_tile = 128,
+  // which is what --help documents); tile <= 0 means FULL RESOLUTION, each sampled frame
+  // contributing every one of its pixels, which is what makes a single quantization of
+  // the strip behave like `magick f1 f2 ... +append -colors N`.
+  //
+  // (This comment used to say "tile == 0 (the default)", which stopped being true when the
+  // default moved to 128.  A reader following it would believe a default render builds a
+  // full-resolution montage; a real 600-frame run reports "128x128 montage, 64.0 MiB".)
   // A lattice tile is a sparse, aliased peek at each frame and measurably worse;
   // it is kept only for callers who want the montage to fit in less RAM.
   const int cell_w = tile > 0 ? tile : info.width;
