@@ -58,6 +58,62 @@ falls**, which is the opposite of what the flag means.
 | 32 | 22 | 682 | 97.8% |
 | 16 | 45 | 675 | 100% |
 
+### Confirmed to change output -- MEASURED, not asserted
+
+An earlier draft of this file claimed "every fix changes every video output" without
+testing it. It has now been measured, and the claim holds -- but by a smaller margin than
+"changes" implies on the palette, and by a larger one on the picture.
+
+Chain, each link measured separately:
+
+| link | evidence | result |
+|---|---|---|
+| sampled pixels differ | montage SHA256, truncated vs full | `DA6DA4F801DA12F4` vs `B42DEC6A10B9D6CC` |
+| palette entries differ | `--dump-palette`, entry by entry | **16 of 16** differ, max component delta **271.4** of 65535 (0.4%) |
+| output pixels differ | `tools\probe-frame-diff.ps1` | **0.97%-1.09%** of components per frame, max delta **52652** (80% of full range) |
+
+The last row is the one that matters. A palette moving 0.4% per component produces output
+that moves **80% of range** on the pixels that move, because Riemersma error feedback
+propagates a changed palette entry into every later pixel in its neighbourhood. So the
+change is invisible in the palette and unmissable in the picture -- which is why a palette
+metric (saturation 84.5% vs 84.4%) is the wrong instrument for judging it, and why the
+fix cannot be waved through on "the colours barely moved".
+
+Per-frame divergence also **increases along the clip**, which is the shape of the defect:
+
+```
+frame   0   0.972%      frame 359   1.092%
+frame 120   0.972%      frame 479   1.092%
+frame 240   0.972%      frame 599   1.092%
+```
+
+Frames past ~350 are the ones the truncated palette never sampled, so they are the ones it
+fits worst. A comparison that read only frame 0 would under-report this by 11%.
+
+### How this was measured, and how it was first measured wrongly
+
+The first attempt hashed both outputs (`MD5=64b14f…` vs `MD5=951c97…`) and then decoded
+**both files to raw rgb48le to count differing pixels: 7119.1 MB each, 14.2 GB total**,
+on a machine whose owner has already had one crash. The hash had already answered "they
+differ"; the full decode was for magnitude, and could have been got from three frames.
+
+`tools\probe-frame-diff.ps1` now does it in **71 MB per side** by sampling six frames
+spread across the clip (first, last, and evenly spaced between) and comparing byte by
+byte, reporting the count and the worst delta.
+
+**A whole-stream hash is the wrong instrument for this question**, for two reasons that
+were both paid for on 2026-10-08:
+
+1. It is all-or-nothing. It cannot say *where* or *how much*, and those are exactly what
+   decide whether a change is safe.
+2. It cannot distinguish one pixel from a cascade. Here the two ends of that range are
+   "1.2% of the picture moved by 80% of range" and "identical".
+
+Six controls were run before this probe was trusted, covering exit 0 (identical pair),
+exit 1 (the defect pair), exit 2 (missing file, non-video input, `-Frames 1` rejected), and
+a 3-frame clip where the request for 6 degrades to sampling all 3 rather than lying about
+coverage.
+
 ### Why it stayed hidden
 
 It needs colour concentrated in the final third. On footage whose colour is distributed,
