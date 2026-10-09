@@ -3084,6 +3084,21 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // 47% of its stage time waiting for the reader, which no amount of worker
     // count can fix -- the slack has to live in slots.  Still capped by what the RAM
     // budget affords, so this cannot overcommit.
+    //
+    // CORRECTION 2026-10-09: the conclusion above is wrong, and the measurement behind
+    // it was too narrow.  The GPU worker does idle waiting for the reader -- but the
+    // reason is the reader's SUPPLY RATE, not the number of slots, so slots cannot fix
+    // it.  Measured on the 600-frame 1080p clip: reader 8227 ms of VideoProcess's
+    // 8860 ms (92.9%), dither 6203 ms, encode 4373 ms.  Per 16-frame batch the reader
+    // supplies in 219 ms while dither consumes in 163 ms, so the worker drains faster
+    // than frames arrive; queue 3 and queue 553 buffer the same starved stream.  And the
+    // reader is ONE ffmpeg process (a single std::thread at :3400 calling one
+    // decoder.Read() per frame at :3433), so no amount of buffering or worker count makes
+    // it faster.
+    //
+    // Both the palette/reader overlap and this dial were expected to win and both lost,
+    // for this one reason: 93% of the runtime is one serial decoder, and neither change
+    // touches it.  See the design spec's section 9.
     if (opt.queue_depth >= 2) {
       depth = std::min(opt.queue_depth, static_cast<int>(affordable));
     }
