@@ -728,6 +728,42 @@ the CUDA engines, not the host block walk.** The cause is not yet diagnosed;
 `RiemersmaBlocksCpu` is only reachable from `--video --cpu-threads N` and so is
 not covered by `verify.ps1`, which is how it went unnoticed.
 
+**CORRECTION 2026-10-09: this section is stale. Both of its load-bearing claims no longer hold,
+and both are now checked.**
+
+1. **The 1.58% divergence does not reproduce.** Re-measured on the same comparison the section
+   describes -- `--engine blocks --no-gpu` against `--engine blocks`, same clip, same palette,
+   `--colors 16 --video-lossless`, 120 frames of the 1080p bench clip, decoded pixels compared
+   per frame:
+
+   ```
+   host  gpu=no   EXIT=0
+   device gpu=yes EXIT=0
+   frame 0..599   components differing   0 of 6220800 (0%)   max delta 0
+   TOTAL components differing: 0
+   ```
+
+   Byte-identical, not AE = 32747. The renders genuinely used different engines (`gpu=no` vs
+   `gpu=yes`), so the comparison is real rather than two runs of the same path.
+
+2. **It *is* covered by `verify.ps1` now.** `tools/probe-video-invariance.ps1` Part B
+   (`--engine blocks --no-gpu` vs `--engine blocks`, compared frame by frame, failing on any
+   differing frame) is wired in at `verify.ps1:486`. It is the check whose absence this section
+   cited as the reason the divergence went unnoticed. So the "only reachable from
+   `--cpu-threads N` and not covered by `verify.ps1`" explanation is no longer the state of the
+   tree either.
+
+**What is NOT retracted.** The warning that host workers are used, and the
+`--cpu-threads 0` default, both stand and are still the right advice. And the *reason* this
+section existed is still the lesson worth keeping: an "AE = 0" verification claim that had
+actually been measured on black frames is worse than no check at all, because it looks like
+evidence. Any correction to a measurement table in this file should be re-measured, not
+reasoned about -- which is what found this one.
+
+The divergence's cause was never diagnosed. If it was fixed, the commit that fixed it did not
+update this section; if it was something else, the 1.58% figure came from a configuration this
+section does not name. Either way the number above should not be relied on.
+
 #### A slot is a batch, so the queue must be sized in slots
 
 The first version sized the queue as `ceil(workers * 2 / batch_frames)`, on the
