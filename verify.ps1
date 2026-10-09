@@ -431,6 +431,28 @@ if (Test-Path $ov) {
   }
 }
 
+# And a ninth: whether splitting the decode across N seek-based ffmpeg processes is
+# byte-identical to one decode.  This guards a property nothing currently depends on, which
+# is the point -- it is the evidence for the next attempt at the bottleneck, and it is
+# evidence that is easy to get wrong from reasoning alone.
+#
+# The recorded result is asymmetric and that asymmetry IS the finding: CFR splits are
+# byte-identical in every case tried, and the VFR case is NOT (frame_index/fps is not a
+# timestamp when durations vary).  So the probe gates the CFR half and REPORTS the VFR half,
+# rather than failing on a constraint that is known and documented.
+#
+# Cheap: 320x180 fixtures, a few seconds.  Not in -Fast.
+$sd = Join-Path $PSScriptRoot 'tools\probe-split-decode.ps1'
+if (Test-Path $sd) {
+  Write-Host ""
+  & pwsh -NoProfile -File $sd
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "split decode: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "split decode: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
 # And a fifth: the image determinism probe again, pointed at VIDEO.  The image one
 # is a self-comparison across time rather than an engine-against-engine comparison,
 # which is the only shape of check that sees a fault both engines share -- and two
