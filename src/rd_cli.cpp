@@ -499,6 +499,10 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // opt-IN, because shipping a measured 24% regression as the default is not defensible.
   const char* overlap_env = std::getenv("RD_PALETTE_OVERLAP");
   const bool overlap = (overlap_env != nullptr && overlap_env[0] == '1');
+  // Whether the palette actually went onto its own thread.  Reported, not gated on timing;
+  // tools\probe-palette-overlap.ps1 reads this line to prove RD_PALETTE_OVERLAP reached the
+  // code.  See the comment at the spawn site.
+  bool overlapped = false;
   rd::PaletteGate gate;
   std::thread palette_thread;
   rd::VideoResult result;
@@ -565,6 +569,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       std::printf("  %2d: %9.1f %9.1f %9.1f\n", i, e.r, e.g, e.b);
     }
   } else if (overlap && !opt.palette_only) {
+    // Printed so that "the flag reached the code" is a DETERMINISTIC fact rather than an
+    // inference from wall time.  That inference is unusable on a busy machine: run-to-run
+    // drift here is 10-25% and this feature's effect is 22-34%, so the two overlap and a
+    // single A/B pair cannot separate them.  A line of output can.
+    overlapped = true;
     // Overlapping: the palette builds here while the caller goes on to start the
     // reader.  `result` is written by this thread and read by the main thread only
     // after the join, so its palette_* fields need no synchronisation of their own.
@@ -587,6 +596,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // The report reads the gate rather than the moved-from unique_ptr: Publish took
   // ownership with std::move, so *palette is empty from here on.
   auto report_palette = [&] {
+    // The overlap marker.  Present iff the palette was built on its own thread, which is
+    // what makes the flag's reachability checkable without timing anything.
+    if (overlapped) {
+      std::printf("palette    : built concurrently with the reader (RD_PALETTE_OVERLAP)\n");
+    }
       const std::size_t tile = static_cast<std::size_t>(result.palette_tile);
       // Mean saturation is reported because sampling many scenes into one montage
       // dilutes the palette: the octree's centroids must then span the whole gamut

@@ -96,11 +96,18 @@ function New-Fixture {
 }
 
 # Renders one arm and returns its wall time in ms, taken from rdither's OWN `frames :` line
-# rather than a stopwatch, so the number is the one the program reports.
+# Returns the run's OWN stdout, not a stopwatch reading and not a bare fps. The caller needs
+# the whole text because the reachability assertion reads a line out of it, and a stopwatch
+# cannot tell a flag that worked from a machine that happened to be quiet.
 function Invoke-Arm {
-    param([string]$Clip, [string]$Out, [bool]$NoOverlap, [int]$Colors = 16)
+    # The parameter is named for what it DOES, not for the flag's polarity.  It was
+    # `$NoOverlap` while the body already set RD_PALETTE_OVERLAP=1, so `-NoOverlap $false`
+    # meant "turn it ON" while reading as "turn it off" -- and it did turn it off, because
+    # the body branches on the value.  The two arms ran swapped and the probe compared the
+    # default against itself.  The timing assertion never noticed; the marker did, in ~4 s.
+    param([string]$Clip, [string]$Out, [bool]$Overlap, [int]$Colors = 16)
     $prev = $env:RD_PALETTE_OVERLAP
-    if ($NoOverlap) { $env:RD_PALETTE_OVERLAP = '1' } else { Remove-Item Env:\RD_PALETTE_OVERLAP -EA SilentlyContinue }
+    if ($Overlap) { $env:RD_PALETTE_OVERLAP = '1' } else { Remove-Item Env:\RD_PALETTE_OVERLAP -EA SilentlyContinue }
     try {
         $text = (& $Rdither --video --colors $Colors --engine $script:Engine `
                      --video-lossless $Clip $Out 2>&1 | Out-String)
@@ -108,10 +115,9 @@ function Invoke-Arm {
         if ($null -eq $prev) { Remove-Item Env:\RD_PALETTE_OVERLAP -EA SilentlyContinue }
         else { $env:RD_PALETTE_OVERLAP = $prev }
     }
-    $code = $LASTEXITCODE
-    if ($code -ne 0) { return $null }
-    if ($text -notmatch 'frames\s*:\s*(\d+) in ([0-9.]+) s \(([0-9.]+) fps') { return $null }
-    return [double]$Matches[3]
+    if ($LASTEXITCODE -ne 0) { return $null }
+    if ($text -notmatch 'frames\s*:') { return $null }
+    return $text
 }
 
 try {
@@ -145,52 +151,51 @@ try {
     }
     Write-Host "  engine     : $script:Engine"
 
-    # --- 1. TIMING FIRST -------------------------------------------------------
-    # Interleaved, so a drift in machine speed cannot masquerade as the flag working.
-    $onTimes = @(); $offTimes = @()
-    for ($rep = 0; $rep -lt 2; $rep++) {
-        $onTimes  += Invoke-Arm -Clip $clip -Out (Join-Path $OutDir "on_$rep.mkv")  -NoOverlap $false
-        $offTimes += Invoke-Arm -Clip $clip -Out (Join-Path $OutDir "off_$rep.mkv") -NoOverlap $true
+    # --- 1. REACHABILITY, DETERMINISTICALLY -------------------------------------
+    # This used to be a TIMING assertion: render both arms twice, require their wall times to
+    # differ by more than 2%.  That is not a usable gate on this machine and never was, and
+    # the reason is arithmetic rather than bad luck.  Run-to-run drift here is 10-25%; this
+    # feature's effect is 22-34%.  Those ranges overlap, so a single A/B pair carries no
+    # information about whether the flag did anything.  Three runs of this probe duly
+    # disagreed: 0.78x, 1.45x, 0.66x.
+    #
+    # So the flag now announces itself on stdout ("built concurrently with the reader"), and
+    # that line is the assertion.  It costs nothing, it cannot be produced by a busy machine,
+    # and it cannot pass by accident.  The second rep went with the timing check, which halves
+    # the probe's render cost -- the reps existed only to average a number nothing gates on.
+    $onText  = Invoke-Arm -Clip $clip -Out (Join-Path $OutDir 'on.mkv')  -Overlap $true
+    $offText = Invoke-Arm -Clip $clip -Out (Join-Path $OutDir 'off.mkv') -Overlap $false
+    foreach ($pair in @(@('on', $onText), @('off', $offText))) {
+        if ($null -eq $pair[1]) {
+            Write-Host "palette overlap: cannot run -- the $($pair[0]) arm produced no output"
+            exit 2
+        }
     }
-    # Inverted logic caught here: Where-Object returns NOTHING when every arm succeeded, and
-    # ($null -eq $nothing) is true, so the original test exited 2 -- on success.
-    $missing = @($onTimes + $offTimes | Where-Object { $null -eq $_ })
-    if ($missing.Count -gt 0) {
-        Write-Host "palette overlap: cannot run -- $($missing.Count) of 4 renders produced no parsable timing line"
-        exit 2
-    }
-    $onMean = ($onTimes  | Measure-Object -Average).Average
-    $offMean = ($offTimes | Measure-Object -Average).Average
-    Write-Host ("  overlap ON  : {0:N1} fps  ({1:N1}, {2:N1})" -f $onMean, $onTimes[0], $onTimes[1])
-    Write-Host ("  overlap OFF : {0:N1} fps  ({1:N1}, {2:N1})" -f $offMean, $offTimes[0], $offTimes[1])
-
-    $gain = if ($offMean -gt 0) { $onMean / $offMean } else { 0 }
-    Write-Host ("  ratio       : {0:N3}x  (overlap / default)" -f $gain)
-    if ([Math]::Abs($gain - 1.0) -lt 0.02) {
-        Write-Host 'FAIL: the two arms are within 2% -- RD_PALETTE_OVERLAP changed nothing,'
-        Write-Host '      so a pixel comparison between them would prove nothing.'
+    $marker = 'built concurrently with the reader'
+    if ($onText -notmatch [regex]::Escape($marker)) {
+        Write-Host 'FAIL: RD_PALETTE_OVERLAP=1 did NOT take the concurrent path.'
+        Write-Host '      Without this, a flag that silently stopped working would make the'
+        Write-Host '      pixel comparison below compare one binary against itself and pass.'
         exit 1
     }
-    # Reported, NOT gated -- and deliberately printed with no verdict attached.
-    #
-    # This ratio is NOT a stable direction.  An earlier run of this probe reported 1.452x
-    # (the overlap "winning") while measurements taken minutes later on a real clip gave
-    # 0.78x and a second clip gave 0.66x, and every one of those runs was slower on both
-    # arms than its neighbours.  Two reps of a contended render is not enough to resolve a
-    # 20% effect on a machine that drifts 10-25% between identical binaries.
-    #
-    # So the direction is NOT gated and this probe does NOT claim one.  What it does assert,
-    # and what gates, is: identical pixels, and arms that differ by enough to prove the flag
-    # reached the code at all.  The measured direction -- slower, on both clips, because the
-    # palette thread takes cores from the dither workers -- is recorded in
-    # docs\KNOWN-ISSUES.md item 4.  Do not "fix" this by asserting $gain -lt 1; that would
-    # encode a noise reading as a contract, and the next machine to run it would fail the gate.
-    Write-Host '  (the ratio above is NOT a stable direction -- see KNOWN-ISSUES.md item 4;' 
-    Write-Host '   this probe gates pixel-identity and flag-reachability, not performance)'
+    if ($offText -match [regex]::Escape($marker)) {
+        Write-Host 'FAIL: the default arm took the concurrent path. The flag is not opt-in,'
+        Write-Host '      which means every render pays for it and the gate proves nothing.'
+        exit 1
+    }
+    Write-Host "  reachability: marker present with =1, absent by default  (deterministic)"
+
+    # Timings are still printed, because they are the evidence for KNOWN-ISSUES item 4, but
+    # they are NOT asserted on and carry no verdict: the drift above is larger than the
+    # effect.  Do not "fix" this by asserting $onFps -lt $offFps; that would encode noise as a
+    # contract and the gate would fail on whichever machine happened to be busiest.
+    $onFps  = if ($onText  -match '\(([0-9.]+) fps') { [double]$Matches[1] } else { 0 }
+    $offFps = if ($offText -match '\(([0-9.]+) fps') { [double]$Matches[1] } else { 0 }
+    Write-Host ("  observed    : overlap {0:N1} fps vs default {1:N1} fps -- NOT ASSERTED" -f $onFps, $offFps)
 
     # --- 2. PIXELS -------------------------------------------------------------
-    $a = Join-Path $OutDir 'on_0.mkv'
-    $b = Join-Path $OutDir 'off_0.mkv'
+    $a = Join-Path $OutDir 'on.mkv'
+    $b = Join-Path $OutDir 'off.mkv'
     & pwsh -NoProfile -File $diff -A $a -B $b -Labels 'overlap-on','overlap-off' -Frames $Frames
     if ($LASTEXITCODE -ne 0) {
         Write-Host 'FAIL: the overlap changes the pixels -- that is the whole contract broken'
@@ -200,7 +205,7 @@ try {
     # --- 3. NEGATIVE CONTROL ---------------------------------------------------
     # A comparison that has never been seen failing cannot tell "identical" from "not
     # looking".  --colors 32 is a known-different render of the same clip.
-    $c = Invoke-Arm -Clip $clip -Out (Join-Path $OutDir 'ctl32.mkv') -NoOverlap $false -Colors 32
+    $c = Invoke-Arm -Clip $clip -Out (Join-Path $OutDir 'ctl32.mkv') -Overlap $false -Colors 32
     if ($null -eq $c) { Write-Host 'palette overlap: cannot run -- the negative control did not render'; exit 2 }
     & pwsh -NoProfile -File $diff -A $a -B (Join-Path $OutDir 'ctl32.mkv') `
         -Labels 'colors-16','colors-32' -Frames $Frames | Out-Null
