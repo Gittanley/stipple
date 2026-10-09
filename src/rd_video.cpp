@@ -1680,8 +1680,12 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // there and a meaningless one here: the reason to sample widely is that 30 points
   // can all land in the dull parts of a 3-hour clip, and the fix is coverage, which
   // grows with the clip's length.  A count cannot express that; a time budget can, and
-  // it also degrades gracefully -- a slow disk takes fewer samples instead of taking
-  // the same time it always took.
+  // A count cannot express coverage either. The budget does two separate things, and
+  // they were confused here until 2026-10-09: the arithmetic above picks a COUNT from an
+  // assumed 0.12 s per sample, which is a coverage decision; the DEADLINE below actually
+  // stops the stage, which is the time bound. Before the deadline existed the flag did
+  // only the first, so on a slow machine it took the same number of samples for LONGER
+  // -- which is the exact opposite of the "degrades gracefully" claim this replaced.
   if (want_all) {
     const double budget_s = opt.palette_budget_ms > 0 ? opt.palette_budget_ms / 1000.0 : 60.0;
     // Measured, and deliberately pessimistic: 0.12 s per sample at six workers.  The
@@ -1708,6 +1712,24 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
                  static_cast<long long>(want), static_cast<long long>(info.frames),
                  budget_s);
   }
+
+
+  // The DEADLINE, which is what the flag's name and help text actually promise.
+  // The arithmetic above picks a SAMPLE COUNT and then, before this existed, nothing
+  // bounded the stage's wall time at all: the count was chosen up front and the run
+  // then took as long as it took. On a loaded machine that overran the budget, which is
+  // the opposite of what the comment above this block claimed.
+  //
+  // RD_PALETTE_DEADLINE_MS overrides the deadline WITHOUT touching the count, and that
+  // is the only reason the deadline is testable: `--palette-budget-ms 1` collapses the
+  // arithmetic to one sample and so cannot distinguish 'count reduced' from 'deadline
+  // fired'. Naming follows RD_PALETTE_OVERLAP / RD_PALETTE_SEEK / RD_TRACE.
+  const char* dl_env = std::getenv("RD_PALETTE_DEADLINE_MS");
+  const double deadline_s =
+      (dl_env != nullptr && dl_env[0] != '\0')
+          ? std::atof(dl_env) / 1000.0
+          : (opt.palette_budget_ms > 0 ? opt.palette_budget_ms / 1000.0 : 60.0);
+  std::atomic<bool> deadline_hit{false};
 
   if (sample_by_seek) {
     if (std::getenv("RD_TRACE") != nullptr) {
@@ -1931,6 +1953,19 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
         for (;;) {
           const int s = next_sample.fetch_add(1);
           if (s >= want) return;
+      // Deadline: a worker that has already started a seek finishes it, because the
+      // time is spent either way; only NEW samples are refused. The cells it would
+      // have filled are padded from the last real sample further down, so refusing is
+      // safe and costs palette coverage rather than producing black cells.
+      // Only once at least one sample has LANDED. seeks_done is incremented after `placed[s] = 1`,
+      // so it counts successful placements, not attempts. Without the guard a
+      // 1 ms deadline refuses every seek before any cell is filled, `sampled`
+      //  stays 0, and the "ffmpeg produced no frames" guard below turns a
+      //  working deadline into a FAILED render. Found by probe-palette-deadline.ps1.
+      if (seeks_done.load() > 0 && NowMs() - p0 > deadline_s * 1000.0) {
+        deadline_hit.store(true);
+        return;
+      }
           const long long idx = static_cast<long long>(s) * sample_step;
           const double when =
               info.fps > 0.0
@@ -1991,6 +2026,13 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   }
 
   for (; !sample_by_seek && sampled < want; ++sampled) {
+    // `sampled > 0` for the same reason as the by-seek arm: a deadline that fires
+    // before the first sample leaves `sampled` at 0 and the guard below
+    // reports a hard failure rather than a short palette.
+    if (sampled > 0 && NowMs() - t0 > deadline_s * 1000.0) {
+      deadline_hit.store(true);
+      break;
+    }
     const double d0 = NowMs();
     std::size_t got = 0;
     if (palette_8bit) {
@@ -2087,6 +2129,13 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
       return false;
     }
   }
+  if (deadline_hit.load()) {
+    std::fprintf(stderr,
+                 "[video] palette: deadline of %.0f ms reached; %d of %lld samples "
+                 "placed\n",
+                 deadline_s * 1000.0, sampled, static_cast<long long>(want));
+  }
+
   const double total = NowMs() - t0;
   if (result != nullptr) {
     result->palette_sampled = sampled;

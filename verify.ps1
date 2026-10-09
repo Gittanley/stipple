@@ -453,6 +453,26 @@ if (Test-Path $sd) {
   }
 }
 
+# And a tenth: does --palette-budget-ms actually bound the palette stage?  It did not until
+# 2026-10-09 -- it computed a sample count from a hardcoded 0.12 s per sample and had no
+# deadline at all, so it bounded nothing while its help text promised a time budget.  A flag
+# that quietly does nothing is the same failure shape as a probe that quietly passes.
+#
+# Both samplers are covered.  The by-seek arm needs a clip over 5000 frames (rd_video.cpp:1663)
+# and RD_PALETTE_SEEK can only disable that path, never force it, so the probe builds a 5100
+# frame clip at 320x180 -- a few MB, seconds to make -- rather than a 1080p clip long enough to
+# reach the path honestly.
+$pd = Join-Path $PSScriptRoot 'tools\probe-palette-deadline.ps1'
+if (Test-Path $pd) {
+  Write-Host ""
+  & pwsh -NoProfile -File $pd -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "palette deadline: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "palette deadline: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
 # And a fifth: the image determinism probe again, pointed at VIDEO.  The image one
 # is a self-comparison across time rather than an engine-against-engine comparison,
 # which is the only shape of check that sees a fault both engines share -- and two

@@ -365,3 +365,66 @@ is exactly what does not happen here. Section 6 of that spec listed CPU contenti
   saturates.
 - The reader-fails-while-palette-builds path, and the interrupt-during-palette-window path, are
   implemented but not exercised by any probe.
+
+---
+
+## 5. `--palette-budget-ms` bounded nothing until 2026-10-09, and the fix makes output load-dependent
+
+**Status:** fixed. The flag now bounds the stage. The price is that a *lowered* budget makes
+output a function of machine speed, which is recorded here rather than left implicit.
+
+### What it did
+
+`rd_video.cpp:1690` computed a sample COUNT from a hardcoded per-sample cost:
+
+```cpp
+const int affordable = static_cast<int>((budget_s - 0.02) / 0.12);
+```
+
+No clock was ever read. `budget_s` was never compared against elapsed time anywhere in the
+sampling path, so there was no deadline: the count was chosen up front and the stage then ran
+for as long as it took. Meanwhile `rd_cli.cpp:125` documented it as "time budget for that
+sampling" and README.md:582 as "as many as a 60-second budget allows".
+
+Two things were wrong with the surrounding comment, and the first is the interesting one. It
+claimed the budget "degrades gracefully -- a slow disk takes fewer samples instead of taking
+the same time it always took." That is backwards: a slow disk took the SAME number of samples
+for LONGER. The flag had a coverage effect and no time effect, and the comment attributed the
+time effect to it.
+
+It was also **inert at the default**. `affordable = (60 - 0.02) / 0.12 = 500`, a 600-frame clip
+offers 600, and `--palette-max-samples` caps at 256, so 256 wins and the budget never binds.
+It only takes effect below about 30.7 s.
+
+### What it does now
+
+A real deadline, checked in both samplers, never allowed to take the sample count below one,
+and reported on stderr when it fires. `RD_PALETTE_DEADLINE_MS` overrides the deadline without
+touching the count, which is what makes it testable at all: `--palette-budget-ms 1` collapses
+the arithmetic to one sample and so cannot distinguish "the count was reduced" from "the
+deadline fired".
+
+Truncation is safe to do because the montage is padded rather than left short --
+`rd_video.cpp:2045-2064` repeats the last sampled tile into every unfilled cell, precisely
+because "Black is a real colour to the octree, so those cells spend palette entries on nothing."
+
+### The cost, stated plainly
+
+**A real deadline is load-dependent output.** Fewer samples means a different montage, so a
+different palette, so different pixels. On this machine, which is rarely quiet, a lowered
+budget therefore stops being reproducible.
+
+This is bounded: at the default the flag is still inert, `--palette-max-samples` binds first,
+and the default path's output is unchanged. It bites only when the budget is deliberately
+lowered below ~30.7 s. The alternative -- leaving the flag lying -- was rejected because a
+flag that bounds nothing is not a smaller problem than a flag that bounds time; it is a
+problem nobody can see.
+
+### Not tested
+
+- Behaviour when the deadline lands mid-montage on a clip where the by-seek workers finish out
+  of order. `sampled` counts LEADING filled cells, so a gap truncates at the gap rather than
+  at the deadline; that is the pre-existing rule and the probe exercises only the common case
+  where every seek succeeds.
+- Whether 0.12 s per sample is still the right constant. It is unmeasured and it is the
+  load-dependent part of the count.
