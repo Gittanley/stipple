@@ -497,9 +497,26 @@ if (-not $magick) {
           $pct = $null
           if ($tok.Count -ge 2 -and $tok[1] -match '^\(([0-9.]+)\)$') {
             $pct = 100.0 * [double]$Matches[1]
-          } elseif ($tok.Count -ge 2) {
+          } elseif ($tok.Count -ge 2 -and $tok[0] -match '^[0-9]+(\.[0-9]+)?$') {
+            # The first token must be a NUMBER before it is divided.  It did not have to
+            # be, and that made this stage unfailable.
+            #
+            # `magick compare` writes its error to stderr, so a missing or unreadable
+            # image yields text rather than a metric:
+            #
+            #     compare: unable to open image 'x.png' null:
+            #
+            # Stripping the non-numerics from that leaves "", `[double]''` is 0, and 0 is
+            # under any ceiling, so a BROKEN COMPARISON REPORTED A PASS.  Measured, and it
+            # is the worst possible failure for the one stage in this suite that has an
+            # external reference: breaking the tool that does the measuring turned the
+            # check green.
+            #
+            # The sibling branch above, added for the same reason, already fails closed --
+            # this one did not, and the author of this line was also the author of that
+            # one.
             $den = $srcW * $srcH
-            if ($den -gt 0) { $pct = 100.0 * [double]($tok[0] -replace '[^0-9.]','') / $den }
+            if ($den -gt 0) { $pct = 100.0 * [double]$tok[0] / $den }
           }
           if ($null -eq $pct) {
             "    FAIL  could not read the comparison metric ('$aeText')"

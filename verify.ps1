@@ -187,6 +187,29 @@ function Skip-Stage([string]$Name, [string]$Why) {
   Write-Host ""
   Write-Host "$Name : SKIPPED ($Why)" -ForegroundColor Yellow
 }
+# A probe that exited 2 -- "cannot run" -- did NOT RUN.  It has to be recorded as a gap, or
+# the coverage line counts it as a stage that ran.
+#
+# THIS FUNCTION EXISTS BECAUSE NONE OF THE ELEVEN EXIT-2 HANDLERS DID THAT.  Each one was
+#
+#     2 { Write-Host "<name>: SKIPPED (cannot run ...)" -ForegroundColor Yellow }
+#
+# which prints a line that LOOKS like a recorded skip and touches neither $stagesSkipped nor
+# $stagesOffByDefault.  Measured by replaying the handler with $LASTEXITCODE = 2:
+#
+#     palette deadline: SKIPPED (cannot run -- the probe printed the reason above)
+#     stagesSkipped.Count = 0
+#     coverage: every stage ran.  0 skipped.
+#     EXIT 0
+#
+# So a probe that never executed was reported as one that executed, on the first runner
+# missing ffmpeg, a fixture, or an engine -- and the suite exited 0.  That is the precise
+# failure verify.ps1:30-33 says this suite exists to prevent, sitting in the suite.
+#
+# A skip that only prints is a comment.
+function Skip-CannotRun([string]$Name) {
+  Skip-Stage $Name 'the probe exited 2 (cannot run) -- it printed the reason above'
+}
 # The same, but recorded as a DELIBERATE exclusion rather than a gap.
 function Skip-ByDefault([string]$Name, [string]$Why) {
   $stagesSkipped.Add("$Name ($Why)")
@@ -401,7 +424,7 @@ if (Test-Path $det) {
   & pwsh -NoProfile -File $det @detArgs
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "determinism: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "determinism" }
     default { Write-Host "determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -482,7 +505,7 @@ if ($Fast) {
     # prints which one above.  Naming the clip here regardless meant that once the
     # probe learned to skip an engine for want of a device, this line went on
     # reporting a missing file that was present, pointing at the wrong thing.
-    2 { Write-Host "video: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "video" }
     default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -500,7 +523,7 @@ if (Test-Path $unv) {
   & pwsh -NoProfile -File $unv -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "unvisited pixel: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "unvisited pixel" }
     default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -538,7 +561,7 @@ if (Test-Path $ag) {
   & pwsh -NoProfile -File $ag -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "alpha guard: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "alpha guard" }
     default { Write-Host "alpha guard: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -566,7 +589,7 @@ if ($Slow) {
     & pwsh -NoProfile -File $ov -Rdither $Rdither
     switch ($LASTEXITCODE) {
       0 { }
-      2 { Write-Host "palette overlap: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+      2 { Skip-CannotRun "palette overlap" }
       default { Write-Host "palette overlap: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
     }
   }
@@ -591,7 +614,7 @@ if (Test-Path $sd) {
   & pwsh -NoProfile -File $sd
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "split decode: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "split decode" }
     default { Write-Host "split decode: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -611,7 +634,7 @@ if (Test-Path $pd) {
   & pwsh -NoProfile -File $pd -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "palette deadline: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "palette deadline" }
     default { Write-Host "palette deadline: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -634,7 +657,7 @@ if (Test-Path $ho) {
   & pwsh -NoProfile -File $ho -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "host oracle: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "host oracle" }
     default { Write-Host "host oracle: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -657,7 +680,7 @@ if ($Fast) {
   & pwsh -NoProfile -File $vdet @vdetArgs
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "video determinism: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "video determinism" }
     default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -677,7 +700,7 @@ if (Test-Path $vinv) {
   & pwsh -NoProfile -File $vinv @vinvArgs
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "video invariance: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "video invariance" }
     default { Write-Host "video invariance: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
@@ -700,7 +723,7 @@ if (Test-Path $vinv) {
   & pwsh -NoProfile -File $cinv -Rdither $Rdither
   switch ($LASTEXITCODE) {
     0 { }
-    2 { Write-Host "cache invalidation: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    2 { Skip-CannotRun "cache invalidation" }
     default { Write-Host "cache invalidation: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
   }
