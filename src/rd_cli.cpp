@@ -125,8 +125,10 @@ void PrintUsage() {
       "  --palette-budget-ms MS  time budget for that sampling (default 60000).\n"
       "                         Measured 0.12 s per sample, 6 at a time, so a\n"
       "                         slow disk takes fewer samples rather than more\n"
-      "                         time.  The reported mean saturation is the thing\n"
-      "                         to check, not the sample count.\n"
+      "                         time.  Look at the printed swatches to judge the\n"
+      "                         palette, not the sample count and not the mean\n"
+      "                         saturation: both report confidently on a montage\n"
+      "                         that was never read correctly.\n"
       "  --palette-tile N       lattice-sample tile edge per frame (default 128)\n"
       "  --palette-mode M       montage (default) or pool (measured worse)\n"
       "  --palette-only         build and report the palette, then stop\n"
@@ -559,6 +561,31 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     result.palette_mosaic_h = 0;
     result.palette_neutral =
         rd::CountNeutralPaletteEntries(*palette, 0.2);
+    // PUBLISH, or this branch deadlocks.
+    //
+    // Every other arm of this if/else chain ends in `gate.Publish` (rd_cli.cpp:589 for
+    // the overlap thread, :596 for the ordinary serial build), because VideoProcess calls
+    // `gate.Wait()` (rd_video.cpp:3819) before it dithers anything and Publish/Fail are
+    // the only things that release that wait. This branch -- the `--palette-from` /
+    // `--palette-import` arm -- adopted a perfectly good palette, printed it, and then fell
+    // out of the chain without publishing, so the gate was never released and the run
+    // blocked forever:
+    //
+    //     rdither --video --engine cpu --colors 14 --palette-import p.txt in.mkv out.mkv
+    //     palette : 14 colours adopted from p.txt, mean saturation 83.0%, 2 near-neutral
+    //     [video] 320x180  batch=16  queue=3 ...
+    //     <nothing, ever>
+    //
+    // Reproduced: still running after 90 s on a 30-frame 320x180 clip, 1725 s of CPU
+    // burned, no output file. Two were left running and had to be killed by hand.
+    //
+    // The specific cruelty is that it PRINTS the adopted palette first. The user is told
+    // the flag worked, the numbers look right, and then the program wedges -- so the
+    // evidence points at the flag rather than at the flag's plumbing.
+    //
+    // The image path never hit this because it never constructs a gate: RunImage dithers
+    // directly and the gate exists only for VideoProcess.
+    gate.Publish(std::move(*palette), std::move(*tree));
     std::printf("palette    : %d colours adopted from %s, mean saturation %.1f%%, "
                 "%d near-neutral\n",
                 palette->count, opt.palette_from.c_str(),
@@ -602,10 +629,25 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       std::printf("palette    : built concurrently with the reader (RD_PALETTE_OVERLAP)\n");
     }
       const std::size_t tile = static_cast<std::size_t>(result.palette_tile);
-      // Mean saturation is reported because sampling many scenes into one montage
-      // dilutes the palette: the octree's centroids must then span the whole gamut
-      // and land on desaturated mid-tones, which reads as "dull and grey".  Making
-      // that a number is the only way to tune it.
+      // Mean saturation is KEPT, but it is no longer the thing to look at, and --help
+      // no longer says it is.
+      //
+      // It was the only signal, because there was nothing else: sampling many scenes
+      // into one montage does dilute the palette toward desaturated mid-tones, and a
+      // number was the only handle on it.  But a mean has no baseline -- 49.0% is fine
+      // for a forest and terrible for a face -- and worse, it reported confidently on
+      // garbage.  It read "mean saturation 49.0%" on a montage every cell of which was
+      // an RGBA byte stream misread as RGB (rd_video.cpp, the by-seek arm's `-pix_fmt`
+      // disagreeing with its buffer's channel count), and the real palette that
+      // produced those cells was 7 of 16 entries PURE GREEN.  A summary statistic with
+      // no baseline cannot tell you your input was corrupt, which is exactly the
+      // failure it was relied on to catch.
+      //
+      // So the swatches are printed too, as 8-bit hex in the same order and format
+      // `--palette-export FILE.txt` writes -- so this line can be diffed against that
+      // file directly, and so 16 colours can be judged in one glance without a
+      // reference value.  The saturation figure stays because it is the only handle on
+      // the DILUTION effect specifically, which the swatches show but do not measure.
       if (!opt.palette_from.empty()) {
         // Already reported above, from the adopted colormap.
       } else if (result.palette_mosaic_w > 0) {
@@ -632,6 +674,26 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       for (int i = 0; i < palette->count && i < opt.dump_palette_limit; ++i) {
         const rd::PaletteEntry& e = palette->entries[i];
         std::printf("  %2d: %9.1f %9.1f %9.1f\n", i, e.r, e.g, e.b);
+      }
+
+      // The swatches, always (unlike the Q16 dump above, which is behind
+      // --dump-palette-limit) and 8 per line so a 16-colour palette is two lines.
+      //
+      // Deliberately the SAME hex, in the SAME order, as the `hex` column of
+      // --palette-export FILE.txt, so this and that file can be diffed or eyeballed
+      // against each other without a conversion step.  Rounded the same way too --
+      // e.r / 257.0 + 0.5 -- rather than invented here, so two runs that disagree
+      // disagree about the palette and not about the printing.
+      for (int i = 0; i < palette->count; i += 8) {
+        std::printf("swatches   :");
+        for (int k = i; k < palette->count && k < i + 8; ++k) {
+          const rd::PaletteEntry& e = palette->entries[k];
+          std::printf(" %02X%02X%02X",
+                      static_cast<unsigned>(e.r / 257.0 + 0.5),
+                      static_cast<unsigned>(e.g / 257.0 + 0.5),
+                      static_cast<unsigned>(e.b / 257.0 + 0.5));
+        }
+        std::printf("\n");
       }
 
       if (!opt.palette_export.empty()) {

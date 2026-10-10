@@ -1180,6 +1180,62 @@ bool VideoProbe(const std::string& path, VideoInfo* out, std::string* error) {
     *error = "could not read video dimensions from " + path;
     return false;
   }
+  // `nb_frames` is a DECLARED count, and a container is under no obligation to declare it.
+  // mp4/h264 do; mkv/ffv1 do not, and ffprobe prints `N/A` for them.  `std::atoll("N/A")`
+  // is 0 -- not an error, not a flag, just 0 -- so the declared field silently became "this
+  // clip has no frames", and every downstream clamp treated that as authoritative.
+  //
+  // The consequence was measured on this repository's own fixture, tests\clip1920_audio.mkv
+  // (an mkv, which is the shape the project uses for its own clips):
+  //
+  //     ffprobe nb_frames        N/A      <- what was read
+  //     ffprobe -count_frames    60       <- reality
+  //     rdither prints           1920x1080, h264, yuv420p, 0 frames
+  //     [video] palette: sampling 1 frame(s) of 0
+  //     palette: 16 colours from 1 sampled frame(s)
+  //
+  // One frame, one palette, exit 0. `want` clamps to its floor of 1 and the montage is a
+  // single cell. See docs\KNOWN-ISSUES.md item 2.
+  //
+  // So when the declared count is absent, COUNT it. `-count_frames` decodes the stream, so
+  // this is not free -- it is a second pass over the file -- and it is paid exactly once,
+  // only when the cheap answer was unavailable. That ordering is the whole design: trust
+  // the declared count when there is one, and only spend a decode when there is not.
+  //
+  // Cached in `out->frames`, so every caller sees one number and the cost is never paid
+  // twice. A source that declares 0 frames AND cannot be counted keeps 0, which is the
+  // pre-existing behaviour rather than a new failure.
+  if (out->frames <= 0) {
+    const std::string cargs =
+        "-v error -select_streams v:0 -count_frames "
+        "-show_entries stream=nb_read_frames -of default=nw=1:nk=1 " + Quote(path);
+    Child counter;
+    if (counter.Start(ffprobe, cargs, /*capture_stdout=*/true,
+                      /*feed_stdin=*/false, error, "probe-count")) {
+      std::string ctext;
+      char cbuf[256];
+      for (;;) {
+        const std::size_t got = counter.Read(cbuf, sizeof(cbuf));
+        if (got == 0) break;
+        ctext.append(cbuf, got);
+      }
+      if (counter.Wait() == 0) {
+        const long long counted = std::atoll(ctext.c_str());
+        if (counted > 0) {
+          out->frames = counted;
+          if (getenv("RD_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[video] container declared no frame count; counted %lld\n",
+                         counted);
+          }
+        }
+      }
+    }
+    // Deliberately does NOT fail the probe if the count cannot be obtained. A caller that
+    // wants the frame count for the PALETTE has a correct-but-degraded answer without it
+    // (one sample), and turning a cosmetic gap into a hard error would refuse renders that
+    // are otherwise fine. The value is a hint, and 0 stays the documented "unknown".
+  }
   if (out->fps <= 0.0) out->fps = 25.0;
   return true;
 }
@@ -1621,12 +1677,30 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // quantize.c's `alpha_trait != Undefined -> depth--` does not shift the tree.
   const bool palette_8bit = opt.palette_depth != 16;
   const int pal_ch = (palette_8bit && !SourcePixFmtHasAlpha(info.pix_fmt)) ? 3 : 4;
+  // ONE format string for BOTH samplers.  The buffer a sample is read into is sized
+  // `pixels * pal_ch` on both paths (rd_video.cpp:1819 for the sequential read, and one
+  // per worker at the by-seek arm), so the `-pix_fmt` handed to ffmpeg and `pal_ch` are
+  // the same fact stated twice, and a run that disagrees between them reads a truncated
+  // stream as if it were whole: `Child::Read` returns exactly the bytes asked for, the
+  // `full` guard passes because the pipe still has data, and every sample is three wrong
+  // bytes.
+  //
+  // That is not hypothetical.  The by-seek arm asked for `rgba` while its buffer was
+  // `pixels * 3`, so on any clip long enough to take that path (info.frames > 5000) every
+  // montage cell was an RGBA byte stream read as RGB triples -- and the quantiser built a
+  // green-grey palette from it, 7 of 16 entries pure green, reporting "mean saturation
+  // 49.0%" the whole time.  Verified bit-exact: replaying the truncated read in isolation
+  // reproduced the dumped montage cell with `np.array_equal` True.
+  //
+  // It reached a render because nothing in the gate exercises the by-seek arm at all (the
+  // 165 bit-exact cases are short clips, and `RD_PALETTE_SEEK` can only DISABLE the path,
+  // never force it).  tools/probe-palette-deadline.ps1's 5100-frame fixture can.
+  const char* const pal_fmt =
+      palette_8bit ? (pal_ch == 3 ? "rgb24" : "rgba") : "rgba64le";
   const std::string args = "-v error" + std::string(fps.input) + " -i " + Quote(path) +
                            " -vf " + filter + fps.output +
                            " -frames:v " + std::to_string(want) + " -f rawvideo" +
-                           (palette_8bit ? (pal_ch == 3 ? " -pix_fmt rgb24"
-                                                          : " -pix_fmt rgba")
-                                           : " -pix_fmt rgba64le") +
+                           " -pix_fmt " + pal_fmt +
                            " -";
   Child child;
   if (std::getenv("RD_TRACE") != nullptr) {
@@ -1725,11 +1799,39 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   // arithmetic to one sample and so cannot distinguish 'count reduced' from 'deadline
   // fired'. Naming follows RD_PALETTE_OVERLAP / RD_PALETTE_SEEK / RD_TRACE.
   const char* dl_env = std::getenv("RD_PALETTE_DEADLINE_MS");
+  // Progressive sample order. The by-seek workers take samples by ATTEMPT number, and
+  // that number is mapped through a bit-reversal before it becomes a sample index.
+  //
+  // Why: a deadline truncates by ATTEMPT, and if attempt n mapped to index n then any
+  // truncated prefix would be the head of the clip -- the exact coverage loss this path
+  // exists to avoid. Bit-reversal is the standard fix: the first k of the reversed order
+  // are already a stratified subset of the whole range, so stopping early keeps a
+  // SMALL SPREAD ACROSS THE ENTIRE CLIP rather than the first k/256 of it. It costs no
+  // extra fetches, which a post-hoc re-spread would, and that matters precisely because
+  // the situation it fixes is running out of time.
+  //
+  // Indices that bit-reversal maps at or past `want` are skipped and the attempt retried,
+  // so the count stays exact for a `want` that is not a power of two.
+  int dl_order_bits = 1;
+  while ((1LL << dl_order_bits) < static_cast<long long>(want)) ++dl_order_bits;
+  const auto progressive_index = [&](int attempt) {
+    int r = 0;
+    for (int b = 0; b < dl_order_bits; ++b) {
+      r |= ((attempt >> b) & 1) << (dl_order_bits - 1 - b);
+    }
+    return r;
+  };
+
   const double deadline_s =
       (dl_env != nullptr && dl_env[0] != '\0')
           ? std::atof(dl_env) / 1000.0
           : (opt.palette_budget_ms > 0 ? opt.palette_budget_ms / 1000.0 : 60.0);
   std::atomic<bool> deadline_hit{false};
+  // Highest SOURCE frame the sampler actually reached, so a deadline run can report its
+  // coverage rather than just its count. With the progressive order this should land near
+  // the end of the clip even when few samples were placed; with the old index order it
+  // landed proportionally short, which is what probe-palette-deadline.ps1 now asserts on.
+  std::atomic<long long> max_src_frame{-1};
 
   if (sample_by_seek) {
     if (std::getenv("RD_TRACE") != nullptr) {
@@ -1951,8 +2053,11 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
         std::vector<std::uint16_t> l16;
         if (!palette_8bit) l16.resize(static_cast<std::size_t>(pixels) * pal_ch);
         for (;;) {
-          const int s = next_sample.fetch_add(1);
-          if (s >= want) return;
+      const int attempt = next_sample.fetch_add(1);
+      if (attempt >= want) return;
+      // Bit-reversed, skipping the out-of-range half of the padded range.
+      const int s = progressive_index(attempt);
+      if (s >= want) continue;
       // Deadline: a worker that has already started a seek finishes it, because the
       // time is spent either way; only NEW samples are refused. The cells it would
       // have filled are padded from the last real sample further down, so refusing is
@@ -1975,8 +2080,7 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
           std::snprintf(sargs, sizeof(sargs),
                         "-v error -ss %.6f -i %s -fps_mode passthrough -frames:v 1 "
                         "-f rawvideo -pix_fmt %s -",
-                        when, Quote(path).c_str(),
-                        palette_8bit ? "rgba" : "rgba64le");
+                        when, Quote(path).c_str(), pal_fmt);
           Child one;
           std::string serr;
           if (!one.Start(ffmpeg, sargs, true, false, &serr, "palette-seek")) continue;
@@ -1992,6 +2096,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
           place_raw(s, palette_8bit ? l8.data() : nullptr,
                     palette_8bit ? nullptr : l16.data());
           placed[static_cast<std::size_t>(s)] = 1;
+      { long long prev = max_src_frame.load();
+        while (idx > prev &&
+               !max_src_frame.compare_exchange_weak(prev, idx)) {} }
           // Progress from whichever worker happens to finish, which is the
           // point: with six concurrent seeks the completions arrive out of
           // order, and a bar driven by the sample *index* would jump around.
@@ -2074,6 +2181,11 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
               palette_8bit ? nullptr : raw16.data());
   }
   child.Close();
+  // Land the bar on what was actually placed when a deadline cut the loop short. Without
+  // this a truncated run ended the bar at, say, 78% and looked interrupted rather than
+  // finished. The by-seek arm already did this at its own progress.Update.
+  progress.Update(sampled);
+
   if (sampled == 0) {
     *error = "ffmpeg produced no frames for the palette sample";
     return false;
@@ -2132,8 +2244,9 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
   if (deadline_hit.load()) {
     std::fprintf(stderr,
                  "[video] palette: deadline of %.0f ms reached; %d of %lld samples "
-                 "placed\n",
-                 deadline_s * 1000.0, sampled, static_cast<long long>(want));
+                 "placed, source frames up to %lld of %lld\n",
+                 deadline_s * 1000.0, sampled, static_cast<long long>(want),
+                 max_src_frame.load(), static_cast<long long>(info.frames));
   }
 
   const double total = NowMs() - t0;

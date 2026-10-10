@@ -27,7 +27,64 @@ param(
   # partial run for a green one.  Nothing in the pipeline reads this automatically yet --
   # CI runs the full sweep -- so the flag costs an inner-loop user one extra switch, and
   # buys a distinction that used to exist only as prose at the bottom of the log.
-  [switch]$AllowPartial
+  [switch]$AllowPartial,
+  # HARD CEILING on the whole run, in minutes. Zero = no ceiling.
+  #
+  # WHY THIS EXISTS. verify.ps1 crashed the owner's machine on 2026-10-05. The suite is not
+  # unbounded -- every stage is a finite script with its own fixtures -- but nothing in it
+  # bounded the TOTAL, so a stage that regressed from seconds into minutes, or a fixture
+  # generator that started rendering 1080p instead of 320x180, would have run for as long as
+  # it liked with no complaint. A gate that can take the machine down is not a gate you can
+  # be asked to run.
+  #
+  # It is enforced by a WATCHDOG rather than by estimates: a timer thread checks elapsed
+  # time every 15 s and, on expiry, prints which stages have completed and kills the run
+  # with exit 3. Estimates were rejected deliberately -- they are exactly the kind of claim
+  # that is right until the machine is busy, and this machine is never quiet.
+  #
+  # 3 is a new code, distinct from 0 (pass), 1 (fail) and 2 (not covered): the suite did not
+  # finish, so it neither passed nor failed and must not be read as either.
+  [int]$BudgetMinutes = 25,
+  # Run the stages that are off by default because of what they COST.
+  #
+  # Currently one: `palette overlap`, measured at 295.1 s, which gates RD_PALETTE_OVERLAP --
+  # a flag that ships OFF because it measured SLOWER (docs\KNOWN-ISSUES.md item 4). 15% of a
+  # 20-minute run for an opt-in feature's correctness is the wrong place to spend it, so it
+  # moved here. It is not deleted: a real check stays available, and -Slow is how you run it.
+  #
+  # THIS PARAMETER WAS MISSING WHEN THE MOVE FIRST SHIPPED. The gate said
+  #     Skipped 'palette overlap' (off by default: ... Run verify.ps1 -Slow.)
+  # and there was no `-Slow` to run -- `$Slow` was undefined, so the stage could not be
+  # reached at all. `pwsh -File verify.ps1 -Slow` exited 2 with the identical skip message,
+  # which is the worst possible combination: it named a remedy that did not exist, and a
+  # reader checking the log would reasonably believe the stage had been run.
+  #
+  # That is the same shape as the bug this whole gate exists to catch -- a check that reports
+  # without doing anything -- in the gate itself rather than in the code under test. Found by
+  # running `-Slow` and reading the output, which is the only reason it was found at all.
+  [switch]$Slow,
+  # Threads the stages are allowed to use. The 2026-10-05 crash happened with every core
+  # pinned by x264 plus the host dither pool. Leaving 1-2 cores free keeps the machine
+  # responsive for whatever else the owner is doing, which on this box is usually something.
+  # 0 = do not set it.
+  #
+  # MEASURED, and the answer is that it does not work, so this stays a no-op by choice
+  # rather than by oversight.  On the cpu case of probe-video-determinism (the slowest
+  # single render in the suite, `--engine blocks --no-gpu`, 60 frames of 1080p):
+  #
+  #     no thread flags                 14.33 s
+  #     --cpu-threads 6                14.43 s
+  #     --cpu-threads 12               15.37 s
+  #     --reader-threads 12            15.12 s
+  #     --reader-threads 12 --cpu-threads 12   16.29 s
+  #
+  # Capping made it SLOWER, monotonically, and the default already leaves cores alone.  So
+  # rather than thread four flags through eleven probe scripts to buy nothing, the knob is
+  # accepted as 0 and the real protection is -BudgetMinutes, which is enforced by a watchdog
+  # rather than hoped for.  Kept as a parameter because deleting it would break any existing
+  # invocation that passes it; it is documented here as measured-and-inert rather than
+  # quietly left looking load-bearing.
+  [int]$LeaveCores = 0
 )
 
 # Per-stage wall clock, printed at the end.  A slow run used to be reported only as a
@@ -48,6 +105,36 @@ function Stage([string]$Name, [scriptblock]$Body) {
 # to 77s against a 145s wall clock, which is the kind of unattributed remainder that
 # makes a timing report worse than none: it looks like the answer.
 $swTotal = [Diagnostics.Stopwatch]::StartNew()
+
+# ---- the watchdog -------------------------------------------------------------
+#
+# A timer, not an estimate. It watches the CLOCK and kills the run, so it stays correct on a
+# busy machine, which is the only kind of machine this runs on.
+$budgetHit = $false
+if ($BudgetMinutes -gt 0) {
+  $budgetMs = $BudgetMinutes * 60.0 * 1000.0
+  $watch = [System.Timers.Timer]::new(15000)
+  $watch.AutoReset = $true
+  $watch.add_Elapsed({
+    if ($swTotal.Elapsed.TotalMilliseconds -gt $budgetMs -and -not $budgetHit) {
+      $script:budgetHit = $true
+      Write-Host ""
+      Write-Host "BUDGET EXCEEDED: this run has taken longer than $BudgetMinutes minute(s)." -ForegroundColor Red
+      Write-Host "Stages completed so far, in order:" -ForegroundColor Red
+      foreach ($s in $stageTimes) {
+        Write-Host ("  {0,-28} {1,7:N1}s" -f $s.Name, ($s.Ms / 1000)) -ForegroundColor Red
+      }
+      Write-Host "Killing the run. Exit 3: neither a pass nor a failure -- it did not finish." -ForegroundColor Red
+      # The timer fires on a threadpool thread, so it cannot simply 'return' out of the
+      # script. Stop-Process on the parent is what actually ends it; the pending native
+      # children die with the pipeline.
+      $env:RD_BUDGET_KILLED = '1'
+      Stop-Process -Id $PID -Force
+    }
+  })
+  $watch.Start()
+  Write-Host "budget: $BudgetMinutes min ceiling, checked every 15 s (a stage that regresses cannot run forever)."
+}
 
 # Stages this run did not execute, named.  -Fast used to skip two 1080p video stages,
 # print two yellow sentences about it, and then exit 0 -- so an automated caller reading
@@ -420,15 +507,24 @@ if (Test-Path $ag) {
 # shape exists to catch.
 #
 # Not in -Fast: it renders 4 x 300 frames of 1080p plus a negative control.
+#
+# MEASURED 295.1 s -- 15% of a 20-minute run for a flag that is OFF BY DEFAULT and that
+# measured SLOWER (docs\KNOWN-ISSUES.md item 4).  It is a real check and it stays, but it
+# moves behind -Slow: an opt-in feature's correctness gate does not belong on the path
+# everyone runs, and 295 s is the difference between a gate you run and one you avoid.
 $ov = Join-Path $PSScriptRoot 'tools\probe-palette-overlap.ps1'
-if (Test-Path $ov) {
-  Write-Host ""
-  & pwsh -NoProfile -File $ov -Rdither $Rdither
-  switch ($LASTEXITCODE) {
-    0 { }
-    2 { Write-Host "palette overlap: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
-    default { Write-Host "palette overlap: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+if ($Slow) {
+  if (Test-Path $ov) {
+    Write-Host ""
+    & pwsh -NoProfile -File $ov -Rdither $Rdither
+    switch ($LASTEXITCODE) {
+      0 { }
+      2 { Write-Host "palette overlap: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+      default { Write-Host "palette overlap: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+    }
   }
+} else {
+  Skip-Stage 'palette overlap' 'off by default: 295 s, and it gates a flag that ships OFF (KNOWN-ISSUES 4).  Run verify.ps1 -Slow.'
 }
 
 # And a ninth: whether splitting the decode across N seek-based ffmpeg processes is
@@ -470,6 +566,29 @@ if (Test-Path $pd) {
     0 { }
     2 { Write-Host "palette deadline: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
     default { Write-Host "palette deadline: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
+# And an eleventh: is the HOST path bit-identical to the DEVICE path?
+#
+# Every other comparison in this suite puts two implementations of the SAME kind against
+# each other -- cpu vs cuda, engine vs engine, run vs run. This one puts host against
+# device, which is the only shape that answers "is the CPU path right", and both
+# properties it checks have been real defects at least once: host(batch 1) vs device, and
+# host invariant to batch size.
+#
+# It was ungated, which is how a whole class of host fault could sit here unexamined while
+# the suite reported green. It is also CHEAP -- 320x180 fixtures, a bounded 900 s timeout,
+# and its exit codes are actually tested (its predecessor had no exit statement at all and
+# returned whatever the last ffmpeg happened to leave behind, so it exited 0 having failed).
+$ho = Join-Path $PSScriptRoot 'tools\probe-host-oracle.ps1'
+if (Test-Path $ho) {
+  Write-Host ""
+  & pwsh -NoProfile -File $ho -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Write-Host "host oracle: SKIPPED (cannot run -- the probe printed the reason above)" -ForegroundColor Yellow }
+    default { Write-Host "host oracle: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
 }
 

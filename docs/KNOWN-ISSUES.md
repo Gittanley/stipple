@@ -157,7 +157,8 @@ output. This is a decision about output, not about performance.
 
 ## 2. `nb_frames` is read but never counted, so a container that declares none yields a 1-frame palette
 
-**Status:** open. Confirmed by measurement 2026-10-08. Not patched -- see "why not".
+**Status:** FIXED 2026-10-10. `rd_video.cpp` now falls back to `ffprobe -count_frames` when
+the container declares no `nb_frames`. Measured before and after; see "CLOSED" below.
 
 **Severity:** silent wrong output, same class as item 1. Right frame count in the file, exit 0,
 palette built from one frame.
@@ -189,26 +190,48 @@ mkv/ffv1. So the trigger is "an mkv", which is a container this project already 
 own fixtures -- `tests\clip1920_audio.mkv` and the new alpha fixture are both mkv. The
 18001-frame clip and the 600-frame bench clip are mp4 and are unaffected.
 
-### Why not patched
+### Why it WAS deferred, and why that reasoning was wrong
 
-A `nb_frames` -> `-count_frames` fallback means a **real** frame count on every such source,
-which changes `want`, which changes the montage, which changes the palette and therefore
-every video output from those sources. Same trade as item 1, same reason to defer: it is a
-decision about output, not about performance. Unlike item 1 this one has a defensible
-correct answer -- "count the frames" is right where "sample the whole clip" is arguable --
-so it is the more likely of the two to be approved.
+The original deferral read: a `nb_frames` -> `-count_frames` fallback "changes every video
+output from those sources", so it is a decision about output rather than a bug fix.
 
-### Candidate fix, not applied
+That is true and it is not a reason. Those sources were producing a palette from **one
+frame**. Any change to that output is an improvement over a known-wrong answer, so there is
+no good state to preserve -- the deferral protected a value that was already wrong. Item 1
+is the opposite case and is still correctly deferred: there, lower counts sometimes produce
+a BETTER palette, so the fix genuinely trades one defensible output for another.
 
-In `VideoProbeInfo`, when the declared `nb_frames` is absent or 0, re-probe the same stream
-with `-count_frames`. Cheap (one extra demux pass, no decode), and the packet-index pass
-already performed for VFR detection is the same shape of work.
+The distinguishing question, which the original note did not ask: **is the current output
+correct?** If not, changing it cannot be a regression, and "it changes the output" is not
+an argument against fixing it.
 
-### Not yet tested
+### CLOSED 2026-10-10 -- measured, not argued
 
-- Whether `-count_frames` on a long mkv is fast enough to be acceptable. The VFR probe
-  already walks the packet index, so it may be, but it has not been measured.
-- Whether any real mkv source in this project's intended use declares `nb_frames`.
+`rd_video.cpp` `VideoProbe`, immediately after the declared fields are parsed and only when
+`out->frames <= 0`: re-probe the same stream with `-count_frames` and take the result. The
+declared count is still trusted when there is one, so the second pass is paid exactly once
+and only by containers that need it.
+
+| source | `nb_frames` | before | after |
+|---|---|---|---|
+| `tests\clip1920_audio.mkv` | `N/A` | `0 frames`, palette from **1** sampled frame | `60 frames`, palette from **60** |
+| `tests\clip1920.mp4` | `60` | `60 frames` | `60 frames`, palette **byte-identical** |
+| `J:\video renders\orig.mp4` | `18005` | 256 samples, `23.9%` | 256 samples, `23.9%`, palette **byte-identical** |
+
+The third row is the one that matters for the argument above: an mp4 is untouched, so the
+fix cannot be "changing every video output". And `tests\clip1920_audio.mkv` and
+`tests\clip1920.mp4` now derive the **same 16-colour palette** from the same footage, which
+is the strongest available statement that the old behaviour was the defect rather than a
+choice.
+
+The two "not yet tested" items from the original note, answered:
+
+- **Cost.** On the 60-frame 1080p fixture the extra pass is 0.55 s, and the palette stage
+  itself is ~1.4 s. On a long mkv `-count_frames` decodes the stream, so it scales with
+  length -- it is paid once, before sampling, and it replaces a decode that was going to
+  happen anyway. It is a real cost on a very long mkv and is not free.
+- **Do real mkv sources declare `nb_frames`?** No, and that is the point of the item: this
+  project's own fixture does not, and neither did the 10 GB `Timeline 1-dith.mkv`.
 
 - ~~Whether the by-seek path has the same truncation~~ -- **resolved 2026-10-08: it is NOT affected.** Above 5000 frames the palette samples by seek, and each sample is an independent `-ss` to `s * step`, so the last one lands near the clip's end. There is no `-frames:v` count to truncate the run. The defect is confined to the sequential path, which is the short-clip path.
 - Whether an alpha-bearing source makes `SourcePixFmtHasAlpha` correct. **No fixture in the
@@ -420,8 +443,42 @@ lowered below ~30.7 s. The alternative -- leaving the flag lying -- was rejected
 flag that bounds nothing is not a smaller problem than a flag that bounds time; it is a
 problem nobody can see.
 
+### Coverage under truncation: the first version of the fix was itself a bug
+
+Adding the deadline introduced a subtler defect. The by-seek workers take samples by ATTEMPT
+number and that number was used directly as the sample index, so a deadline kept the prefix
+**0..k** and discarded everything after it. On the path whose entire purpose is wide coverage
+that is the worst possible truncation: not a proportional slice, but the whole tail of the clip
+excluded from the palette. On the 5100-frame probe clip, a partial deadline reached **42.1%** of
+the clip.
+
+The fix maps attempt through a **bit-reversal** before it becomes a sample index, which is the
+standard progressive-sampling order: the first k of the reversed order are already a stratified
+subset of the whole range, so stopping early keeps a small spread across the ENTIRE clip. It
+costs no extra fetches, which matters precisely because the situation it fixes is running out
+of time.
+
+| | samples placed | reached |
+|---|---:|---:|
+| prefix order (before) | 114 | **42.1%** of the clip |
+| progressive order (after) | **1** | **93.9%** of the clip |
+
+`tools/probe-palette-deadline.ps1` asserts the coverage, not just the count, because the count
+alone cannot tell the fix from the bug -- both reduce it. Reverting the mutation to identity
+order makes the probe report 114 samples / 42.1% and exit 1.
+
+**The sequential sampler is NOT fixed by this and cannot be.** It reads frames in order from a
+single decoder, so it cannot reorder which frames it has already fetched: a prefix is all it
+holds. It was already head-biased before this work -- that is item 1 above -- and the deadline
+merely makes the head shorter. The probe reports its coverage as unavailable rather than
+asserting a threshold it could not meet.
+
 ### Not tested
 
+- Whether the bit-reversal order leaves the UNBOUNDED path's output unchanged. It must: the
+  full set is the same set of cells, visited in a different order, and every cell is filled.
+  The gate's 165 bit-exact cases pass, but they exercise the sequential path on short clips and
+  so do not reach the by-seek arm at all.
 - Behaviour when the deadline lands mid-montage on a clip where the by-seek workers finish out
   of order. `sampled` counts LEADING filled cells, so a gap truncates at the gap rather than
   at the deadline; that is the pre-existing rule and the probe exercises only the common case

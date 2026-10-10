@@ -68,6 +68,51 @@
 #
 # Exit 2 means "cannot run" (no ffmpeg, no rdither), deliberately distinct from exit 1,
 # "ran and the answers differ".
+#
+# PART C -- THE ONLY STAGE WITH AN EXTERNAL REFERENCE.  Added 2026-10-10.
+#
+# Parts A and B compare rdither to rdither.  So does every other video stage in this
+# project: probe-video-exact is blocks vs opencl, probe-video-determinism is run vs run,
+# probe-host-oracle is host vs device.  Each asks "do two of OUR answers agree?" -- and a
+# defect shared by every arm is invisible to all of them, because they would agree.
+#
+# That is not a hypothetical, it is what happened twice.  The palette sampler's by-seek arm
+# asked ffmpeg for 4 channels and read into a 3-channel buffer, so every montage cell was an
+# RGBA stream read as RGB and 7 of 16 palette entries came out pure green.  It shipped
+# through a gate run recorded as "EXIT=0, 165/0 bit-exact, every stage ran, 0 skipped",
+# because the sequential sampler and the by-seek sampler were BOTH misreading and therefore
+# AGREEING.  `nb_frames` absent on mkv gave a 1-frame palette the same way.  So did
+# `--palette-import` on video, which hung on every arm identically.
+#
+# Part C is the shape that can see it: rdither's video output against ImageMagick's own
+# Riemersma, on the same source frame, through an independent `magick compare`.
+#
+# WHY IT ASSERTS A BOUND AND NOT `AE=0`, because `AE=0` is unachievable and asserting it
+# would make this stage permanently red:
+#
+#   RiemersmaBlocksCpu zeroes the error queue at every BLOCK boundary
+#   (rd_riemersma_cpu.cpp:586-587).  RiemersmaWalkCpu -- the image path -- keeps one queue
+#   for the whole frame (rd_riemersma_cpu.cpp:327), and so does ImageMagick.  At 320x180
+#   with the default `--blocks 512` that is 113 error-queue restarts per frame.
+#
+#   Measured, both sides dithering against the SAME forced palette
+#   (notes/video-block-queue-restart.md):
+#     image path                        6.3 px  (0.001%)
+#     video, --blocks 512 (default)   229.5 px  (0.40%)
+#     video, --blocks 65536 (1 block) 186.7 px  (0.32%)
+#
+# Monotonic in block size, converging toward the image path -- the signature of the restart.
+# `--help` has always admitted the cost ("--blocks 32 deviates 3.4x more from IM's output").
+#
+# So the bound is what has value.  A palette regression or a channel misread moves it by an
+# ORDER OF MAGNITUDE -- the green-grey bug was not 0.4% off, it was 7 of 16 entries pure
+# green -- so a 2% ceiling is insensitive to the block structure and still catches that
+# class by a wide margin.
+#
+# CPU ENGINE ONLY.  The GPU engines deviate from IM by design (~1.7% at --blocks 512, ~6.1%
+# at --blocks 32), so asserting them here would report a documented, intended difference as a
+# failure on every run.  `--input-mode rgba64` because yuv444 converts on the device and
+# yuv420 is 34 dB away by design; the host path is the one where exactness is defined.
 
 param(
   [string]$Rdither = "",
@@ -336,6 +381,118 @@ if ($rd.rc -ne 0 -or -not $rd.made) {
     }
     "    FAIL  host $(HashOf $ref) vs device $(HashOf $dev): $badFrames of $([int]$n) frames differ"
     $fail++
+  }
+}
+
+# ---------------------------------------------------------------- part C
+#
+# The only part with an EXTERNAL reference.  Parts A and B, and every other video stage in
+# this project, compare rdither to rdither -- so a defect shared by all of their arms is
+# invisible to them, because they agree.  Three have shipped that way; see the header.
+#
+# Cost: one extra 12-frame render plus a few `magick` calls, a couple of seconds.  It runs on
+# every build and needs no GPU, because it uses the host engine.
+''
+"  part C: does the video path match ImageMagick's own Riemersma?"
+$magick = Resolve-Tool 'magick.exe' ''
+if (-not $magick) {
+  '    SKIP  magick is not on PATH, so there is no reference implementation to compare to'
+  $skipped++
+} else {
+  $cOut = Join-Path $tmp 'oracle.mkv'
+  # An rgb24 fixture is what makes this an ORACLE rather than another self-comparison: it
+  # has no YCbCr->RGB step anywhere, so the only thing that can differ from ImageMagick is
+  # the dither.  With a yuv420p fixture a colour-conversion difference would swamp the thing
+  # being measured.
+  $oracleClip = Join-Path $tmp 'oracle_src.mkv'
+  & $ffmpeg -v error -y -f lavfi -i "testsrc=size=${srcW}x${srcH}:rate=30:duration=1" `
+      -frames:v 12 -pix_fmt rgb24 -c:v ffv1 $oracleClip 2>&1 | Out-Null
+  if (-not (Test-Path $oracleClip)) {
+    '    SKIP  could not build an rgb24 oracle fixture'
+    $skipped++
+  } else {
+    # Palette from the IMAGE path, handed to the video path, so both dither against the same
+    # colours -- otherwise this compares two different palettes and reports the difference
+    # as a dither fault.  --colors MUST equal the file's count: rdither refuses a mismatch,
+    # and a refusal here looks exactly like a divergence.
+    $palTxt = Join-Path $tmp 'oracle_pal.txt'
+    $pimg = Join-Path $tmp 'oracle_pal.png'
+    & $ffmpeg -v error -y -i $oracleClip -frames:v 1 -pix_fmt rgb24 $pimg 2>&1 | Out-Null
+    $null = & $exe --colors $Colors --palette-export $palTxt $pimg (Join-Path $tmp 'pal_out.png') 2>&1
+    $palCount = 0
+    if (Test-Path $palTxt) {
+      $palCount = @(Get-Content $palTxt | Where-Object { $_ -notmatch '^#' -and $_.Trim() }).Count
+    }
+    if ($palCount -lt 1) {
+      '    FAIL  could not export a palette to compare against'
+      $fail++
+    } else {
+      $rc2 = & $exe --video --engine cpu --colors $palCount --palette-import $palTxt `
+                --input-mode rgba64 --video-lossless --no-audio `
+                $oracleClip $cOut 2>&1 | Out-String
+      if (-not (Test-Path $cOut)) {
+        '    FAIL  the oracle render produced no output'
+        $fail++
+      } else {
+        # Force ImageMagick onto OUR palette with -remap, so a palette difference cannot be
+        # mistaken for a dither difference.  Four earlier attempts at this comparison left
+        # this step out, which is why they reported divergences that were really just two
+        # different palettes.
+        $hexes = @(Get-Content $palTxt | Where-Object { $_ -notmatch '^#' -and $_.Trim() } |
+                   ForEach-Object { ($_ -split "`t")[-1].Trim() })
+        $gif = Join-Path $tmp 'oracle_pal.gif'
+        $gargs = @('-size', "$($hexes.Count)x1", 'xc:black')
+        for ($k = 0; $k -lt $hexes.Count; $k++) {
+          $gargs += @('-fill', "#$($hexes[$k])", '-draw', "point $k,0")
+        }
+        & $magick @gargs $gif 2>&1 | Out-Null
+
+        $srcPng = Join-Path $tmp 'oracle_src0.png'
+        & $ffmpeg -v error -y -i $oracleClip -frames:v 1 -pix_fmt rgb24 $srcPng 2>&1 | Out-Null
+        $refPng = Join-Path $tmp 'oracle_ref.png'
+        & $magick $srcPng -dither Riemersma -remap $gif $refPng 2>&1 | Out-Null
+        $gotPng = Join-Path $tmp 'oracle_got.png'
+        & $ffmpeg -v error -y -i $cOut -frames:v 1 -pix_fmt rgb24 $gotPng 2>&1 | Out-Null
+
+        if (-not (Test-Path $refPng) -or -not (Test-Path $gotPng)) {
+          '    FAIL  could not produce both sides of the comparison'
+          $fail++
+        } else {
+          # The CEILING, and why it is a ceiling rather than AE=0, is in the header: the
+          # blocks walk zeroes its error queue per block and the reference does not.
+          # Measured baseline 0.40% at the default --blocks 512; 2% is ~5x that, far below
+          # any palette or channel fault and far above the block structure.
+          $CeilingPct = 2.0
+          $aeText = (& cmd /c "`"$magick`" compare -metric AE `"$gotPng`" `"$refPng`" null: 2>&1" | Out-String).Trim()
+          # This ImageMagick reports a NORMALISED metric -- "229.48 (0.00398402)" -- not a
+          # bare integer.  The count is the first token and the fraction is the second; a
+          # check written against the integer form alone reads the fraction and passes
+          # everything, which is how this was nearly shipped.
+          $tok = ($aeText -split '\s+')
+          $pct = $null
+          if ($tok.Count -ge 2 -and $tok[1] -match '^\(([0-9.]+)\)$') {
+            $pct = 100.0 * [double]$Matches[1]
+          } elseif ($tok.Count -ge 2) {
+            $den = $srcW * $srcH
+            if ($den -gt 0) { $pct = 100.0 * [double]($tok[0] -replace '[^0-9.]','') / $den }
+          }
+          if ($null -eq $pct) {
+            "    FAIL  could not read the comparison metric ('$aeText')"
+            $fail++
+          } elseif ($pct -le $CeilingPct) {
+            "    ok    {0:N3}% of pixels differ from ImageMagick's Riemersma (ceiling {1}%)" -f $pct, $CeilingPct
+            "          same $palCount colours forced on both sides, so this measures the"
+            "          dither.  Baseline ~0.40%: RiemersmaBlocksCpu zeroes its error queue per"
+            "          block (rd_riemersma_cpu.cpp:586) and the reference does not."
+          } else {
+            "    FAIL  {0:N3}% of pixels differ from ImageMagick's Riemersma, ceiling {1}%" -f $pct, $CeilingPct
+            "          This is the only video stage with an external reference.  Every other"
+            "          one compares rdither to rdither and cannot see a fault they share."
+            $fail++
+          }
+        }
+      }
+    }
   }
 }
 

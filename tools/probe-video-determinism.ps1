@@ -48,15 +48,27 @@ param(
   # 8 stays.  It looked like 8 was too few, and the measurement says otherwise for the
   # path this probe actually samples.
   #
-  # On the default yuv444p input the `cpu` case diverges on 11 of 24 runs -- a rate of
-  # 0.458 -- so an 8-run sample misses it with probability 0.542^7, about 1.4%.  The
-  # suite detects this reliably at 8, and raising it to 24 measured 21 s against 62 s
-  # for a gain from 98.6% to 99.9%.  Not worth 3x the time.
+  # ORIGINALLY MEASURED: on the default yuv444p input the `cpu` case diverged on 11 of 24
+  # runs -- a rate of 0.458 -- so an 8-run sample missed it with probability 0.542^7, about
+  # 1.4%.  Raising it to 24 measured 21 s against 62 s for a gain from 98.6% to 99.9%.
   #
-  # The confusion worth recording: on --input-mode rgba64 the same case diverges on
-  # only 6 of 24 runs, a rate of 0.25, where 8 runs miss it 13% of the time.  Both
-  # figures are real and they are for different paths.  The rgba64 number is the one
-  # that made this look urgent, and it is the one this probe never takes.
+  # RE-MEASURED 2026-10-10, and the race is GONE: 24 runs of the `cpu` case on
+  # tests\clip1920_audio.mkv, with this probe's exact flags including RD_YUV444_OUT=0,
+  # produced ONE distinct hash.  Same for a 320x180 fixture: one hash over 24 runs.  The
+  # 0.458 figure predates the writer-ordering fix (`Batch::first_frame`, defect 3 in the
+  # long note below), so it described a build that no longer exists.
+  #
+  # This matters for a decision that was about to be made on it.  The plan was to cut the
+  # cpu case to a 320x180 fixture to save ~100 s, justified by "8 reps are required
+  # because the divergence rate is 0.458".  That justification is void: there is no
+  # divergence to detect at either size, so a smaller fixture cannot be shown to preserve
+  # the detection this probe is supposed to provide.  Shrinking it on a dead statistic
+  # would have reduced coverage while looking like an optimisation.
+  #
+  # 8 is kept, not because 0.458 still holds, but because it is the budget this stage was
+  # designed around and nothing has replaced the evidence for a smaller number.  If a
+  # divergence reappears, the rate has to be re-measured before the rep count is touched --
+  # which is what the note above now says.
   [int]$Runs = 8,
   [int]$Colors = 16,
   [string]$Rdither = "",
@@ -113,14 +125,22 @@ function Get-DecodedHash([string]$mkv) {
   $h = (& ffmpeg -v error -i $mkv -f rawvideo -pix_fmt rgba -f md5 - 2>$null | Out-String).Trim()
   if (-not $h) { return $null }
   # The md5 stream carries every decoded sample of every frame, which is exactly what
-  # hashing the raw file covered.  A frame count is reported alongside so a truncated
-  # decode cannot masquerade as a stable one.
-  $n = 0
-  try {
-    $n = [int](& ffprobe -v error -select_streams v:0 -count_frames `
-                 -show_entries stream=nb_read_frames -of csv=p=0 $mkv 2>$null | Out-String).Trim()
-  } catch { $n = 0 }
-  return @{ hash = $h; bytes = $n }
+  # hashing the raw file covered.
+  #
+  # THE PER-RUN `ffprobe -count_frames` THAT USED TO BE HERE IS GONE, and it was not free.
+  # `-count_frames` DECODES the whole clip to count its frames, so this function was
+  # decoding every output twice per run -- once for the md5 and once for the number.
+  # Measured on the 60-frame 1080p fixture: render 3.92 s, count_frames 1.23 s, md5 1.36 s.
+  # At 3 engines x 8 runs that is 48 x 1.23 = 59 s of a stage that measures 457 s, spent
+  # re-deriving a number the clip cannot vary from.
+  #
+  # The count is now read ONCE, from the SOURCE, before the sweep (see $script:SourceFrames).
+  # That is sufficient rather than merely cheaper: this probe asserts every run produces
+  # the SAME frame count, and separately that it equals the source's. Comparing 48 numbers
+  # to each other when they must all equal one known constant cannot fail in a way the
+  # source comparison would miss -- and the source comparison is the one that actually
+  # catches dropped frames, which is what the `-shortest` fault was.
+  return @{ hash = $h; bytes = $script:SourceFrames }
 }
 
 # Frame count, from the file rather than from rdither's own report: a pipeline that
@@ -163,6 +183,17 @@ $cases = @(
 "Video determinism: $Runs runs per case, decoded pixels + frame count"
 ''
 "clip: $Clip"
+''
+# The SOURCE frame count, read ONCE.  Every run's output must equal this, so reading it
+# 48 times (once per output, via `-count_frames`) is 48 decodes to re-derive a constant --
+# measured at 1.23 s each on the 60-frame 1080p fixture.  See Get-DecodedHash.
+$script:SourceFrames = Get-FrameCount $Clip
+if ($script:SourceFrames -lt 1) {
+  'video determinism: cannot read the source frame count; the frame-count half of this ' +
+    'check would be vacuous, so the whole stage is skipped rather than half-run.'
+  exit 2
+}
+"source    : $script:SourceFrames frames (read once; every run must match it)"
 ''
 $fail = 0
 $skipped = 0

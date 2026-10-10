@@ -83,7 +83,7 @@ function New-Fixture {
     return @{ seq = $seq; seek = $seek }
 }
 
-# Returns the number of DISTINCT samples the run reports, or $null on failure.
+# Returns the number of DISTINCT samples the run reports, plus how far into the clip it got.
 function Get-Sampled {
     param([string]$Clip, [string]$Out, [string]$DeadlineMs)
     $prev = $env:RD_PALETTE_DEADLINE_MS
@@ -96,13 +96,17 @@ function Get-Sampled {
         if ($null -eq $prev) { Remove-Item Env:\RD_PALETTE_DEADLINE_MS -EA SilentlyContinue }
         else { $env:RD_PALETTE_DEADLINE_MS = $prev }
     }
-    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Rc = $LASTEXITCODE; Sampled = -1; Text = $text } }
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Rc = $LASTEXITCODE; Sampled = -1; SrcFrame = -1; Frames = -1; Text = $text } }
     $m = [regex]::Match($text, 'palette\s*:\s*(\d+) colours from (\d+)')
-    if (-not $m.Success) {
-        $m = [regex]::Match($text, 'palette_sampled|(\d+) sampled frame')
-    }
-    $sampled = if ($m.Success) { [int]$m.Groups[$m.Groups.Count - 1].Value } else { -1 }
-    return [pscustomobject]@{ Rc = 0; Sampled = $sampled; Text = $text }
+    $sampled = if ($m.Success) { [int]$m.Groups[2].Value } else { -1 }
+    $total = 0
+    $np = & ffprobe -v error -select_streams v:0 -count_frames `
+        -show_entries stream=nb_read_frames -of 'csv=p=0' $Clip 2>$null
+    if ($np) { $total = [int]$np }
+    # Only the deadline line carries coverage; without one there is nothing to assert.
+    $md = [regex]::Match($text, 'source frames up to (-?\d+) of (\d+)')
+    $src = if ($md.Success) { [int]$md.Groups[1].Value } else { -1 }
+    return [pscustomobject]@{ Rc = 0; Sampled = $sampled; SrcFrame = $src; Frames = $total; Text = $text }
 }
 
 try {
@@ -123,6 +127,47 @@ try {
             exit 2
         }
         Write-Host ("  {0,-11} unbounded   : {1} sampled frame(s)" -f $label, $free.Sampled)
+
+        # A PARTIAL deadline, not the 1 ms floor. The count assertion alone cannot tell the
+        # coverage fix from the bug it fixed: both reduce the sample count. What distinguishes
+        # them is WHERE the surviving samples sit, so this arm asks for roughly a third of the
+        # budget and then checks how far into the clip the sampler got.
+        $partial = Get-Sampled -Clip $clip -Out (Join-Path $OutDir "$label-part.mkv") `
+                    -DeadlineMs ([string]([int](1500 * [double]$free.Sampled / 256)))
+        if ($partial.Rc -ne 0) {
+            Write-Host "  FAIL  the $label partial-deadline render FAILED (exit $($partial.Rc))"
+            $failed = $true
+            continue
+        }
+        $pct = if ($partial.Frames -gt 0 -and $partial.SrcFrame -ge 0) {
+            100.0 * $partial.SrcFrame / $partial.Frames
+        } else { -1 }
+        if ($pct -lt 0) {
+            Write-Host ("  {0,-11} partial     : {1} of {2} samples (coverage not reported -- this" -f `
+                $label, $partial.Sampled, $free.Sampled)
+            Write-Host '                        sampler reads frames in order, so it is'
+            Write-Host '                        head-biased by construction; see item 1)'
+        } else {
+            Write-Host ("  {0,-11} partial     : {1} of {2} samples, reached frame {3:N0} of {4:N0} ({5:N1}%)" -f `
+                $label, $partial.Sampled, $free.Sampled, $partial.SrcFrame, $partial.Frames, $pct)
+        }
+
+        if ($partial.Sampled -ge 1 -and $partial.Sampled -lt $free.Sampled -and $pct -ge 0) {
+            # The truncated set must still be a SAMPLE OF THE WHOLE CLIP. Before the fix,
+            # attempt n mapped to index n, so a third of the budget reached a third of the
+            # clip. With the progressive order a prefix is already stratified, so a partial
+            # run should get most of the way through even having placed far fewer samples.
+            if ($pct -lt 80) {
+                Write-Host ("  FAIL  {0}: a partial deadline covering {1:N1} samples reached only" -f `
+                    $label, $partial.Sampled)
+                Write-Host ("        {0:N1}% of the clip. A truncated sample set must stay spread" -f $pct)
+                Write-Host '        ACROSS the clip, not be the head of it.'
+                $failed = $true
+            } else {
+                Write-Host ("  {0,-11} ok           : truncated to {1} samples, still {2:N1}% of the clip" -f `
+                    $label, $partial.Sampled, $pct)
+            }
+        }
 
         # Deadline of 1 ms. It cannot fire before the first sample is placed, so the floor
         # is one sample rather than zero.
@@ -151,6 +196,80 @@ try {
         }
         Write-Host ("  {0,-11} ok           : bounded {1} -> {2}" -f $label, $free.Sampled, $tight.Sampled)
     }
+    # ---------------------------------------------------------------------------------
+    # CROSS-SAMPLER AGREEMENT. Not a deadline question, but it lives here because it needs
+    # the same 5100-frame fixture, and this is the only gate that builds one.
+    #
+    # WHY. The by-seek sampler asked ffmpeg for `rgba` while its read buffer was sized
+    # `pixels * 3`, so on a clip with no alpha it read 3/4 of each frame and strode the RGBA
+    # byte stream as RGB triples. Every montage cell was wrong and the quantiser built a
+    # green-grey palette from it -- 7 of 16 entries pure green -- reporting "mean saturation
+    # 49.0%" throughout. It reached a render because the 165-case bit-exact gate never
+    # reaches `sample_by_seek` at all (`info.frames > 5000`, and RD_PALETTE_SEEK can only
+    # DISABLE that path), so one of the program's two palette samplers had NO coverage.
+    #
+    # WHY A STATIC CLIP IS THE ORACLE. The two samplers legitimately read DIFFERENT frames
+    # -- sequentially the first N, by seek a spread across the whole clip -- so their
+    # palettes are NOT supposed to match in general, and comparing them on an ordinary clip
+    # would assert nothing. If every frame is IDENTICAL, though, which frames were sampled
+    # cannot matter: both samplers must derive the same palette from the same pixels by
+    # construction. That makes the comparison a real planted-defect oracle rather than a
+    # restatement of the implementation -- the corrupted read cannot satisfy it, and no
+    # correct read can fail it.
+    # ---------------------------------------------------------------------------------
+    Write-Host ''
+    Write-Host 'palette deadline: do the two samplers agree when the frames cannot matter?'
+
+    $static = Join-Path $OutDir 'static.mp4'
+    & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=30' `
+        -frames:v 5100 -vf 'fps=30,tpad=stop_mode=clone:stop_duration=200' `
+        -pix_fmt yuv420p -c:v libx264 -g 60 -qp 0 $static 2>&1 | Out-Null
+    if (-not (Test-Path -LiteralPath $static)) {
+        Write-Host 'palette deadline: cannot run -- could not build the static-frame fixture'
+        exit 2
+    }
+
+    $pal = @{}
+    foreach ($arm in @(@('sequential', '0'), @('by-seek', '1'))) {
+        $label = $arm[0]
+        $seekEnv = $arm[1]
+        $txt = Join-Path $OutDir "$label-static.txt"
+        $prev = $env:RD_PALETTE_SEEK
+        $env:RD_PALETTE_SEEK = $seekEnv
+        try {
+            $null = (& $Rdither --video --colors 16 --engine cuda --im-palette `
+                        --palette-only --palette-export $txt $static `
+                        (Join-Path $OutDir "$label-static.mkv") 2>&1 | Out-String)
+        } finally {
+            if ($null -eq $prev) { Remove-Item Env:\RD_PALETTE_SEEK -EA SilentlyContinue }
+            else { $env:RD_PALETTE_SEEK = $prev }
+        }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $txt)) {
+            Write-Host "  FAIL  the $label static-clip palette build exited $LASTEXITCODE"
+            $failed = $true
+            continue
+        }
+        $pal[$label] = @(Get-Content -LiteralPath $txt |
+            Where-Object { $_ -notmatch '^#' -and $_.Trim() } |
+            ForEach-Object { ($_ -split "`t")[-1] })
+    }
+
+    if ($pal.ContainsKey('sequential') -and $pal.ContainsKey('by-seek')) {
+        $a = ($pal['sequential'] -join ' ')
+        $b = ($pal['by-seek'] -join ' ')
+        Write-Host "  sequential  : $a"
+        Write-Host "  by-seek     : $b"
+        if ($a -ne $b) {
+            Write-Host '  FAIL  the two samplers disagree on a clip whose frames are all identical.'
+            Write-Host '        Which frames were sampled cannot matter here, so the difference is in'
+            Write-Host '        how a frame was READ. The likely cause is the -pix_fmt handed to ffmpeg'
+            Write-Host '        disagreeing with the read buffer''s channel count (rd_video.cpp).'
+            $failed = $true
+        } else {
+            Write-Host '  ok           : both samplers derive the same palette from identical frames'
+        }
+    }
+
     if ($failed) { exit 1 }
 } finally {
     Remove-Item -LiteralPath $OutDir -Recurse -Force -EA SilentlyContinue
