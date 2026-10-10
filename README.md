@@ -336,8 +336,9 @@ the 5.8 dB.)
 
 **Output.** `--video-pix-fmt` defaults to `yuv444p` and that default is load-bearing:
 `yuv420p` output subsamples chroma over 2×2 blocks, averaging away the dither pattern
-entirely. It is also far smaller — 15,191 bytes against 36,031 for the same 600 frames
-— so the small file is the one where the dither is gone. `--video-lossless` gives
+entirely. It is also far smaller, in the same direction as the unique-colour counts measured
+below (36,031 at `yuv420p` against 15,191 at `yuv444p`, same 600 frames) - so the smaller
+file is the one where the dither is gone. `--video-lossless` gives
 ffv1 yuv444p, which keeps the palette exactly, at roughly 28× the bitrate of yuv420p
 H.264.
 
@@ -701,11 +702,48 @@ Beyond that suite, `verify.ps1` also runs:
 | Check | What it proves | Result |
 |---|---|---|
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
-| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 36 image cells | 36/36 |
+| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
 | `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count, on each of the three engines | 3/3 |
-| `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 9 geometries | 9/9 |
-| `tools\probe-video-invariance.ps1` | `--batch-frames 16` gives the same pixels as `1`, and `--no-gpu` the same as the device | 2/2, 1 half skipped without a GPU |
+| `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 14 geometries | 6 of 14 have one; 8 have none to check |
+| `tools\probe-video-invariance.ps1` | `--batch-frames 16` gives the same pixels as `1`, `--no-gpu` the same as the device, **and part C: the video path stays within 1% of ImageMagick's own Riemersma** | 2/2, 1 half skipped without a GPU |
+| `tools\probe-host-oracle.ps1` | the host walk is bit-identical to the device, and batch-invariant | ok |
+| `tools\probe-alpha-guard.ps1` | `SourcePixFmtHasAlpha` takes both directions | ok |
+| `tools\probe-split-decode.ps1` | N seek-based decodes == one decode, per frame | CFR identical; VFR differs, reported not failed |
+| `tools\probe-palette-deadline.ps1` | `--palette-budget-ms` bounds the stage, **and both palette samplers agree on a clip whose frames are all identical** | ok |
+| `tools\probe-cache-invalidation.ps1` | the clip-invariant cache hits within a run and leaks nothing between geometries | ok |
+| `rdither --self-test` | the C++-level invariants, including the palette gate's blocking and publish semantics | PASSED |
+| `tools\probe-palette-overlap.ps1` | `RD_PALETTE_OVERLAP` changes no pixel | **off by default** — run `verify.ps1 -Slow` |
+
+### Exit codes
+
+`verify.ps1` does not have one "success" code, and the difference matters when a run is red:
+
+| | |
+|---|---|
+| **0** | every stage ran and passed (reachable with `-Slow`, or when nothing is skipped) |
+| **1** | a stage failed |
+| **2** | a stage did not run for an *incidental* reason — missing fixture, `-Fast`, probe could not start. A gap. |
+| **3** | the `-BudgetMinutes` watchdog fired; the run did not finish |
+| **4** | **pass with declared exclusions** — everything that ran passed, and everything skipped is off by default and named in the output with the switch that runs it. **This is what the default invocation returns.** |
+
+### Part C is the one that matters, and it was the last one added
+
+Every other video check here compares rdither to rdither: OpenCL to CUDA, run to run, host
+to device, batch 16 to 1. A defect shared by all their arms is **invisible to them, because
+they agree** — and three shipped that way through runs recorded as
+`EXIT=0, 165/0 bit-exact, every stage ran, 0 skipped`:
+
+* the by-seek palette sampler read RGBA bytes as RGB triples, giving a green-grey palette
+  with 7 of 16 entries pure green, while reporting "mean saturation 49.0%";
+* `nb_frames` is `N/A` on mkv, so the palette was built from **one frame**;
+* `--palette-import` on video hung forever on a palette gate nobody released.
+
+Part C is the only shape that can see that class: rdither's video output against
+ImageMagick's own Riemersma. It asserts a **1% ceiling**, not `AE=0`, because the blocks walk
+zeroes its error queue per block and the reference does not — measured 0.099%–0.538% across
+six colour counts and five block lengths, so the ceiling is set from that envelope rather than
+from one sample.
 
 That last one is the odd one out and earns its place. The cross-engine checks compare two
 engines against each other, which makes them **structurally blind to a fault both engines
