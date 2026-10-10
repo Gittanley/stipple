@@ -2448,6 +2448,18 @@ class Pipeline {
     } else {
       budget = 2ull << 30;
     }
+    // --max-ram-mb, when the user actually passed it, caps this and can only lower it.
+    // Physical RAM stays the real ceiling: a request for more memory than the machine
+    // has is answered with the memory the machine has, not with an error, because the
+    // alternative is a flag that refuses ordinary numbers on a small box.
+    //
+    // Capping rather than overriding is the whole decision.  Overriding would let a
+    // user promise the pipeline bytes that do not exist, which is how you get an
+    // out-of-memory crash instead of a queue that is merely smaller than asked for.
+    if (opt.max_ram_mb_set) {
+      const std::size_t cap = opt.max_ram_mb * 1024ull * 1024ull;
+      if (budget > cap) budget = cap;
+    }
     ram_budget_ = budget;
     reserved_ = reserve;
     avail_phys_ = avail;

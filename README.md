@@ -373,10 +373,13 @@ the dither being saturated rather than stalled); `--frames`, `--batch-frames` an
 
 **RAM.** The queue is sized first and the worker count trimmed to fit it, because a deep
 queue with fewer workers beats a shallow one with more. `[ram]` on every run reports the
-real figure — 42 slots + a 768 MiB reserve ≈ 810 MiB peak at 1080p, with the reserve
-dominating. `--mem-fraction` sets the share of physical RAM the queue may use (default
-about a third) and `--max-ram-mb` caps it absolutely; frames beyond the budget spill to
-disk rather than failing.
+real figure — its `queue N` is **megabytes in flight, not a slot count** — plus a 768 MiB
+decoder reserve, with the reserve dominating. `--mem-fraction` sets the share of physical
+RAM the queue may use (default about a third), and `--max-ram-mb` caps that budget when you
+pass it. The cap can only lower it: a request for more memory than the machine has is
+answered with the memory it has. It is also not exact — a liveness floor of two slots means
+a very small value cannot push the queue below that, which is reported rather than hidden;
+frames beyond the budget spill to disk rather than failing.
 
 ### What the fps number means in practice
 

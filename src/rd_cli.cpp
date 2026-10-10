@@ -1653,6 +1653,15 @@ int main(int argc, char** argv) {
     opt.video_opt.block = opt.blocks.block;
     opt.video_opt.diffusion = opt.diffusion;
     opt.video_opt.quiet = opt.quiet;
+    // --max-ram-mb reaches the video queue only when the user actually typed it.  The
+    // default is 512 while the video path's own default is derived from physical RAM,
+    // so forwarding the value unconditionally would shrink every default run.  See the
+    // `max_ram_mb_set` note in include/rd_video.h.
+    opt.video_opt.max_ram_mb = opt.max_ram_mb;
+    opt.video_opt.max_ram_mb_set = false;
+    for (const std::string& s : opt.seen_flags) {
+      if (s == "--max-ram-mb") { opt.video_opt.max_ram_mb_set = true; break; }
+    }
     opt.video_opt.dump_palette_limit = opt.dump_palette ? 16 : 0;
     // --engine opencl selects the OpenCL video engine.  Everything else keeps
     // the historical behaviour, which is that --video always used the block-

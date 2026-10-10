@@ -237,6 +237,18 @@ struct VideoOptions {
   // Fraction of physical RAM the in-flight frame buffers may occupy; 0 = auto
   // (about a third).  The queue depth is derived from this.
   double mem_fraction = 0.0;
+  // An ABSOLUTE cap on the same queue, in megabytes, and the pair matters:
+  // `max_ram_mb_set` says whether the user actually passed --max-ram-mb, because the
+  // CLI default is 512 while the video path's own default is derived from physical
+  // RAM.  Applying 512 unconditionally would silently shrink every default run, so
+  // the cap engages only when the flag was really typed.
+  //
+  // Before this existed the flag reached the image path (rd_cli.cpp builds the
+  // PixelStore from it) and NOT this one: max_ram_mb appeared nowhere in rd_video.cpp,
+  // so `--max-ram-mb 1` and `--max-ram-mb 100000` sized the queue identically.  The
+  // help text and README.md both said it capped the budget "absolutely".
+  std::size_t max_ram_mb = 0;
+  bool max_ram_mb_set = false;
   std::string codec = "libx264";
   int crf = 18;
   // veryfast, not medium.  Once the dither stopped being the bottleneck the
