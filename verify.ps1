@@ -728,6 +728,30 @@ if (Test-Path $vinv) {
   }
   }
 
+# And an eighth: does the SEGMENTED path work at all?
+#
+# `--segment-frames` shipped with an access violation (0xC0000005) under
+# RD_PALETTE_OVERLAP=1 and a plain exit 1 without it, and this suite stayed green the
+# whole time, because NO STAGE RAN IT.  It is the crash-safe path -- the one a long
+# render uses, precisely so progress survives a power cut -- so a crash there is the
+# worst place for one, and it went unnoticed for exactly the reason that nothing
+# exercised it.
+#
+# The probe covers the four shapes separately: plain, with the overlap env var (the
+# only way to reach the race), more than one segment (so the loop iterates), and a
+# pixel comparison against the unsegmented control under --video-lossless.  Cheap:
+# a 320x180 10-frame lavfi fixture, seconds.
+$seg = Join-Path $PSScriptRoot 'tools\probe-segment-frames.ps1'
+if (Test-Path $seg) {
+  Write-Host ""
+  & pwsh -NoProfile -File $seg -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Skip-CannotRun "segment frames" }
+    default { Write-Host "segment frames: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
 # ---- where the time went --------------------------------------------------------
 #
 # Printed unconditionally, and attributed per stage, because "the suite takes 25-35

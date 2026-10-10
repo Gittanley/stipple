@@ -726,6 +726,7 @@ Beyond that suite, `verify.ps1` also runs:
 | `tools\probe-split-decode.ps1` | N seek-based decodes == one decode, per frame | CFR identical; VFR differs, reported not failed |
 | `tools\probe-palette-deadline.ps1` | `--palette-budget-ms` bounds the stage, **and both palette samplers agree on a clip whose frames are all identical** | ok |
 | `tools\probe-cache-invalidation.ps1` | the clip-invariant cache hits within a run and leaks nothing between geometries | ok |
+| `tools\probe-segment-frames.ps1` | `--segment-frames` runs at all: plain, with `RD_PALETTE_OVERLAP=1`, multi-segment, and its decoded pixels equal the unsegmented run | ok |
 | `rdither --self-test` | the C++-level invariants, including the palette gate's blocking and publish semantics | PASSED |
 | `tools\probe-palette-overlap.ps1` | `RD_PALETTE_OVERLAP` changes no pixel | **off by default** — run `verify.ps1 -Slow` |
 

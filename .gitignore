@@ -99,6 +99,17 @@ tests/smooth.png
 gate*.log
 build_*.log
 
+# The agent working agreement and its state files: personal to one machine and one
+# person, and deliberately not published. AGENT-NAMES.md IS tracked, so a clone gets the
+# registry but not the rule that asks anyone to fill it -- inert rather than broken.
+# tools/check_agent_names.py and tools/check_load_path.py follow the same rule for the
+# same reason: a checker nothing invokes is not a control.
+AGENTS.md
+MEMORY.md
+QUESTIONS.md
+tools/check_agent_names.py
+tools/check_load_path.py
+
 # Editor and OS noise
 .vscode/
 .vs/
