@@ -91,8 +91,8 @@
 # would make this stage permanently red:
 #
 #   RiemersmaBlocksCpu zeroes the error queue at every BLOCK boundary
-#   (rd_riemersma_cpu.cpp:586-587).  RiemersmaWalkCpu -- the image path -- keeps one queue
-#   for the whole frame (rd_riemersma_cpu.cpp:327), and so does ImageMagick.  At 320x180
+#   (rd_riemersma_cpu.cpp:603-604).  RiemersmaWalkCpu -- the image path -- keeps one queue
+#   for the whole frame (rd_riemersma_cpu.cpp:344-345), and so does ImageMagick.  At 320x180
 #   with the default `--blocks 512` that is 113 error-queue restarts per frame.
 #
 #   Measured, both sides dithering against the SAME forced palette
@@ -525,7 +525,7 @@ if (-not $magick) {
             "    ok    {0:N3}% of pixels differ from ImageMagick's Riemersma (ceiling {1}%)" -f $pct, $CeilingPct
             "          same $palCount colours forced on both sides, so this measures the"
             "          dither.  Baseline ~0.40%: RiemersmaBlocksCpu zeroes its error queue per"
-            "          block (rd_riemersma_cpu.cpp:586) and the reference does not."
+            "          block (rd_riemersma_cpu.cpp:604) and the reference does not."
           } else {
             "    FAIL  {0:N3}% of pixels differ from ImageMagick's Riemersma, ceiling {1}%" -f $pct, $CeilingPct
             "          This is the only video stage with an external reference.  Every other"

@@ -85,6 +85,20 @@ tests/fhd_photo.png
 tests/big.png
 tests/smooth.png
 
+# Run transcripts from this tree: gate and build logs.  They are evidence ABOUT a
+# machine, not about the code -- a gate log is a claim about what passed on one
+# GTX 1650 SUPER on one day, and committing ten of them invites a diff that means
+# nothing.  The same reasoning as artifacts/ below, which is why that directory is
+# ignored rather than tracked.
+#
+# This rule was MISSING, and its absence is how `git add -A` would have committed
+# gate.log, gate2.log, ... gate_slow.log, gate_now.log, gate_after_fixes.log,
+# gate_cuda.log, build_cuda.log and build_cuda2.log -- every one of them written by
+# an agent session, none of them reviewed.  A .gitignore entry is cheaper than
+# remembering which of thirty-nine untracked paths are yours.
+gate*.log
+build_*.log
+
 # Editor and OS noise
 .vscode/
 .vs/

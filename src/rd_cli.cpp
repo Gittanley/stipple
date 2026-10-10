@@ -821,17 +821,33 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
 
   rd::InstallInterruptHandler();
   bool failed = false;
-  // ONE gate for every segment, published once.  Per-segment would be two bugs at once:
-  // rd::Palette(*palette) is a 2 MB copy on the stack (sizeof(Palette) is 65536 x 32 B),
-  // and the palette is identical for every segment anyway.  The overlap does not apply
-  // here -- this path stays a serial prefix -- but the signature is uniform, so the gate
-  // exists regardless.
-  // ONE gate for every segment, published once.  The overlap does NOT apply to this
-  // path: it stays a serial prefix, and the gate exists only because VideoProcess's
-  // signature is uniform.  (Per-segment publishing would also mean rd::Palette(*palette),
-  // a 2 MB stack copy -- sizeof(Palette) is 65536 x 32 B.)
-  rd::PaletteGate seg_gate;
-  seg_gate.Publish(std::move(*palette), std::move(*tree));
+  // The gate published ABOVE is reused for every segment.  Publishing again here is what
+  // broke this path, and it is worth recording why, because the bug looked like a
+  // missing join rather than an extra publish:
+  //
+  //   * Every arm of the palette if/else chain publishes into `gate` (rd_cli.cpp:588 for
+  //     --palette-from, :614 on the overlap thread, :621 for the serial build).  So by the
+  //     time control reaches the segment loop the palette is ALREADY published.
+  //   * This code published a SECOND time, from std::move(*palette) and std::move(*tree),
+  //     into a fresh `seg_gate`.  Palette is an aggregate holding a fixed 65536-entry
+  //     array, so moving from it copies and leaves the contents readable -- which is why
+  //     the dither half kept working and hid this.  ColorTree holds a std::vector<QNode>,
+  //     so the move actually EMPTIED it.  The segment loop therefore ran against an empty
+  //     tree and VideoProcess refused it: "segment 1: palette/tree upload failed".
+  //   * With RD_PALETTE_OVERLAP=1 the palette thread was still running and writing *tree
+  //     while the line above moved from it -- a data race on a vector mid-reallocation,
+  //     which is the access violation (0xC0000005) rather than the tidy error.
+  //   * And this path never called join_palette() at all, so with the overlap on, a
+  //     joinable std::thread reached its destructor at scope exit.
+  //
+  // `gate` is const-correct for this: VideoProcess takes it by const reference and calls
+  // gate.Wait(), which is idempotent, so one publish serves any number of segments.  The
+  // palette is identical for every segment anyway -- it is a serial prefix, spent once.
+  //
+  // The join is still required, and it belongs HERE rather than at the publish: the
+  // overlap thread is the only writer of `*palette`/`*tree`/`result`, and everything below
+  // reads them.
+  join_palette();
   report_palette();
   for (int seg = 0; seg < seg_count; ++seg) {
     if (done[static_cast<std::size_t>(seg)]) continue;
@@ -849,10 +865,8 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     std::printf("segment %d/%d: frames %lld..%lld -> %s\n", seg + 1, seg_count,
                 static_cast<long long>(first),
                 static_cast<long long>(first + want - 1), seg_path.c_str());
-    // Segmented path: same gate, published once by the caller above and reused for
-    // every segment.  The palette is a serial prefix here and the overlap does not
-    // apply; the gate exists because VideoProcess's signature is uniform.
-    if (!rd::VideoProcess(in_path, seg_path, opt, info, seg_gate,
+    // Same gate, published once by the caller above and reused for every segment.
+    if (!rd::VideoProcess(in_path, seg_path, opt, info, gate,
                           &seg_result, &error)) {
       std::fprintf(stderr, "error: segment %d: %s\n", seg + 1, error.c_str());
       failed = true;

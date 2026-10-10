@@ -16,8 +16,8 @@ defects survived in, each one a build path nobody had ever run.
 
 | | coverage | notes |
 |---|---|---|
-| clean clone builds at all | every push | the check that would have caught all five defects |
-| CPU-only build, 100 bit-exact cases vs ImageMagick | every push | 50 further cases report SKIPPED, not passed |
+| clean clone builds at all | every push | the nocuda job alone catches three of the five defects |
+| CPU-only build, 110 bit-exact cases vs ImageMagick | every push | 55 further cases report SKIPPED, not passed |
 | CUDA build compiles and links | every push | 12.8 toolkit unpacked from redist archives; no GPU on the runner |
 | OpenCL-vs-CUDA, 36 cells | manual | no GPU on the runner |
 | video probes | manual | no GPU, and no clip is committed |
@@ -26,7 +26,9 @@ A skipped check is never counted as a pass, and the CPU job asserts that at leas
 real cases actually ran — because a suite that skips nearly everything and exits 0 is
 worse than a failing one.
 
-Both jobs are green on every push. Getting there took three fixes in the CUDA job alone —
+Three jobs run on every push. The two that gate — `nocuda` and `cuda` — are green; the
+third, `linux`, is `continue-on-error: true` and does not block. Getting there took three
+fixes in the CUDA job alone —
 every one of them in code written minutes earlier and never run — and a hunt for a
 *buildable* ImageMagick on a runner that ships only the runtime. All of it is recorded in
 [the workflow](.github/workflows/ci.yml) and [docs/DESIGN.md](docs/DESIGN.md) so nobody
@@ -36,9 +38,10 @@ repeats it. Two facts out of that hunt matter to you:
   `pwsh -File tools/install-imagemagick.ps1` — 21 s, pinned to 7.1.2-31 Q16-HDRI. It
   asserts every file the build needs and reads back the version it got, because a prefix
   that installs cleanly can still be unbuildable.
-- `CMakeLists.txt` and `build.cmd` therefore accept **two** ImageMagick layouts: the
-  official Windows one, and a conda prefix, which puts headers under
-  `Library\include\ImageMagick-7` and names its libraries `MagickCore-7.Q16HDRI.dll.lib`.
+- `CMakeLists.txt` and `build.cmd` therefore accept **three** ImageMagick layouts: the
+  official Windows one, a conda prefix, which puts headers under
+  `Library\include\ImageMagick-7` and names its libraries `MagickCore-7.Q16HDRI.dll.lib`,
+  and a system one on Linux.
 
 ```
 rdither --colors 16 photo.png out.png
@@ -249,7 +252,7 @@ rdither --colors 16 --engine opencl photo.png out.png
 ```
 
 **That identity is measured, not asserted: 36 of 36 comparison cells are
-bit-identical to CUDA** — four images × colour counts × three block sizes, via
+bit-identical to CUDA** — six images × two colour counts × three block sizes, via
 `tools\probe-opencl-exact.ps1`. It is also the only path for a non-NVIDIA GPU, and
 it now works from a clean clone: download the 1.1 MB Khronos SDK, unpack it beside
 this repository, and `build.cmd` enables the engine. No install step and nothing
@@ -309,9 +312,9 @@ dithering is held constant:
 | | vs `yuv444` | vs `rgba64` |
 |---|---|---|
 | `yuv444` | — | 28.0 dB |
-| `yuv420` | **5.8 dB** | 5.8 dB |
+| `yuv420` | **34 dB** | not measured |
 
-**5.8 dB is not a colourimetric nuance, it is a different picture.** If you have 4:2:0
+**34 dB is not a colourimetric nuance, it is a different picture.** If you have 4:2:0
 footage and care about fidelity, use `yuv444` or `rgba64`. On a true 4:4:4 source every
 mode agrees exactly (`yuv444` vs `rgba64` is AE 0), so the choice only bites for 4:2:0
 input - which is most real footage.
@@ -332,7 +335,7 @@ fewer bytes: it reconstructs 2x2 chroma on the device, which is real work that c
 much of the saving. **`yuv420` stays off the default for that reason.** (5% is also
 inside this machine's 10-25% run-to-run drift between identical binaries, so treat it as
 indicative rather than settled; `yuv444` is the default because it is not clearly worth
-the 5.8 dB.)
+the 34 dB.)
 
 **Output.** `--video-pix-fmt` defaults to `yuv444p` and that default is load-bearing:
 `yuv420p` output subsamples chroma over 2×2 blocks, averaging away the dither pattern
@@ -370,7 +373,7 @@ the dither being saturated rather than stalled); `--frames`, `--batch-frames` an
 
 **RAM.** The queue is sized first and the worker count trimmed to fit it, because a deep
 queue with fewer workers beats a shallow one with more. `[ram]` on every run reports the
-real figure — 42 slots + a 782 MiB reserve ≈ 824 MiB peak at 1080p, with the reserve
+real figure — 42 slots + a 768 MiB reserve ≈ 810 MiB peak at 1080p, with the reserve
 dominating. `--mem-fraction` sets the share of physical RAM the queue may use (default
 about a third) and `--max-ram-mb` caps it absolutely; frames beyond the budget spill to
 disk rather than failing.
@@ -383,9 +386,19 @@ footage), all defaults, on a **Xeon E5-2620 v3 @ 2.40 GHz**, 6 cores / 12 thread
 
 ```
 palette    : 16 colours from 256 sampled frame(s), 128x128 montage, 64.0 MiB, 28676.7 ms, mean saturation 22.1%, 9 near-neutral
-frames     : 18001 in 352.51 s (51.1 fps)
-busy time  : palette 28677 | decode 270944 | dither 222857 | encode 153089 | wall 352507 ms
+frames     : <frames> in <total> s (<fps> fps, palette included)
+             <fps> fps over the <pipeline> s window the progress bar covers (excludes the <palette> s palette)
+busy time  : wall <total_ms> ms (palette <palette_ms> of it)
+             summed worker time: decode <decode> | dither <dither> | encode <encode>
+             writer <convert+pipe> ms of that encode figure: <convert> ms float->uint16 on the host, <pipe> ms pushing the pipe
 ```
+
+Line shapes as of `67f529e`, read off `src/rd_cli.cpp:332`, `:347`, `:359` and `:367`.
+Placeholders, not a transcript: the four lines above the `busy time` block are the ones
+this section had quoted, and they are kept because the decode/dither/encode figures are
+what `[63% of it is decode and encode](#what-the-fps-number-means-in-practice)` is
+computed from. `convert_ms` and `pipe_ms` are a partition of the encode figure; the three
+beside them are summed worker time across threads and can exceed the wall clock.
 
 **Read that as elapsed time, not as a benchmark.** 300 s of footage took 353 s, so:
 
@@ -502,7 +515,8 @@ block walk on host workers, so it is still the approximation above — on paper 
 check the GPU is not lying to you without a second GPU.
 
 **It is now trustworthy for that.** The host path agrees with CUDA **byte for byte** on
-video, at every `--batch-frames` from 1 to 30, in `yuv444`, `yuv444-prepass` and
+video, at `--batch-frames` 1 and 16 (the two the oracle exercises, plus 16 being the
+default), in `yuv444`, `yuv444-prepass` and
 `rgba64`, and at 1920x1080 as well as 320x180 — so `--no-gpu` measures the GPU rather
 than the host. Getting there took three fixes, all found by running two builds on one
 machine and comparing decoded pixels, because `probe-video-exact` compares two *device*
@@ -529,7 +543,7 @@ output, `libx264 yuv444p crf 12` → 15191, `libx264 yuv420p` → 36031. Use
 28× the bitrate.
 
 **What *is* verified for the GPU engines**: that `blocks` and `opencl` agree with each
-other byte-for-byte, per pixel, on 54 cases including alpha input, and on 60 frames of
+other byte-for-byte, per pixel, on 36 cases including alpha input, and on 60 frames of
 1080p video — and that both are deterministic across repeated runs. The OpenCL port
 was built against that bar specifically, because `rd_riemersma.h` defines the two
 engines as having the same partition and the same arithmetic, which makes "identical or
@@ -600,7 +614,7 @@ rdither --list-dithers                      # what is registered
 rdither --dither bayer --colors 16 in.png out.png
 ```
 
-`examples/bayer_dither.cc` is a complete, working second algorithm in about 40 lines,
+`examples/bayer_dither.cc` is a complete, working second algorithm in about 170 lines,
 built into the default binary. It exists to prove the seam works rather than to be useful
 — ordered dithering has visible 8×8 texture where Riemersma has none, and its threshold
 is applied as a brightness offset that is a no-op at this bit depth. For a dither you

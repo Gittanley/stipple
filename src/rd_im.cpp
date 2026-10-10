@@ -723,8 +723,13 @@ bool ImAdoptPaletteFromColormap(const LoadedImage& image, int colors,
     return false;
   }
   int n = 0;
+  // How many colours the IMAGE holds, as opposed to how many are kept.  `expect_colors` is
+  // validated against this, never against the trimmed count -- that distinction is the whole
+  // bug.  Clamping first and comparing afterwards compares the file against itself and always
+  // passes.
+  int n_held = 0;
   if (img->colors > 0 && img->colormap != nullptr) {
-    n = static_cast<int>(img->colors);
+    n = n_held = static_cast<int>(img->colors);
     if (colors > 0 && n > colors) n = colors;
     for (int i = 0; i < n; ++i) {
       const PixelInfo& e = img->colormap[i];
@@ -740,6 +745,12 @@ bool ImAdoptPaletteFromColormap(const LoadedImage& image, int colors,
     // palette image -- without depending on which coder produced it.
     const int limit = colors > 0 ? colors : kMaxColormapSize;
     n = 0;
+    // -1 means "stopped at the cap, so the image holds MORE than limit and the exact count is
+    // unknown".  That is still enough to reject, and it avoids scanning the whole image: the
+    // loop below is O(w*h*n), so running it to completion on a full photograph would be a
+    // denial of service dressed as a validation.  A palette image is a swatch strip, so the
+    // cap is normally never reached and the exact count lands here instead.
+    n_held = -1;
     const std::size_t w = img->columns, h = img->rows;
     std::vector<Quantum> buffer(w * h * 3);
     if (ExportImagePixels(img, 0, 0, w, h, "RGB", QuantumPixel, buffer.data(),
@@ -771,6 +782,33 @@ bool ImAdoptPaletteFromColormap(const LoadedImage& image, int colors,
       *error = "the image has neither a colormap nor readable pixels";
       return false;
     }
+    // Ran off the end of the image without hitting the cap, so what we collected IS the whole
+    // palette rather than a prefix of it.
+    if (n < limit) n_held = n;
+  }
+  // THE VALIDATION, mirroring rd_im.cpp:1166 on the .txt path.  `colors` here is
+  // `--colors`, and include/rd_im.h:149-153 promises it "is validated, not applied": a
+  // disagreeing file is REJECTED with both numbers in the message.
+  //
+  // This is compared against `n_held`, the count the IMAGE holds, never against `n`, the count
+  // after the clamp above.  Comparing the trimmed count is comparing the file against itself:
+  // `if (colors > 0 && n > colors) n = colors;` guarantees n == colors whenever the image was
+  // too big, so the check could never fail in exactly the case it exists to catch.  That is how
+  // a 6-colour PNG was accepted at `--colors 16`, dithered to 6, exit 0, no message -- while
+  // the identical palette as .txt was refused.
+  if (colors > 0 && n_held != colors) {
+    if (n_held < 0) {
+      *error = "the palette image holds more than " + std::to_string(colors) +
+               " colours, which is what --colors says; the two disagree, so the palette "
+               "was not used.  Pass the image's own count as --colors, or pass "
+               "--colors 0 to accept the image as it is.";
+    } else {
+      *error = "the palette image holds " + std::to_string(n_held) +
+               " colours but --colors is " + std::to_string(colors) +
+               "; the two disagree, so the palette was not used.  Pass the image's own "
+               "count as --colors, or pass --colors 0 to accept the image as it is.";
+    }
+    return false;
   }
   palette->count = n;
   palette->associate_alpha = false;

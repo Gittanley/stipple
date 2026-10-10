@@ -222,8 +222,17 @@ if "%WITH_CUDA%"=="OFF" (
   echo   cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_WITH_CUDA=OFF -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
   cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_WITH_CUDA=OFF -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
 ) else (
-  echo   cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
-  cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
+  REM RD_WITH_CUDA=ON is passed EXPLICITLY, not left to CMakeLists.txt:21's default of ON.
+  REM Omitting -D does not reset a value already in build\CMakeCache.txt, so after one
+  REM `build.cmd --no-cuda` the cache holds RD_WITH_CUDA=OFF and every later plain
+  REM `build.cmd` silently kept building the CPU engine only -- while still printing
+  REM "[ok] CUDA Toolkit: ..." from the presence check above, because that check only
+  REM looks for nvcc and never asks CMake what it decided.  The flag that lies.
+  REM
+  REM A GPU build is also the only build whose gate can run the `video`, `unvisited pixel`
+  REM and `host oracle` stages; the CPU-only one skips all three.
+  echo   cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_WITH_CUDA=ON -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
+  cmake -S . -B build -G "!CMAKE_GEN!" !CMAKE_ARCH! -DRD_WITH_CUDA=ON -DRD_IMAGEMAGICK_ROOT="%RD_IMAGE_MAGICK%"
 )
 if errorlevel 1 (
   echo.
