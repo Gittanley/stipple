@@ -22,6 +22,11 @@
 
 namespace {
 
+// Largest --max-ram-mb / --max-vram-mb value whose * 1024 * 1024 does not wrap a
+// 64-bit std::size_t to zero.  2^44 - 1, about 16 exabytes.  One constant for both
+// flags so the two parse-site checks cannot drift apart from each other.
+constexpr std::size_t kMaxBudgetMb = (std::size_t{1} << 44) - 1;
+
 struct Options {
   // Every flag name the user actually typed, in order.  Recorded because "was this
   // passed?" cannot be recovered from a field's value: --palette-budget-ms defaults
@@ -1115,12 +1120,48 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: --max-ram-mb expects a number\n");
         return 2;
       }
+      // RANGE CHECK, and it is not defensive padding.  Both budget flags are stored in
+      // megabytes and multiplied by 1024*1024 at the point of use (rd_cli.cpp:1785 for
+      // RAM, :2099 for VRAM), in std::size_t, which is 64-bit unsigned.  So any value at
+      // or above 2^44 MB wraps that multiply to zero: 2^44 * 2^20 == 2^64 == 0 mod 2^64.
+      //
+      // Measured before this existed, at exactly 2^44:
+      //
+      //     rdither --colors 16 --max-ram-mb 17592186044416 in.png out.png
+      //     pixels     : disk (memory-mapped spill file) (0.6 MiB)
+      //     ...
+      //     exit 0
+      //
+      // A ZERO budget, which is the exact inverse of the request: the largest number the
+      // flag accepts produced the smallest behaviour it has, and nothing said so.  The
+      // output image is correct, so there is no visible symptom either -- it just quietly
+      // spilled a whole render to disk because somebody typed a big number.
+      //
+      // 2^44 - 1 is the largest value the multiply cannot wrap, and it is about 16
+      // exabytes, so nothing legitimate is refused by this bound.
+      if (mb > kMaxBudgetMb) {
+        std::fprintf(stderr,
+                     "error: --max-ram-mb must be 0..%llu (that is 2^44-1; a larger "
+                     "value overflows to zero and inverts the request)\n",
+                     static_cast<unsigned long long>(kMaxBudgetMb));
+        return 2;
+      }
       opt.max_ram_mb = mb;
     } else if (arg == "--max-vram-mb") {
       if (!NeedsValue(argc, i, "--max-vram-mb")) return 2;
       std::size_t mb = 0;
       if (!ParseSize(argv[++i], &mb)) {
         std::fprintf(stderr, "error: --max-vram-mb expects a number\n");
+        return 2;
+      }
+      // Same overflow, same bound, same reason -- see --max-ram-mb above.  Verified by
+      // reading rather than by running: this one only bites on a GPU build, and the
+      // multiply at :2099 has the identical shape.
+      if (mb > kMaxBudgetMb) {
+        std::fprintf(stderr,
+                     "error: --max-vram-mb must be 0..%llu (that is 2^44-1; a larger "
+                     "value overflows to zero and inverts the request)\n",
+                     static_cast<unsigned long long>(kMaxBudgetMb));
         return 2;
       }
       opt.max_vram_mb = mb;
