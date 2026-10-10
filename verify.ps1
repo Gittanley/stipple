@@ -7,7 +7,30 @@
        pixel-for-pixel;
     2. `magick compare -metric AE`, an independent path through the CLI.
 
-  Exit code 0 means every case reported AE=0 on both engines.
+  Every case is checked twice:
+    1. rdither --verify, which runs IM's full pipeline internally and diffs
+       pixel-for-pixel;
+    2. `magick compare -metric AE`, an independent path through the CLI.
+
+  EXIT CODES -- these are load-bearing, and 4 was added on 2026-10-10 because the suite
+  could not otherwise tell a caller "everything passed" from "something could not run":
+
+    0  every stage ran and passed.  Reachable only with -Slow, or when nothing is skipped.
+    1  a stage FAILED.
+    2  a stage did not run for an INCIDENTAL reason -- a missing fixture, a -Fast run, a
+       probe that could not start.  A gap.  Not a pass, not a failure.
+    3  the -BudgetMinutes watchdog fired.  The run did not finish, so it neither passed nor
+       failed and must not be read as either.
+    4  PASS WITH DECLARED EXCLUSIONS.  Everything that ran passed, and everything that did
+       not run is OFF BY DEFAULT and named in the output with the switch that runs it.
+       This is the exit code of the DEFAULT invocation, and it is a good result: it means
+       `palette overlap` (295 s, gating a flag that ships off) was deliberately excluded,
+       not skipped by accident.
+
+  Before 4 existed, the default invocation exited 2 forever, even on a tree where every
+  stage passed. A red light nobody can act on trains people to ignore it, which is the same
+  failure as a green that means nothing -- and it is the same shape of bug this suite exists
+  to catch, living in the suite itself.
 #>
 param(
   [string]$Rdither   = ".\build\Release\rdither.exe",
@@ -142,10 +165,34 @@ if ($BudgetMinutes -gt 0) {
 # a third of the suite never ran.  The list is printed in the summary, which makes the
 # gap greppable, and its non-emptiness decides the exit code below.
 $stagesSkipped = [System.Collections.Generic.List[string]]::new()
+# Stages skipped because they are OFF BY DEFAULT -- reachable, documented, and re-runnable
+# with a named switch.  Kept apart from the incidental skips below because the two deserve
+# DIFFERENT exit codes, and merging them is what made this suite unreadable.
+#
+# The reason this exists: `palette overlap` (295 s, gating a flag that ships OFF) moved behind
+# -Slow, and every default run then exited 2 forever -- on a perfect tree. An exit code that
+# is red for a reason nobody can act on trains people to ignore it, which is the same failure
+# as a green that means nothing. So:
+#
+#   exit 4  every stage that ran passed, and everything NOT run is off by default and named
+#           below with the switch that runs it.  This is a PASS with declared exclusions.
+#   exit 2  something did not run for an INCIDENTAL reason -- a missing fixture, a -Fast run,
+#           a probe that could not start.  That is a gap, and it stays a gap.
+#
+# The distinction is the whole point. 4 says "here is what I did not cover and here is how to
+# cover it"; 2 says "I could not cover something and you should not assume it is fine".
+$stagesOffByDefault = [System.Collections.Generic.List[string]]::new()
 function Skip-Stage([string]$Name, [string]$Why) {
   $stagesSkipped.Add("$Name ($Why)")
   Write-Host ""
   Write-Host "$Name : SKIPPED ($Why)" -ForegroundColor Yellow
+}
+# The same, but recorded as a DELIBERATE exclusion rather than a gap.
+function Skip-ByDefault([string]$Name, [string]$Why) {
+  $stagesSkipped.Add("$Name ($Why)")
+  $stagesOffByDefault.Add("$Name ($Why)")
+  Write-Host ""
+  Write-Host "$Name : OFF BY DEFAULT ($Why)" -ForegroundColor Yellow
 }
 
 # `magick compare -metric AE` reports its metric on stderr, which PowerShell
@@ -524,7 +571,7 @@ if ($Slow) {
     }
   }
 } else {
-  Skip-Stage 'palette overlap' 'off by default: 295 s, and it gates a flag that ships OFF (KNOWN-ISSUES 4).  Run verify.ps1 -Slow.'
+  Skip-ByDefault 'palette overlap' '295 s, and it gates a flag that ships OFF (KNOWN-ISSUES 4).  Run verify.ps1 -Slow.'
 }
 
 # And a ninth: whether splitting the decode across N seek-based ffmpeg processes is
@@ -695,10 +742,20 @@ Write-Host ""
 if ($stagesSkipped.Count -eq 0) {
   Write-Host "coverage: every stage ran.  0 skipped." -ForegroundColor Cyan
 } else {
-  Write-Host ("coverage: {0} stage(s) SKIPPED and therefore NOT covered by this run:" -f $stagesSkipped.Count) -ForegroundColor Yellow
-  foreach ($s in $stagesSkipped) { Write-Host "    $s" -ForegroundColor Yellow }
-  Write-Host "A skipped stage is not a passing stage.  The bit-exact tally above does not" -ForegroundColor Yellow
-  Write-Host "include them and no number in this run covers them." -ForegroundColor Yellow
+  $gaps = $stagesSkipped.Count - $stagesOffByDefault.Count
+  if ($gaps -eq 0) {
+    Write-Host ("coverage: every stage that ran passed. {0} stage(s) are OFF BY DEFAULT and" -f $stagesOffByDefault.Count) -ForegroundColor Cyan
+    foreach ($s in $stagesOffByDefault) { Write-Host "    $s" -ForegroundColor Cyan }
+    Write-Host "Each is named with the switch that runs it.  Nothing below covers them." -ForegroundColor Cyan
+  } else {
+    Write-Host ("coverage: {0} stage(s) did not run and are NOT covered by this run:" -f $stagesSkipped.Count) -ForegroundColor Yellow
+    foreach ($s in $stagesSkipped) { Write-Host "    $s" -ForegroundColor Yellow }
+    if ($stagesOffByDefault.Count -gt 0) {
+      Write-Host ("  of which {0} are off by default and {1} are gaps:" -f $stagesOffByDefault.Count, $gaps) -ForegroundColor Yellow
+    }
+    Write-Host "A stage that did not run is not a passing stage.  The bit-exact tally above" -ForegroundColor Yellow
+    Write-Host "does not include them and no number in this run covers them." -ForegroundColor Yellow
+  }
 }
 
 if ($stagesSkipped.Count -gt 0) {
@@ -708,13 +765,35 @@ if ($stagesSkipped.Count -gt 0) {
     Write-Host "stages listed above; do not read 0 as a full-suite pass." -ForegroundColor Yellow
     exit 0
   }
+  # THE EXIT CODE DEPENDS ON WHY A STAGE DID NOT RUN, not only on whether one did.
+  #
+  #   4 -- everything skipped is off by DEFAULT: named above, with the switch that runs it.
+  #        This is a PASS with declared exclusions, and it is reachable on the default
+  #        invocation, which exit 2 was not.  `palette overlap` moved behind -Slow in this
+  #        commit and every default run then exited 2 forever, on a tree where everything
+  #        passed -- so a caller could not tell a healthy suite from a broken one, and the
+  #        habit that forms is to ignore the code.  A red light nobody can act on is
+  #        functionally a light that is off.
+  #
+  #   2 -- something did not run for an INCIDENTAL reason: a missing fixture, a -Fast run,
+  #        a probe that could not start.  That is a GAP and stays one.
+  #
+  # 0 is still unreachable without -AllowPartial, and 1 is still failure.
+  $gaps = $stagesSkipped.Count - $stagesOffByDefault.Count
+  if ($gaps -eq 0) {
+    Write-Host "Exiting 4: PASS with declared exclusions.  Everything that ran passed; the" -ForegroundColor Cyan
+    Write-Host "stage(s) above are off by default and the switch to run each is named there." -ForegroundColor Cyan
+    Write-Host "For full coverage run: verify.ps1 -Slow" -ForegroundColor Cyan
+    exit 4
+  }
   # 2, not 1: nothing failed, and 1 is reserved for that.  2 is this suite's existing
   # "cannot run / not covered" code, which is exactly what a -Fast run is.  It was 0.
   # $($stagesSkipped.Count), not $stagesSkipped.Count: inside a double-quoted string
   # PowerShell interpolates the collection and then emits a literal ".Count", so the
   # uncorrected form printed the whole skip list followed by ".Count".
-  Write-Host "Exiting 2: $($stagesSkipped.Count) stage(s) did not run.  This is not a pass and not a" -ForegroundColor Yellow
-  Write-Host "failure.  Use -AllowPartial if you need exit 0 from a deliberately partial run." -ForegroundColor Yellow
+  Write-Host "Exiting 2: $gaps of the $($stagesSkipped.Count) stage(s) above did not run for a" -ForegroundColor Yellow
+  Write-Host "reason that is not a declared exclusion.  Not a pass and not a failure." -ForegroundColor Yellow
+  Write-Host "Use -AllowPartial if you" -ForegroundColor Yellow
   exit 2
 }
 exit 0
