@@ -97,17 +97,18 @@
 #
 #   Measured, both sides dithering against the SAME forced palette
 #   (notes/video-block-queue-restart.md):
-#     image path                        6.3 px  (0.001%)
-#     video, --blocks 512 (default)   229.5 px  (0.40%)
-#     video, --blocks 65536 (1 block) 186.7 px  (0.32%)
+#     image path                        7.5 px  (0.013%)
+#     video, --blocks 512 (default)   203.6 px  (0.354%)
+#     video, --blocks 16              309.8 px  (0.538%)
 #
 # Monotonic in block size, converging toward the image path -- the signature of the restart.
 # `--help` has always admitted the cost ("--blocks 32 deviates 3.4x more from IM's output").
 #
 # So the bound is what has value.  A palette regression or a channel misread moves it by an
 # ORDER OF MAGNITUDE -- the green-grey bug was not 0.4% off, it was 7 of 16 entries pure
-# green -- so a 2% ceiling is insensitive to the block structure and still catches that
-# class by a wide margin.
+# green -- while the block structure moves it by a factor of 1.5.  A ceiling of 1.0% sits
+# between those, set from the worst value measured across six colour counts and five block
+# lengths rather than from one sample.
 #
 # CPU ENGINE ONLY.  The GPU engines deviate from IM by design (~1.7% at --blocks 512, ~6.1%
 # at --blocks 32), so asserting them here would report a documented, intended difference as a
@@ -460,9 +461,33 @@ if (-not $magick) {
         } else {
           # The CEILING, and why it is a ceiling rather than AE=0, is in the header: the
           # blocks walk zeroes its error queue per block and the reference does not.
-          # Measured baseline 0.40% at the default --blocks 512; 2% is ~5x that, far below
-          # any palette or channel fault and far above the block structure.
-          $CeilingPct = 2.0
+          #
+          # MEASURED ENVELOPE, not a guess and not one sample.  Every point is rgb24 in
+          # ffv1, palette exported from the image path and forced onto ImageMagick with
+          # -remap, so both sides dither the same colours and only the dither differs.
+          # Across colour count, at --blocks 512:
+          #
+          #     --colors  4 ( 4 entries)  0.421%      --colors 32 (24 entries)  0.110%
+          #     --colors  8 ( 8 entries)  0.339%      --colors 64 (45 entries)  0.099%
+          #     --colors 12 (11 entries)  0.353%
+          #     --colors 16 (14 entries)  0.354%
+          #
+          # Across block length, at 14 palette entries -- the dominant axis:
+          #
+          #     --blocks   16   0.538%     --blocks  512   0.354%
+          #     --blocks   32   0.513%     --blocks 4096   0.348%
+          #     --blocks   64   0.460%
+          #
+          # So the worst observed value across both axes is 0.538%.  The ceiling is 1.0%:
+          # roughly 1.9x the worst case measured, which is enough that the number does not
+          # move when the machine is busy, and tight enough that a regression has to be a
+          # real one to get through.
+          #
+          # IT WAS 2.0% BEFORE, which was a number picked off a single 0.354% sample --
+          # 5.6x headroom, so anything up to 1.9% would have passed.  A ceiling with that
+          # much slack is not a guard.  The envelope above is what makes 1.0 defensible, and
+          # it took six colour counts and five block lengths to earn it; one run does not.
+          $CeilingPct = 1.0
           $aeText = (& cmd /c "`"$magick`" compare -metric AE `"$gotPng`" `"$refPng`" null: 2>&1" | Out-String).Trim()
           # This ImageMagick reports a NORMALISED metric -- "229.48 (0.00398402)" -- not a
           # bare integer.  The count is the first token and the fraction is the second; a
