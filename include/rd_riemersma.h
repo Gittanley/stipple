@@ -141,8 +141,17 @@ inline constexpr int kNoMove = -1;
 // 4^L entries in total, which is also the cell count of the 2^level grid.  The
 // leaves cover every cell except the grid's *last* one; ForgetGravity then
 // visits the origin, which was already the first leaf.  So the grid's last cell
-// is never dithered at all -- which is why a 1920x1080 frame at level 11 leaves
-// exactly one pixel at its source value, and why ImageMagick itself does.
+// is never dithered at all.
+//
+// IT DOES NOT FOLLOW that a 1920x1080 frame at level 11 leaves one pixel unvisited, and
+// this comment used to say exactly that. Recomputing the closed form over [0, 4^11 - 1)
+// puts the in-bounds entries at exactly width * height with an EMPTY unvisited set: the
+// one cell the curve never reaches is (2^11 - 1, 0) = (2047, 0), which is OFF-IMAGE at
+// width 1920. The rule is stated correctly 300 lines away in rd_blocks_cuda.cu:1140 and in
+// rd_riemersma_cpu.cpp:390-394, and both say 0.
+//
+// What IS true, and what probe-unvisited-pixel.ps1 measures: the gap lands inside the
+// image when width is a power of two AND width >= height. 1920 is neither.
 inline std::size_t CurveEntryCount(int level) {
   return (level <= 0) ? 0 : (static_cast<std::size_t>(1) << (2 * level));
 }

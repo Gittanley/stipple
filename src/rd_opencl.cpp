@@ -1711,7 +1711,7 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // ever show up as compression noise in an encoded file.
   //
   // The float path is the reference because it is already verified bit-identical
-  // to the CUDA engine on all 54 cells of tools/probe-opencl-exact.ps1.  So this
+  // to the CUDA engine on all 36 cells of tools/probe-opencl-exact.ps1.  So this
   // needs no new fixture and no new reference: the strong test is already green,
   // and this just checks the new kernels against it.
   //

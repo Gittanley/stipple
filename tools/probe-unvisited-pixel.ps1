@@ -58,9 +58,14 @@ param(
   [string]$Rdither = "",
   [string]$Ffmpeg  = "",
   [int]$Colors = 16,
-  # Geometries to sweep.  These are the ones that were measured, not a guess: the
-  # first six have no unvisited pixel and the last four do.  Both halves matter --
-  # a geometry that should report one and does not is a silent regression too.
+  # Geometries to sweep.  These are the ones that were measured, not a guess.
+  #
+  # The summary below used to say "the first six have no unvisited pixel and the last four
+  # do", which described a ten-geometry list.  Four more were added at the end without
+  # updating it, and the last run reports "6 of 6 geometries asserted and ok, 0 failed, 8
+  # have no unvisited pixel to check" -- so it is SIX with one and EIGHT with none.  Do not
+  # describe this list by position; read it.  Both halves matter -- a geometry that should
+  # report one and does not is a silent regression too.
   #
   # 4096x2160 was MISSING and is in the break set.  The condition is derived, not
   # guessed: the missing cell is (2^level - 1, 0), so it is inside the image exactly

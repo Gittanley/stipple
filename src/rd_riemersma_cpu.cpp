@@ -306,6 +306,23 @@ std::size_t BuildCurveIndex(int level, std::size_t width,
   // the sequence is one longer than width*height.  (Established by comparing
   // against BuildCurveSequence: every one of the 4^level cells matches the
   // closed form exactly, and only this final entry needs stating explicitly.)
+  //
+  // (CORRECTION: that parenthetical cites BuildCurveSequence as its authority, and
+  // BuildCurveSequence is the function with the bug. Circular. The CELLS match --
+  // SelfTestCurveMatchesRecursion reports 0 mismatches -- but BuildCurveSequence's
+  // TRAILING entry is wrong: it declares `int x = 0, y = 0` and its WalkCurve lambda
+  // takes `vx, vy` as PARAMETERS without ever writing x or y, so `out[n] = (x, y)`
+  // always emits (0,0). The real resting cursor is (2^level - 1, 0), measured at
+  // levels 1..10, and it is precisely the cell the leaves never cover -- so
+  // BuildCurveSequence re-dithers the origin and never dithers the gap.
+  //
+  // Nothing that DITHERS calls BuildCurveSequence: its callers are rd_cli.cpp's
+  // --dump-curve, the self-test's mismatch dump, and this file's line 195.
+  // RiemersmaWalkCpu tracks the cursor properly (:355-367) and RiemersmaBlocksCpu derives
+  // its own from HilbertPoint. So this is a wrong DIAGNOSTIC and a self-test that cannot
+  // catch this class -- not wrong output. The stderr note below inherits the same false
+  // claim: it says the gap pixel "is what ImageMagick's own recursion leaves there", and
+  // ImageMagick dithers it.)
   out->push_back(0);
 
   // Last writer wins, matching the sequential final write.
@@ -705,8 +722,15 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
     //
     // Driven off `cached.unvisited`, a list rather than an index, so a future
     // ComputeCurveLevel that produces more than one gap cannot silently leave the rest
-    // unwritten.  Four measured geometries have exactly one (1024x768, 1024x1024,
-    // 2048x2048, 4096x2160); the other six have none.
+    // unwritten.
+    //
+    // SIX of probe-unvisited-pixel.ps1's fourteen geometries have exactly one (512x480,
+    // 256x192, 1024x768, 1024x1024, 2048x2048, 4096x2160) and eight have none.  This line
+    // used to say "four ... the other six", which enumerates ten -- a count from before
+    // 512x480 and 256x192 were added to the probe, and the same error the fuller comment at
+    // :390-393 above had already been corrected for.  A fix that reached one comment and not
+    // the other two.  Measured: "6 of 6 geometries asserted and ok, 0 failed, 8 have no
+    // unvisited pixel to check".
     if (fused) {
       for (std::int32_t p : cached.unvisited) {
         const std::size_t pixel_index = static_cast<std::size_t>(p);

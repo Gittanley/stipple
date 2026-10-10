@@ -3503,10 +3503,17 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // false here, which read as a decision and was not one.  The only reader of the field
   // is RiemersmaWalkCpu -- the memo table is allocated at rd_riemersma_cpu.cpp:334-336
   // and consulted at :71 and :85 inside Visit, and Visit is called only from
-  // RiemersmaWalkCpu (:346, :356, :364).  This file never calls it: the video path
-  // calls RiemersmaBlocksCpu (:396), whose inner loop walks the tree inline and is
-  // cache-free on both the host and the device precisely so the two agree
-  // ("Cache-free on both paths, so the two agree", rd_riemersma_cpu.cpp:488).
+  // RiemersmaWalkCpu (:346, :356, :364).
+  //
+  // (CORRECTION: "the only reader" was FALSE as written.  rd_riemersma_cuda.cu:583 also
+  // reads `params.use_cache`, into the kernel's `use_cache`.  The CONCLUSION below still
+  // holds -- the video path calls RiemersmaBlocksCpu, whose inner loop walks the tree
+  // inline and is cache-free on both the host and the device precisely so the two agree
+  // ("Cache-free on both paths, so the two agree", rd_riemersma_cpu.cpp:612) -- but the
+  // premise it rested on was wrong, and a comment that reaches for "only" should be
+  // checked against every reader rather than the one that was in mind.)
+  //
+  // This file never calls it: the video path
   //
   // So the assignment set a flag no code in the video path could observe, and the
   // default already said the same thing.  Zero behavioural difference: `false` and

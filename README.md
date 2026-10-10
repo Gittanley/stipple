@@ -702,7 +702,7 @@ Beyond that suite, `verify.ps1` also runs:
 | Check | What it proves | Result |
 |---|---|---|
 | `tools\probe-determinism.ps1` | repeated runs give identical pixels and identical files | 6/6 |
-| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 54 image cells | 54/54 |
+| `tools\probe-opencl-exact.ps1` | OpenCL == CUDA, per pixel, on 36 image cells | 36/36 |
 | `tools\probe-video-exact.ps1` | OpenCL == CUDA on 60 frames of 1080p, **both data paths**, and no frames lost | 2/2 identical |
 | `tools\probe-video-determinism.ps1` | the same video command 8× over is the same pixels and the same frame count, on each of the three engines | 3/3 |
 | `tools\probe-unvisited-pixel.ps1` | the pixel the walk never visits keeps its source value, on 14 geometries | 6 of 14 have one; 8 have none to check |
