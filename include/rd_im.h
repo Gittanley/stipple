@@ -146,9 +146,10 @@ bool ImWritePalette(const Palette& palette, const std::string& path,
 //
 //                  The fix is a wider format, not a better comment, and it is not
 //                  written: %.6f would round-trip these values exactly and costs
-//                  nothing but bytes.  Until then, export-then-import is reproducible
-//                  to one decimal place, not exactly.  Do not describe it as
-//                  bit-exact in output, in docs, or to a user.
+//                  nothing but bytes.  NOW WRITTEN AT %.6f WITH AN a COLUMN, so
+//                  export-then-import preserves every colour value exactly and
+//                  carries alpha; verified by probe-palette-parity.ps1.  A legacy
+//                  five-token file still reads, with alpha assumed opaque.
 //
 //                  The hex column is 8-bit and is ignored on read -- it is there
 //                  for a human, and preferring it would silently quantise further.
@@ -163,7 +164,15 @@ bool ImWritePalette(const Palette& palette, const std::string& path,
 // file holding a different number of colours is REJECTED with both numbers in
 // the message, because the two inputs disagree about the single most important
 // property of a palette and silently preferring either one produces output the
-// user did not ask for.  Pass <= 0 to accept whatever the file contains.
+// user did not ask for.
+//
+// Pass <= 0 to accept whatever the file contains -- TRUE FOR THIS FUNCTION, AND NOT
+// REACHABLE FROM THE COMMAND LINE.  rdither's own range check rejects --colors 0 with
+// "--colors must be 2..65536", so every error message that used to tell a user to pass
+// 0 was advising something the tool would refuse.  Those messages now name the file's
+// own count as the only value that works.  Widening the CLI range is a separate decision
+// because --colors means something else entirely on the DERIVE path, where 0 is not
+// "no opinion" to ImageMagick the way it is here.
 //
 // `palette` is filled; `tree` is built from it, so the imported palette is
 // immediately usable by every engine.  The tree is built from the PALETTE, not

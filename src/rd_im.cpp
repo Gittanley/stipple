@@ -800,13 +800,13 @@ bool ImAdoptPaletteFromColormap(const LoadedImage& image, int colors,
     if (n_held < 0) {
       *error = "the palette image holds more than " + std::to_string(colors) +
                " colours, which is what --colors says; the two disagree, so the palette "
-               "was not used.  Pass the image's own count as --colors, or pass "
-               "--colors 0 to accept the image as it is.";
+               "was not used.  Pass the image's own count as --colors, which is "
+               "the only value that works from the command line.";
     } else {
       *error = "the palette image holds " + std::to_string(n_held) +
                " colours but --colors is " + std::to_string(colors) +
                "; the two disagree, so the palette was not used.  Pass the image's own "
-               "count as --colors, or pass --colors 0 to accept the image as it is.";
+               "count as --colors, which is the only value that works from the command line.";
     }
     return false;
   }
@@ -1287,7 +1287,7 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
       *error = path + " holds " + std::to_string(palette->count) +
                " colours but --colors is " + std::to_string(expect_colors) +
                "; the two disagree, so the palette was not used.  Pass the file's "
-               "count as --colors, or pass --colors 0 to accept the file as it is.";
+               "count as --colors, which is the only value that works from the command line.";
       return false;
     }
     // Snap every entry to the precision the engine can actually represent,

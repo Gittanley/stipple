@@ -747,16 +747,14 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
 
   if (opt.palette_only) {
     join_palette();
-    report_palette();
+    if (report_palette() != 0) return 1;
     if (!opt.quiet) {
       std::printf("palette-only: stopping before the dither, as asked\n");
     }
-    // NOTE: report_palette()'s return value is discarded at all three call sites, so a
-    // failed --palette-export prints "error: --palette-export ..." and the run still
-    // exits 0.  That is the same shape as the bugs fixed around it -- reported, not
-    // acted on -- and it is left as found here because changing an exit code is a
-    // behaviour change the suite has never asserted either way.  Flagged rather than
-    // fixed on the quiet, because it would have meant silently widening the change.
+    // The return value was discarded here and at the other two call sites, so a failed
+    // --palette-export printed "error: --palette-export ..." and the run still exited 0.
+    // Reported and not acted on, which is the same defect shape as the ones fixed around
+    // it: the user asked for a file, did not get one, and the exit code said success.
     return 0;
   }
 
@@ -785,7 +783,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       std::fprintf(stderr, "error: %s\n", error.c_str());
       return 1;
     }
-    report_palette();
+    if (report_palette() != 0) return 1;
     PrintVideoSummary(result, opt.quiet);
     return 0;
   }
@@ -887,7 +885,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // overlap thread is the only writer of `*palette`/`*tree`/`result`, and everything below
   // reads them.
   join_palette();
-  report_palette();
+  if (report_palette() != 0) return 1;
   for (int seg = 0; seg < seg_count; ++seg) {
     if (done[static_cast<std::size_t>(seg)]) continue;
     const std::int64_t first = static_cast<std::int64_t>(seg) * seg_frames;
