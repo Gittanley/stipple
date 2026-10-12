@@ -35,7 +35,7 @@
 param(
   [string]$Rdither   = ".\build\Release\rdither.exe",
   [string]$Magick    = "magick",
-  [int[]] $Colors    = @(2, 4, 16, 64, 256),
+  [int[]] $Colors    = @(2, 4, 16, 32, 64, 256),
   [string]$ImageDir  = "tests",
   # Skip the stages that need a 1080p clip.  The full run is dominated by exactly those
   # two, and they are also the only checks that can exercise the faults found this week:
@@ -324,12 +324,19 @@ $engines = @(
 # than a wrong pixel.  A build configuration the project documents as supported was
 # reporting a failing suite.
 #
-# The cuda share is 11 fixtures x 5 colour counts = 55 of the 165 total, which is why
-# README quotes "110 passed, 55 SKIPPED" for a --no-cuda build.  That arithmetic is a
+# The cuda share is 11 fixtures x 6 colour counts = 66 of the 198 total, which is why
+# README quotes "132 passed, 66 SKIPPED" for a --no-cuda build.  That arithmetic is a
 # product of the three lists below, so it is exact and does not need re-measuring when a
 # fixture is added -- but it does need UPDATING, and did not get it when in_gray_alpha
 # and in_jpeg arrived.  Three lists, one multiplication: if you add a fixture, a colour
 # count or an engine, this number moves.
+#
+# 32 is in this list because it is the boundary the sweep used to step over: the flat
+# search is unavailable above 16 colours (rd_cuda_common.cuh:293, `colours > 16` returns
+# false) and the blocks/approx crossover measures between 16 and 24
+# (artifacts/colors32_findings.md).  So the one count where the engine changes algorithm
+# was the one count nobody ran against ImageMagick.  Its absence was a hole, not a
+# judgement: nothing here had ever compared the two at 32.
 . "$PSScriptRoot\tools\rd-engine-probe.ps1"
 $avail = Get-RdEngineAvailability -Rdither $Rdither -Engines @('cuda') -Fixture (Join-Path $ImageDir "in_grad.png")
 Write-RdEngineSkipReport -Availability $avail | Out-Null

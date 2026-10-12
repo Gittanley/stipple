@@ -69,7 +69,7 @@ faster CPU, RAM or disk makes it faster with the same GPU.
 > - **The measurements are real.** Every number in this README and in `docs/DESIGN.md`
 >   came from running the code on the machine it was written on. None of it is
 >   estimated or illustrative.
-> - **The verification is real too, and it is the point.** 165 bit-exact cases against
+> - **The verification is real too, and it is the point.** 198 bit-exact cases against
 >   ImageMagick, a 36-cell cross-engine bit-exactness sweep, a run-to-run determinism
 >   probe, and a video frame-accounting check. See [Correctness](#correctness).
 > - **Expect some things to be wrong.** An AI will confidently report work as finished
@@ -476,8 +476,8 @@ engines here and false of others, and the difference is not a detail.
 
 | What you run | Engine it uses | vs ImageMagick | Tested by |
 |---|---|---|---|
-| `--engine cpu` | sequential walk, on the CPU | **bit-exact** | 165 cases, `verify.ps1` |
-| `--engine cuda` | sequential walk, on the GPU | **bit-exact** | 165 cases, `verify.ps1` |
+| `--engine cpu` | sequential walk, on the CPU | **bit-exact** | 198 cases, `verify.ps1` |
+| `--engine cuda` | sequential walk, on the GPU | **bit-exact** | 198 cases, `verify.ps1` |
 | `--engine blocks` | block-parallel walk, CUDA | **not exact** — 1.7% of pixels differ | determinism only |
 | `--engine opencl` | block-parallel walk, OpenCL | **not exact** — 1.7% too, being identical to `blocks` | `blocks` on 36 cells + determinism |
 | `--engine approx` | iterative solver | **not exact**, by design | not covered |
@@ -675,7 +675,7 @@ examples/         bayer_dither.cc -- a worked example of a plugin
 tools/            measurement scripts (the record of how the numbers were got)
 docs/DESIGN.md    the full engineering record
 docs/OPENCL.md    the OpenCL engine: what it is, how it is verified, what is left
-verify.ps1        165 bit-exact cases against ImageMagick
+verify.ps1        198 bit-exact cases against ImageMagick
 build.cmd         build, with dependency checks
 ```
 
@@ -687,31 +687,31 @@ every one of those choices is load-bearing for bit-exactness.
 
 ## Correctness
 
-`verify.ps1` renders 165 cases and compares each against ImageMagick's own output, pixel
+`verify.ps1` renders 198 cases and compares each against ImageMagick's own output, pixel
 by pixel, with zero tolerance. It is the first thing to run when something looks wrong
 and the last thing to run before committing.
 
 ```
 > powershell -File verify.ps1
-bit-exact cases: 165 passed, 0 failed
+bit-exact cases: 198 passed, 0 failed
 ```
 
-**Read that number for what it is.** Those 165 cases run on `cpu`, `cuda` and
+**Read that number for what it is.** Those 198 cases run on `cpu`, `cuda` and
 `cpu --max-ram-mb 1` - the *sequential* walk, the one that is supposed to be exact. The
 suite is the reason the exactness claim is trustworthy, and it is also the reason the
 inexactness claims are not in any way tentative: those come from a separate measurement
 against ImageMagick's output, not from this suite, because this suite does not touch
 those engines at all. See [Where bit-exactness holds](#where-bit-exactness-holds).
 
-Without an NVIDIA GPU you will see **110 passed, 55 SKIPPED** rather than 165. The 55 are
+Without an NVIDIA GPU you will see **132 passed, 66 SKIPPED** rather than 198. The 66 are
 the `cuda` cases, and they are reported as skipped rather than quietly dropped. The split
-is exact rather than measured, because the case list is a product: **3 engines x 5 colour
-counts x 11 fixtures = 165**, so each engine owns 5 x 11 = 55, and dropping `cuda` leaves
+is exact rather than measured, because the case list is a product: **3 engines x 6 colour
+counts x 11 fixtures = 198**, so each engine owns 6 x 11 = 66, and dropping `cuda` leaves
 two. This was 100/50 while the total was 150, before `in_gray_alpha` and `in_jpeg` were
 added -- a stale pair of numbers that still divided correctly, which is the dangerous kind:
 
 ```
-bit-exact cases: 110 passed, 0 failed, 55 SKIPPED (engine not in this build)
+bit-exact cases: 132 passed, 0 failed, 66 SKIPPED (engine not in this build)
 ```
 
 Beyond that suite, `verify.ps1` also runs:
@@ -753,7 +753,7 @@ Beyond that suite, `verify.ps1` also runs:
 Every other video check here compares rdither to rdither: OpenCL to CUDA, run to run, host
 to device, batch 16 to 1. A defect shared by all their arms is **invisible to them, because
 they agree** — and three shipped that way through runs recorded as
-`EXIT=0, 165/0 bit-exact, every stage ran, 0 skipped`:
+`EXIT=0, 198/0 bit-exact, every stage ran, 0 skipped`:
 
 * the by-seek palette sampler read RGBA bytes as RGB triples, giving a green-grey palette
   with 7 of 16 entries pure green, while reporting "mean saturation 49.0%";
