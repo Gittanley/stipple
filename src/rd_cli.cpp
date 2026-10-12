@@ -320,7 +320,12 @@ int ReportInterrupted(const std::string& out_path, bool interrupted = true) {
 // says which window it is a rate over, so the two can be compared instead of guessed
 // at.  A reader who wants the bar's figure has it on the bar, marked; a reader who
 // wants end-to-end has it here.
-void PrintVideoSummary(const rd::VideoResult& result) {
+void PrintVideoSummary(const rd::VideoResult& result, bool quiet) {
+  // `quiet` is a parameter rather than a gate at the two call sites, because a gate at
+  // the call site is exactly what was missing: both callers were ungated and the flag
+  // was therefore a no-op on this function.  It is also the last of the three video
+  // reporting blocks that --quiet did not reach, with the probe lines and report_palette.
+  if (quiet) return;
   const double total_s = result.total_ms / 1000.0;
   const double pipeline_ms =
       result.total_ms > result.palette_ms ? result.total_ms - result.palette_ms : 0.0;
@@ -447,10 +452,15 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     std::fprintf(stderr, "error: %s\n", error.c_str());
     return 1;
   }
-  std::printf("source     : %s\n", in_path.c_str());
-  std::printf("video      : %dx%d, %s, %s, %lld frames @ %.3f fps\n", info.width,
-              info.height, info.codec.c_str(), info.pix_fmt.c_str(),
-              static_cast<long long>(info.frames), info.fps);
+  // These two were ungated, which is why --quiet on video printed 11 lines while the
+  // same flag on an image printed none: the image path gates every one of its prints and
+  // the video path had no gate here, on report_palette, or on PrintVideoSummary.
+  if (!opt.quiet) {
+    std::printf("source     : %s\n", in_path.c_str());
+    std::printf("video      : %dx%d, %s, %s, %lld frames @ %.3f fps\n", info.width,
+                info.height, info.codec.c_str(), info.pix_fmt.c_str(),
+                static_cast<long long>(info.frames), info.fps);
+  }
 
   // ROTATION.  ffmpeg's rawvideo output auto-rotates, so a stream carrying a 90 or
   // 270 degree display matrix arrives at the pipeline already turned -- at the
@@ -628,6 +638,28 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // The report reads the gate rather than the moved-from unique_ptr: Publish took
   // ownership with std::move, so *palette is empty from here on.
   auto report_palette = [&] {
+    // --quiet silences everything this function prints, but NOT the --palette-export
+    // side effect underneath it: a user who asked for a file still gets the file.  So the
+    // export is factored out and the reporting is guarded, rather than this returning
+    // early and skipping the write, or each of the seven printfs below being gated
+    // individually -- which is how this was missed in the first place: the image path
+    // gates every one of its prints and the video path gated none, so `--quiet` printed
+    // 11 lines on video and 0 on an image.
+    auto export_palette = [&]() -> int {
+      if (opt.palette_export.empty()) return 0;
+      if (!rd::ImWritePalette(gate.palette(), opt.palette_export, &error)) {
+        std::fprintf(stderr, "error: --palette-export %s: %s\n",
+                     opt.palette_export.c_str(), error.c_str());
+        return 1;
+      }
+      if (!opt.quiet) {
+        std::printf("palette    : written to %s (%d colours; read it back with "
+                    "--palette-from)\n",
+                    opt.palette_export.c_str(), gate.palette().count);
+      }
+      return 0;
+    };
+    if (opt.quiet) return export_palette();
     // The overlap marker.  Present iff the palette was built on its own thread, which is
     // what makes the flag's reachability checkable without timing anything.
     if (overlapped) {
@@ -702,15 +734,9 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       }
 
       if (!opt.palette_export.empty()) {
-        if (!rd::ImWritePalette(gate.palette(), opt.palette_export, &error)) {
-          std::fprintf(stderr, "error: --palette-export %s: %s\n",
-                       opt.palette_export.c_str(), error.c_str());
-          return 1;
-        }
-        std::printf("palette    : written to %s (%d colours; read it back with "
-                    "--palette-from)\n",
-                    opt.palette_export.c_str(), gate.palette().count);
+        return export_palette();
       }
+      return 0;
   };
   // Joining is what makes every read below safe, and it must happen on EVERY exit
   // path: a detached thread outliving the interrupt handler, or writing into a
@@ -722,7 +748,15 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   if (opt.palette_only) {
     join_palette();
     report_palette();
-    std::printf("palette-only: stopping before the dither, as asked\n");
+    if (!opt.quiet) {
+      std::printf("palette-only: stopping before the dither, as asked\n");
+    }
+    // NOTE: report_palette()'s return value is discarded at all three call sites, so a
+    // failed --palette-export prints "error: --palette-export ..." and the run still
+    // exits 0.  That is the same shape as the bugs fixed around it -- reported, not
+    // acted on -- and it is left as found here because changing an exit code is a
+    // behaviour change the suite has never asserted either way.  Flagged rather than
+    // fixed on the quiet, because it would have meant silently widening the change.
     return 0;
   }
 
@@ -752,7 +786,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       return 1;
     }
     report_palette();
-    PrintVideoSummary(result);
+    PrintVideoSummary(result, opt.quiet);
     return 0;
   }
 
@@ -867,9 +901,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     opt.start_frame = first;
     opt.frames_in_segment = want;
     rd::VideoResult seg_result;
-    std::printf("segment %d/%d: frames %lld..%lld -> %s\n", seg + 1, seg_count,
+    if (!opt.quiet) {
+      std::printf("segment %d/%d: frames %lld..%lld -> %s\n", seg + 1, seg_count,
                 static_cast<long long>(first),
                 static_cast<long long>(first + want - 1), seg_path.c_str());
+    }
     // Same gate, published once by the caller above and reused for every segment.
     if (!rd::VideoProcess(in_path, seg_path, opt, info, gate,
                           &seg_result, &error)) {
@@ -903,9 +939,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       failed = true;
       break;
     }
-    std::printf("segment %d/%d: done, %llu bytes, checkpointed (%zu recorded)\n",
-                seg + 1, seg_count, static_cast<unsigned long long>(bytes),
-                cp.segments.size());
+    if (!opt.quiet) {
+      std::printf("segment %d/%d: done, %llu bytes, checkpointed (%zu recorded)\n",
+                  seg + 1, seg_count, static_cast<unsigned long long>(bytes),
+                  cp.segments.size());
+    }
     // Accumulate rather than overwrite.  VideoProcess started its own clock for this
     // segment and the palette was built once, before the loop, so seg_result.total_ms
     // covers one segment only; taking it as the whole job's time reported N times too
@@ -956,8 +994,10 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     return 1;
   }
   (void)DeleteFileA(ckpt_path.c_str());
-  std::printf("output     : %s (%zu segment(s) joined)\n", out_path.c_str(),
-              cp.segments.size());
+  if (!opt.quiet) {
+    std::printf("output     : %s (%zu segment(s) joined)\n", out_path.c_str(),
+                cp.segments.size());
+  }
 
   // The throughput report.  It used to be missing here entirely: the non-segment
   // path returns through PrintVideoSummary and the segment path returned 0
@@ -974,7 +1014,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   if (result.palette_ms > 0.0) {
     result.total_ms += result.palette_ms;
   }
-  PrintVideoSummary(result);
+  PrintVideoSummary(result, opt.quiet);
   return 0;
 }
 
