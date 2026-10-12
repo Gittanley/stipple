@@ -126,6 +126,73 @@ try {
     if (-not $same) { $problems++ }
   }
 
+  # Two cases this probe did not cover when it was first written, and both were found
+  # by bugs it sailed straight past.
+
+  # ROUND-TRIP STABILITY.  The .txt form used to be described as lossless in
+  # include/rd_im.h, on the grounds that %.1f of a Q16 channel is exact because a Q16
+  # channel is an integer.  Both halves were false: in this build the channels are not
+  # integers (44 of 48 values in an exported 16-colour palette were fractional), and
+  # export -> import -> export changed every one of sixteen rows.  A description is not
+  # evidence, so this asserts it.
+  $rt1 = Join-Path $tmp 'rt1.txt'
+  $rt2 = Join-Path $tmp 'rt2.txt'
+  & $exe --video --engine cpu --colors $n --palette-export $rt1 $src (Join-Path $tmp 'rt1.mkv') 2>&1 | Out-Null
+  # The count to import with must be read back from what was WRITTEN, not from $n.
+  # Asking for --colors 14 yields 13 actual colours here: the canonical sort and the
+  # tree's dedup drop duplicates, so the requested count is an upper bound rather than
+  # a promise. Using $n made the import refuse its own export -- which is the
+  # validation working correctly and the probe guessing wrongly. This is the second
+  # time in this file that assumed a colour count instead of measuring it.
+  $rtCount = 0
+  if (Test-Path $rt1) {
+    $rtCount = @(Get-Content $rt1 | Where-Object { $_ -notmatch '^#' -and $_.Trim() }).Count
+  }
+  & $exe --video --engine cpu --colors $rtCount --palette-import $rt1 --palette-export $rt2 $src (Join-Path $tmp 'rt2.mkv') 2>&1 | Out-Null
+  if ((Test-Path $rt1) -and (Test-Path $rt2)) {
+    # TWO properties, not one, because the first version of this assertion compared the
+    # files byte-for-byte and was WRONG: the first import re-sorts canonically, so row 0
+    # legitimately moves. That is SortPaletteCanonical doing its job, not data loss.
+    # Comparing bytes reported "16 rows differ" on a format that had lost nothing.
+    #
+    #   (a) VALUES are preserved -- the colour set is unchanged. This is the lossless
+    #       claim, and it is the one that was false under %.1f.
+    #   (b) the SECOND pass is byte-identical -- normalisation is idempotent, so repeated
+    #       export/import cycles converge instead of oscillating.
+    $vals1 = @(Get-Content $rt1 | Where-Object { $_ -notmatch '^#' -and $_.Trim() } |
+               ForEach-Object { (($_ -split '\s+') | Where-Object { $_ -ne '' })[1..3] -join ',' } | Sort-Object)
+    $vals2 = @(Get-Content $rt2 | Where-Object { $_ -notmatch '^#' -and $_.Trim() } |
+               ForEach-Object { (($_ -split '\s+') | Where-Object { $_ -ne '' })[1..3] -join ',' } | Sort-Object)
+    $good = (($vals1 -join '|') -eq ($vals2 -join '|'))
+    Write-Host ("  {0} txt round trip preserves every colour value" -f $(if ($good) { 'ok  ' } else { 'FAIL' }))
+    if (-not $good) { $problems++ }
+
+    $rt3 = Join-Path $tmp 'rt3.txt'
+    & $exe --video --engine cpu --colors $rtCount --palette-import $rt2 --palette-export $rt3 $src (Join-Path $tmp 'rt3.mkv') 2>&1 | Out-Null
+    $good = (Test-Path $rt3) -and ((Get-Content $rt2) -join '|') -eq ((Get-Content $rt3) -join '|')
+    Write-Host ("  {0} txt normalisation is idempotent (pass 2 == pass 3 byte for byte)" -f `
+                $(if ($good) { 'ok  ' } else { 'FAIL' }))
+    if (-not $good) { $problems++ }
+  } else {
+    Write-Host "  FAIL txt round trip: could not produce both exports"
+    $problems++
+  }
+
+  # A GAP in a palette file.  This probe originally passed green while that bug was
+  # live, because it only ever compared a matching count against a mismatched one and
+  # never asked whether the FILE was valid: a gap used to import with a BLACK entry,
+  # because PaletteEntry's defaults are 0,0,0,opaque and nothing was checking.
+  $gapped = Join-Path $tmp 'gap.txt'
+  $body = Get-Content $rt1 | Where-Object { $_ -notmatch '^#' -and $_.Trim() }
+  ($body | Where-Object { ($_ -split '\s+')[0] -ne '1' }) | Out-File -Encoding ascii $gapped
+  $out = Join-Path $tmp 'gap.mkv'
+  $msg = & $exe --video --engine cpu --colors ($n - 1) --palette-import $gapped $src $out 2>&1
+  $code = $LASTEXITCODE
+  $good = ($code -ne 0) -and (($msg | Out-String).Contains('index'))
+  Write-Host ("  {0} txt with a missing index is refused by name (exit {1})" -f `
+              $(if ($good) { 'ok  ' } else { 'FAIL' }), $code)
+  if (-not $good) { $problems++ }
+
   if ($problems -eq 0) {
     ""
     "palette parity: ok -- both formats accept a match and refuse a mismatch identically"

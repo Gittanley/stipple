@@ -1005,10 +1005,25 @@ bool ImWritePalette(const Palette& palette, const std::string& path,
     }
     std::fprintf(f, "# rdither palette, %d colours, Q16 (0..65535) and 8-bit hex\n",
                  palette.count);
-    std::fprintf(f, "# count\tr\tg\tb\thex\n");
+    // count r g b a hex
+    //
+    // Two changes, both because the old format could not carry what a palette needs:
+    //
+    //   %.1f -> %.6f.  %.1f was NOT lossless here, whatever the header claimed. A Q16
+    //   channel is not an integer in this build -- 44 of 48 channel values in an
+    //   exported 16-colour palette were fractional (6801.6, 8346.7, 21875.5) -- so
+    //   export -> import -> export changed every one of sixteen rows. Six decimals
+    //   round-trips a double channel exactly and costs only bytes.
+    //
+    //   a  -> a new column.  The format had nowhere to put alpha, so exporting a
+    //   palette from an alpha image and importing it produced associate_alpha=no
+    //   against a derived palette's yes, and the output stopped matching ImageMagick
+    //   with no warning and a zero exit.  Measured at 3.2% AE.
+    std::fprintf(f, "# count\tr\tg\tb\ta\thex\n");
     for (int i = 0; i < palette.count; ++i) {
       const PaletteEntry& e = palette.entries[i];
-      std::fprintf(f, "%d\t%.1f\t%.1f\t%.1f\t%02X%02X%02X\n", i, e.r, e.g, e.b,
+      std::fprintf(f, "%d\t%.6f\t%.6f\t%.6f\t%.6f\t%02X%02X%02X\n", i, e.r, e.g, e.b,
+                   e.a,
                    static_cast<unsigned>(e.r / 257.0 + 0.5),
                    static_cast<unsigned>(e.g / 257.0 + 0.5),
                    static_cast<unsigned>(e.b / 257.0 + 0.5));
@@ -1170,6 +1185,13 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
     // them pure black, with no error and nothing in the output to say so.  The dither
     // then searched a tree containing a colour the file never asked for.
     std::vector<bool> seen;
+    // Whether any row carried an alpha below full opacity.  This is what decides
+    // associate_alpha for an imported palette, and it is the reason the format gained a
+    // column: previously the flag was forced to false here, unconditionally, so an
+    // imported palette could never be associated even when every colour it held was
+    // translucent -- and a derived palette from the same image was.  That mismatch is
+    // what made export/import diverge from ImageMagick with a zero exit.
+    bool saw_transparency = false;
     char line[512];
     int lineno = 0;
     while (std::fgets(line, sizeof(line), f) != nullptr) {
@@ -1177,17 +1199,41 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
       if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
       int index = 0;
       double r = 0.0, g = 0.0, b = 0.0;
-      char hex[32] = {0};
-      // The hex column is read so the format is matched exactly, then ignored:
-      // it is 8-bit and preferring it would quietly quantise a Q16 palette.
-      const int got = std::sscanf(line, "%d %lf %lf %lf %31s", &index, &r, &g, &b,
-                                  hex);
+      // Two shapes are accepted, because the alpha column is new and every palette file
+      // written before it is still on somebody's disk:
+      //
+      //   6 tokens: index r g b a hex     current format
+      //   5 tokens: index r g b hex       the old one; alpha is then kOpaqueAlpha
+      //
+      // They are told apart by whether the FIFTH token parses as a number.  That is
+      // unambiguous in practice: the hex column is six hex digits and never parses as a
+      // double, and alpha is a channel in the same 0..65535 range as the others.  A
+      // hand-edited file with something else there is rejected by name rather than
+      // guessed at, which is the point.
+      char tok5[32] = {0};
+      char tok6[32] = {0};
+      const int got = std::sscanf(line, "%d %lf %lf %lf %31s %31s", &index, &r, &g, &b,
+                                  tok5, tok6);
       if (got < 4) {
         std::fclose(f);
         *error = path + ": line " + std::to_string(lineno) +
-                 " is not a palette row (want: index r g b [hex])";
+                 " is not a palette row (want: index r g b [a] [hex])";
         return false;
       }
+      double alpha = kOpaqueAlpha;
+      if (got >= 6) {
+        char* endp = nullptr;
+        const double v = std::strtod(tok5, &endp);
+        if (endp == tok5 || *endp != '\0' || !(v >= 0.0 && v <= kQuantumRange)) {
+          std::fclose(f);
+          *error = path + ": line " + std::to_string(lineno) + " alpha '" + tok5 +
+                   "' is not a number in 0.." + std::to_string(kQuantumRange);
+          return false;
+        }
+        alpha = v;
+      }
+      // The hex column is matched but ignored: it is 8-bit and preferring it would
+      // quietly quantise a Q16 palette.
       if (index < 0 || index >= kMaxColormapSize) {
         std::fclose(f);
         *error = path + ": line " + std::to_string(lineno) + " index " +
@@ -1203,10 +1249,17 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
       palette->entries[index].r = r;
       palette->entries[index].g = g;
       palette->entries[index].b = b;
-      palette->entries[index].a = kOpaqueAlpha;
+      palette->entries[index].a = alpha;
+      if (alpha != kOpaqueAlpha) saw_transparency = true;
       if (index + 1 > palette->count) palette->count = index + 1;
     }
     std::fclose(f);
+    // A palette that carries transparency is an associated palette.  Decided from the
+    // FILE rather than from the source image, so the derived and the imported path reach
+    // the same answer from the same evidence instead of two implementations being kept
+    // in step.  A legacy 5-token file yields saw_transparency == false and keeps the old
+    // behaviour, which is the only honest thing to do with a format that cannot say.
+    palette->associate_alpha = saw_transparency;
     if (palette->count <= 0) {
       *error = path + " contains no palette rows";
       return false;
