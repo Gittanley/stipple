@@ -730,6 +730,9 @@ Beyond that suite, `verify.ps1` also runs:
 | `tools\probe-palette-deadline.ps1` | `--palette-budget-ms` bounds the stage, **and both palette samplers agree on a clip whose frames are all identical** | ok |
 | `tools\probe-cache-invalidation.ps1` | the clip-invariant cache hits within a run and leaks nothing between geometries | ok |
 | `tools\probe-segment-frames.ps1` | `--segment-frames` runs at all: plain, with `RD_PALETTE_OVERLAP=1`, multi-segment, and its decoded pixels equal the unsegmented run | ok |
+| `tools\probe-quiet-flag.ps1` | `--quiet` silences stdout on video, segmented video, palette-only and image — and still reports when absent | ok |
+| `tools\probe-flag-limits.ps1` | `--max-ram-mb` / `--max-vram-mb` reject values that overflow to a zero budget, and accept the largest legal one | ok |
+| `tools\probe-palette-parity.ps1` | PNG and `.txt` palette imports accept a matching `--colors` and refuse a mismatched one **identically** | ok |
 | `rdither --self-test` | the C++-level invariants, including the palette gate's blocking and publish semantics | PASSED |
 | `tools\probe-palette-overlap.ps1` | `RD_PALETTE_OVERLAP` changes no pixel | **off by default** — run `verify.ps1 -Slow` |
 

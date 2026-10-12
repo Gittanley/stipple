@@ -752,6 +752,44 @@ if (Test-Path $seg) {
   }
 }
 
+# Three more stages, all of them guarding a bug that shipped because nothing ran the
+# path.  Each asserts an AGREEMENT rather than one implementation's behaviour, so a
+# future change that drifts one side of a pair is caught by the pair, not by whichever
+# side someone remembered to pin down.
+
+$quietProbe = Join-Path $PSScriptRoot 'tools\probe-quiet-flag.ps1'
+if (Test-Path $quietProbe) {
+  Write-Host ""
+  & pwsh -NoProfile -File $quietProbe -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Skip-CannotRun "quiet flag" }
+    default { Write-Host "quiet flag: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
+$limitProbe = Join-Path $PSScriptRoot 'tools\probe-flag-limits.ps1'
+if (Test-Path $limitProbe) {
+  Write-Host ""
+  & pwsh -NoProfile -File $limitProbe -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Skip-CannotRun "flag limits" }
+    default { Write-Host "flag limits: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
+$parityProbe = Join-Path $PSScriptRoot 'tools\probe-palette-parity.ps1'
+if (Test-Path $parityProbe) {
+  Write-Host ""
+  & pwsh -NoProfile -File $parityProbe -Rdither $Rdither
+  switch ($LASTEXITCODE) {
+    0 { }
+    2 { Skip-CannotRun "palette parity" }
+    default { Write-Host "palette parity: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+  }
+}
+
 # ---- where the time went --------------------------------------------------------
 #
 # Printed unconditionally, and attributed per stage, because "the suite takes 25-35
