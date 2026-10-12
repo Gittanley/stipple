@@ -1164,6 +1164,12 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
     }
     palette->count = 0;
     palette->associate_alpha = false;
+    // Which slots the file actually filled.  Needed because a GAP is invisible in the
+    // entries themselves: PaletteEntry's defaults are 0,0,0,opaque, which is BLACK,
+    // so a file declaring indices 0,1,3 used to import as four colours, the third of
+    // them pure black, with no error and nothing in the output to say so.  The dither
+    // then searched a tree containing a colour the file never asked for.
+    std::vector<bool> seen;
     char line[512];
     int lineno = 0;
     while (std::fgets(line, sizeof(line), f) != nullptr) {
@@ -1190,6 +1196,10 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
       }
       // Assign by the file's own index rather than by arrival order, so a
       // reordered file still imports in the order it declares.
+      if (index >= static_cast<int>(seen.size())) {
+        seen.resize(static_cast<std::size_t>(index) + 1, false);
+      }
+      seen[static_cast<std::size_t>(index)] = true;
       palette->entries[index].r = r;
       palette->entries[index].g = g;
       palette->entries[index].b = b;
@@ -1200,6 +1210,25 @@ bool ImReadPalette(const std::string& path, int expect_colors, Palette* palette,
     if (palette->count <= 0) {
       *error = path + " contains no palette rows";
       return false;
+    }
+    // A gap is a malformed file, and refusing it is consistent with how the rest of
+    // this reader treats a disagreement: say what is wrong and use nothing, rather
+    // than importing something the file did not say.  The alternative -- compacting the
+    // indices -- would be silently APPLYING a renumbering, which is the thing
+    // include/rd_im.h promises this path never does.
+    //
+    // The message names the FIRST missing index and the highest one declared, because
+    // "your file has a gap" without either number leaves the reader to diff the file
+    // by hand.
+    for (int i = 0; i < palette->count; ++i) {
+      if (!seen[static_cast<std::size_t>(i)]) {
+        *error = path + ": no row declares index " + std::to_string(i) +
+                 ", but the file's highest index is " +
+                 std::to_string(palette->count - 1) +
+                 "; importing it would fill the gap with black.  Renumber the rows so"
+                 " the indices are contiguous from 0, or export a fresh palette.";
+        return false;
+      }
     }
     if (expect_colors > 0 && palette->count != expect_colors) {
       *error = path + " holds " + std::to_string(palette->count) +

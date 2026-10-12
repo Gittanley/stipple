@@ -134,11 +134,24 @@ bool ImWritePalette(const Palette& palette, const std::string& path,
 //
 // Two formats, chosen by suffix, matching ImWritePalette exactly:
 //
-//   .txt / .text   The line-oriented Q16 form.  This is the LOSSLESS one: the
-//                  values are written with %.1f and a Q16 channel is an integer,
-//                  so the text is bit-exact and survives a round trip unchanged.
+//   .txt / .text   The line-oriented Q16 form.  Intended to be the lossless one,
+//                  and it is CLOSER than the image form, but it is NOT lossless and
+//                  an earlier version of this comment said it was.  That claim rested
+//                  on "a Q16 channel is an integer", which does not hold here: in a
+//                  Q16-HDRI build the colormap entries are not integers.  Measured on
+//                  an exported 16-colour palette, 44 of its 48 channel values are
+//                  fractional (6801.6, 8346.7, 21875.5).  %.1f keeps one decimal, so
+//                  a value such as 7844.4814 comes back as 7844.5 -- a real change,
+//                  in the last digit, on a path whose entire purpose is reproducibility.
+//
+//                  The fix is a wider format, not a better comment, and it is not
+//                  written: %.6f would round-trip these values exactly and costs
+//                  nothing but bytes.  Until then, export-then-import is reproducible
+//                  to one decimal place, not exactly.  Do not describe it as
+//                  bit-exact in output, in docs, or to a user.
+//
 //                  The hex column is 8-bit and is ignored on read -- it is there
-//                  for a human, and preferring it would silently quantise.
+//                  for a human, and preferring it would silently quantise further.
 //   anything else  An image, read the way --palette-from already reads one: its
 //                  unique colours become the palette.  That handles the PNG8
 //                  1xN strip this module writes, and equally
