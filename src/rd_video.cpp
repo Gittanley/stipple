@@ -3607,7 +3607,24 @@ bool VideoProcess(const std::string& in, const std::string& out,
             return !free_slots.empty() || failed || eof;
           });
           if (failed || eof) return;
-          if (Interrupted()) return;
+          if (Interrupted()) {
+            // Publish the interrupt, do not just leave.  The writer's wait
+            // predicate is HasTurn || eof || failed and it wakes on notify
+            // only; a bare `return` here set nothing and notified nobody, so
+            // whenever the break landed before the first batch turned, the
+            // writer slept the full 600 s (measured: probe-interrupt.ps1 at
+            // -DelayMs 1500 hung until its timeout; the same probe at 2500,
+            // with batches in flight, passed).  `failed = true` is exactly
+            // what the writer's own Interrupted branch does further down --
+            // and cv_done, not cv_ready, is the one the writer sleeps on
+            // (cv_done.wait_for at its loop head): notifying only cv_ready
+            // and cv_free woke the workers and left the writer asleep.
+            failed = true;
+            cv_ready.notify_all();
+            cv_free.notify_all();
+            cv_done.notify_all();
+            return;
+          }
           slot = free_slots.front();
           free_slots.pop_front();
         }
@@ -3767,7 +3784,19 @@ bool VideoProcess(const std::string& in, const std::string& out,
           }
         }
         if (failed) return;
-          if (Interrupted()) return;
+        if (Interrupted()) {
+          // Same publish as the reader's interrupt branch: without it, a worker
+          // that leaves here while the GPU worker sleeps in cv_ready.wait (its
+          // predicate is !ready || eof || failed -- Interrupted is not in it)
+          // and the writer sleeps in wait_for(HasTurn || eof || failed) leave
+          // both asleep forever on an interrupt that arrived before any batch
+          // turned.
+          failed = true;
+          cv_ready.notify_all();
+          cv_free.notify_all();
+          cv_done.notify_all();  // the writer sleeps on cv_done, not cv_ready
+          return;
+        }
         if (ready.empty()) {
           if (eof) return;
           continue;
@@ -3990,7 +4019,10 @@ bool VideoProcess(const std::string& in, const std::string& out,
         *error =
             "pipeline stalled: no batch completed within 600 s "
             "(check the decoder and encoder processes)";
-        std::lock_guard<std::mutex> l2(mu);
+        // `lock` above already holds mu.  This branch used to build a second
+        // lock_guard on the same non-recursive mutex: on MSVC that deadlocks
+        // the writer with mu held, every reader then blocks, and reader.join()
+        // never returns -- on the 600 s stall path and, below, on every Ctrl-C.
         failed = true;
         cv_ready.notify_all();
         cv_free.notify_all();
@@ -4000,7 +4032,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
       if (Interrupted()) {
         // Unwind through the normal shutdown path so the encoder's stdin is
         // closed and ffmpeg can finalise what it has.
-        std::lock_guard<std::mutex> l2(mu);
+        // Same self-lock as the stall branch above: `lock` holds mu already.
         failed = true;
         cv_ready.notify_all();
         cv_free.notify_all();
@@ -4189,7 +4221,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // summary and exit 0 over a partial encode.
     std::fprintf(stderr, "error: %s\n", HostDitherError().c_str());
     if (result != nullptr) result->frames = 0;
-    return result;
+    // false, NOT `return result`: result is a VideoResult*, non-null at every
+    // call site, so returning it converted this failure to TRUE -- the exact
+    // "plausible summary and exit 0 over a partial encode" the comment above
+    // exists to prevent.
+    return false;
   }
 
   if (result != nullptr) {
