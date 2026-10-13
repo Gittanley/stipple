@@ -105,11 +105,13 @@ function Get-PixelHash([string]$Path) {
   [pscustomobject]@{ Hash = $h; Frames = $frames; Bytes = $frameBytes }
 }
 
-# The engines, and how each is expected to behave.  OpenCL REFUSES above 16 colours
-# (rd_opencl.cpp: "this engine implements the flat search only, so --colors must be 16 or
-# fewer"), and that refusal is correct behaviour rather than a gap, so a refusal is
+# The engines, and how each is expected to behave.  OpenCL refuses when the RESOLVED
+# PALETTE exceeds 16 entries -- rd_opencl.cpp:630 tests tree.color_count(), not
+# --colors -- and that refusal is correct behaviour rather than a gap, so a refusal is
 # recorded as such and compared like any other outcome.  If a future change makes OpenCL
-# accept 32, this probe reports the CHANGE -- which is exactly what it is for.
+# accept larger palettes, this probe reports the CHANGE -- which is exactly what it is
+# for.  It used to say "REFUSES above 16 colours" and quote the error string verbatim;
+# both were wrong, since --colors 20 runs on an image whose palette resolved to 12.
 $engines = @('cpu', 'cuda', 'opencl')
 
 $results = [ordered]@{}

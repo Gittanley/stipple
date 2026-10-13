@@ -1229,8 +1229,9 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
                                   std::uint16_t* out_u16,
                                   int state_slot,
                                   const std::uint16_t* in_u16) {
-  // Defence in depth, and currently unreachable: the flat-search-only restriction at
-  // :1216 already refuses anything above 16 colours, so this engine could never
+  // Defence in depth, and currently unreachable: the flat-search-only restriction in
+  // BuildFlatSearchHost (:629-630, `tree.color_count() > 16`) already refuses anything
+  // above 16 palette entries, so this engine could never
   // actually alias.  `b_idx` IS one unsigned char per curve position (idx_bytes =
   // n * frames at :1245, read back into a std::vector<unsigned char> at :1752), so
   // IF that restriction is ever lifted the bug arrives silently: the lookup still
@@ -1340,8 +1341,18 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // palette too large for the 4-bit packing falls back to the recursive
     // ClosestColor, which this port does not carry; silently doing something
     // else would redefine what a given --engine means.
-    return "opencl: this engine implements the flat search only, so --colors must "
-           "be 16 or fewer";
+    //
+    // The constraint is the PALETTE, not --colors.  --colors is a request and the
+    // octree routinely resolves it to fewer entries than were asked for, so naming
+    // --colors here blamed the wrong quantity: measured on this machine, `--engine
+    // opencl --colors 20` runs on an image whose palette resolved to 12 entries, and
+    // the SAME image is refused at `--colors 28` because it resolved to 17.  A user
+    // whose palette is already 12 colours was told their 28-colour request was too
+    // large when the request was not what ran.
+    return "opencl: this engine implements the flat search only, so the palette must "
+           "have 16 colours or fewer; this image's palette resolved to " +
+           std::to_string(tree.color_count()) +
+           " (--colors is an upper bound, not a guarantee)";
   }
   std::vector<ClNode> hnodes(tree.nodes().size());
   for (std::size_t i = 0; i < tree.nodes().size(); ++i) {
