@@ -122,7 +122,14 @@ __global__ void GatherKernelT(const float4* __restrict__ pixels,
 }
 
 // Seeds q with the nearest palette entry for the raw pixel (no error diffusion).
-__global__ void InitIndexKernel(const float* __restrict__ cx,
+//
+// Templated on T because the curve field it reads is double under --approx-fp64
+// and float otherwise (see the two GatherKernelT instantiations at the call
+// site).  It used to take `const float*` unconditionally while the fp64 path
+// passed doubles, so fp64 runs seeded q0 from double bits reinterpreted as
+// floats -- wrong indices, silently, for every pixel.
+template <typename T>
+__global__ void InitIndexKernel(const T* __restrict__ cx,
                                 const double* __restrict__ palette, int count,
                                 int assoc, const DevNode* __restrict__ nodes,
                                 int use_tree, unsigned char* __restrict__ q,
@@ -130,10 +137,10 @@ __global__ void InitIndexKernel(const float* __restrict__ cx,
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float4 v;
-  v.x = cx[4 * i + 0];
-  v.y = cx[4 * i + 1];
-  v.z = cx[4 * i + 2];
-  v.w = cx[4 * i + 3];
+  v.x = static_cast<float>(cx[4 * i + 0]);
+  v.y = static_cast<float>(cx[4 * i + 1]);
+  v.z = static_cast<float>(cx[4 * i + 2]);
+  v.w = static_cast<float>(cx[4 * i + 3]);
   Rgba target;
   cuda_common::d_associate_alpha_pixel(assoc, v, &target);
   const int index = (use_tree != 0)
@@ -330,9 +337,15 @@ std::string RiemersmaApproxCuda(const Palette& palette, const DitherParams& para
     GatherKernelT<float><<<blocks, threads>>>(d_pixels, d_curve,
                                               static_cast<float*>(d_cx), n);
   }
-  InitIndexKernel<<<blocks, threads>>>(static_cast<const float*>(d_cx), d_palette,
-                                       palette.count, assoc, d_nodes,
-                                       options.use_tree, d_q0, n);
+  if (fp64) {
+    InitIndexKernel<double><<<blocks, threads>>>(
+        static_cast<const double*>(d_cx), d_palette, palette.count, assoc,
+        d_nodes, options.use_tree, d_q0, n);
+  } else {
+    InitIndexKernel<float><<<blocks, threads>>>(
+        static_cast<const float*>(d_cx), d_palette, palette.count, assoc,
+        d_nodes, options.use_tree, d_q0, n);
+  }
 
   const int tile = 256;
   const int jacobi_blocks = (n + tile - 1) / tile;
