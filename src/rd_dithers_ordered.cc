@@ -31,11 +31,16 @@
 // the matrix at all -- with two palette entries the two distances are equal exactly at
 // the midpoint, so the fraction is identically 1 and every row comes out flat -- and a
 // 3-colour gradient puts the centroids where the ramp has no local variation to dither.
-// Building a fixture that exposes the raw threshold pattern is still open.  A related
-// loose end: the 64x64 and 32x32 outputs differ by only about 32 pixels out of half a
-// million, which is smaller than a change of tile size should produce, and the reason is
-// not understood.  So the blue-noise *quality* claim is not yet earned, and the two
-// names are a speed/size trade whose benefit at the quality end is unconfirmed.
+// Building a fixture that exposes the raw threshold pattern is still open.  The
+// related loose end -- "the 64x64 and 32x32 outputs differ by only about 32
+// pixels out of half a million" -- is EXPLAINED and fixed: the rank builder
+// started from an all-ON pattern, whose blur is uniform, so every exchange step
+// landed on the same two pixels and the matrix came out degenerate (rank[n*n]
+// at one position, 0 everywhere else) for both tile sizes, hence nearly
+// identical outputs.  The builder now seeds deterministic proto-noise and runs
+// the three phases described in BuildVoidCluster; --self-test asserts the rank
+// spread.  The blue-noise spectrum itself is still not measured, so the
+// quality claim remains open even though the ranks are now real.
 //
 // Neither of those is a reason to delete the filters -- they are deterministic, exact on
 // the palette, and visibly different from every other registered algorithm -- but it is a
@@ -47,6 +52,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace rd {
@@ -188,16 +194,18 @@ DitherResult BayerOrdered(DitherJob& job, RgbaF* px) {
 // matrix whose spectrum is blue noise -- energy pushed to high frequencies, none at
 // the low-frequency end where the eye is most sensitive to beating.
 //
-// The exchange, per rank, is two steps and the order matters:
+// The exchange, used by the prefilter in BuildVoidCluster, is two steps and the
+// order matters:
 //
-//   1. filter, find the LARGEST value, turn that pixel OFF.  That is the tightest
-//      cluster, and clearing it is what creates a void.
-//   2. filter again, find the SMALLEST value, and record this rank there.  That is
-//      the largest void, which is where the dot belongs.
+//   1. filter, find the LARGEST value among ON pixels, turn that pixel OFF.  That
+//      is the tightest cluster, and clearing it is what creates a void.
+//   2. filter again, find the SMALLEST value among OFF pixels, turn it ON.  That
+//      is the largest void, which is where the dot belongs.
 //
 // Getting the order wrong -- placing first, clearing after -- produces a matrix that
 // still looks structured and still quantises, so it would pass a smoke test and be
-// wrong.
+// wrong.  Ranks themselves are assigned afterwards, by the drain and refill phases
+// documented in BuildVoidCluster, not by this exchange.
 struct VoidCluster {
   int n = 0;
   // 1..n*n, and 0 meaning "never assigned", which should not happen.
@@ -230,7 +238,28 @@ VoidCluster BuildVoidCluster(int n) {
   static const double kK[5] = {0.12012, 0.23387, 0.29202, 0.23387, 0.12012};
   const int r = 2;
 
+  // A deterministic proto-noise start, density ~0.1.
+  //
+  // NOT all-ON, which is what this used to be.  A blur of a uniform field is
+  // uniform, so with `on` all 1.0 every step did the same thing: arg_max (strict
+  // >, tie to index 0) returned 0, the clear at index 0 was undone by the
+  // restore, arg_min returned 0, and rank[0] was overwritten np times.  The
+  // matrix came out degenerate -- rank[0] == n*n, every other rank 0 -- which
+  // is the "64x64 and 32x32 differ by only ~32 pixels" loose end in the header
+  // comment above: both matrices were the same rank-0 pattern.  Caught by
+  // --self-test's far-entry fraction check.
+  //
+  // The seed must be deterministic across processes: --resume re-runs the whole
+  // program, and a std::random_device matrix would make the resumed file differ
+  // from the original.  Fixed LCG constants, no seed input.
   std::vector<double> on(np, 1.0);
+  {
+    std::uint64_t s = 0x9E3779B97F4A7C15ull;
+    for (std::size_t i = 0; i < np; ++i) {
+      s = s * 6364136223846793005ull + 1442695040888963407ull;
+      on[i] = ((s >> 33) % 10 == 0) ? 1.0 : 0.0;
+    }
+  }
   std::vector<double> tmp(np, 0.0);
   std::vector<double> filt(np, 0.0);
 
@@ -282,39 +311,91 @@ VoidCluster BuildVoidCluster(int n) {
     }
   };
 
-  // argmax / argmin over the WHOLE image, not just the OFF pixels.  Ulichney's
-  // formulation does it over the whole binary image, and restricting it to off pixels
-  // is a different algorithm that produces a worse matrix -- the on pixels are exactly
-  // the ones that make a location look clustered.
+  // argmax over the ON pixels only (the tightest cluster), argmin over the OFF
+  // pixels only (the largest void) -- then REMOVE the argmax pixel and PLACE at
+  // the argmin pixel.  The whole-image searches this used to run could return a
+  // pixel whose state made the toggle a no-op, which is half of why the old
+  // matrix was degenerate; the other half was the single exchange loop, which
+  // cycled on the same pixel forever (see the phase comments below).
+  //
+  // Reference for the structure: Zoy's BlueNoise void-and-cluster
+  // (pixelmager/bluenoisegen src_void_and_cluster/void_and_cluster.cpp, after
+  // caca.zoy.org/study): prefilter to equilibrium, DRAIN the pattern assigning
+  // ranks downward, then REFILL from the equilibrium clone assigning ranks
+  // upward.  Each phase visits each pixel exactly once, so the ranks come out a
+  // permutation of 1..n*n -- which is what a threshold matrix has to be.
   //
   // Strict comparison, so a tie goes to the lowest index.  Same reason as the
   // nearest-colour tie-break: --resume re-runs from a checkpoint, and a tie broken
   // differently on a second pass would make the resumed file differ from the original.
-  auto arg_max = [&]() {
-    std::size_t best = 0;
-    double bv = filt[0];
-    for (std::size_t i = 1; i < np; ++i) {
-      if (filt[i] > bv) { bv = filt[i]; best = i; }
+  auto arg_max_on = [&]() -> std::size_t {
+    std::size_t best = np;  // np = "none": no ON pixel left
+    double bv = 0.0;
+    for (std::size_t i = 0; i < np; ++i) {
+      if (on[i] <= 0.5) continue;
+      if (best == np || filt[i] > bv) { bv = filt[i]; best = i; }
     }
     return best;
   };
-  auto arg_min = [&]() {
-    std::size_t best = 0;
-    double bv = filt[0];
-    for (std::size_t i = 1; i < np; ++i) {
-      if (filt[i] < bv) { bv = filt[i]; best = i; }
+  auto arg_min_off = [&]() -> std::size_t {
+    std::size_t best = np;  // np = "none": no OFF pixel left
+    double bv = 0.0;
+    for (std::size_t i = 0; i < np; ++i) {
+      if (on[i] > 0.5) continue;
+      if (best == np || filt[i] < bv) { bv = filt[i]; best = i; }
     }
     return best;
   };
 
-  for (std::size_t step = 0; step < np; ++step) {
+  // Prefilter: exchange (remove tightest ON, place at largest OFF void) until
+  // the two land on the same pixel -- the pattern is then in equilibrium, the
+  // state both phases below start from.  The reference loops until stable; the
+  // bound here is a safety net so a build can never hang the first program that
+  // touches a tile, and 4*n*n exchanges is far past where equilibrium arrives.
+  for (std::size_t it = 0; it < 4 * np; ++it) {
     blur();
-    const std::size_t tightest = arg_max();
-    on[tightest] = 0.0;  // clear the tightest cluster: this is what makes the void
+    const std::size_t tightest = arg_max_on();
+    if (tightest == np) break;
+    on[tightest] = 0.0;
     blur();
-    const std::size_t largest_void = arg_min();
-    vc.rank[largest_void] = static_cast<std::uint16_t>(step + 1);
-    on[largest_void] = 1.0;  // and put the dot there
+    const std::size_t largest_void = arg_min_off();
+    if (largest_void == np) break;
+    on[largest_void] = 1.0;
+    if (tightest == largest_void) break;  // exchange was the identity: settled
+  }
+
+  // The equilibrium pattern, cloned: phase II refills exactly this state.
+  const std::vector<double> equilibrium = on;
+
+  // Phase I -- DRAIN.  The dots in the equilibrium pattern get the LOW ranks,
+  // counting down: remove the tightest cluster, rank it, never re-add it.
+  // Tightest-first means the redundant dot of each neighbourhood is claimed
+  // while the neighbourhood still exists.
+  std::size_t dots = 0;
+  for (std::size_t i = 0; i < np; ++i) {
+    if (on[i] > 0.5) ++dots;
+  }
+  std::size_t rank = dots;
+  while (rank > 0) {
+    --rank;
+    blur();
+    const std::size_t tightest = arg_max_on();
+    if (tightest == np) break;  // cannot happen with rank<=dots; test catches it
+    on[tightest] = 0.0;
+    vc.rank[tightest] = static_cast<std::uint16_t>(rank + 1);  // 1-based
+  }
+
+  // Phase II -- REFILL.  Restore the equilibrium pattern and fill the largest
+  // voids one dot at a time, ranks counting up to n*n.  A void is OFF by
+  // definition of arg_min_off, so every placement lands on a not-yet-ranked
+  // pixel: the two phases together rank every pixel exactly once.
+  on = equilibrium;
+  for (std::size_t r = dots; r < np; ++r) {
+    blur();
+    const std::size_t largest_void = arg_min_off();
+    if (largest_void == np) break;  // pattern full before ranks ran out
+    on[largest_void] = 1.0;
+    vc.rank[largest_void] = static_cast<std::uint16_t>(r + 1);  // 1-based
   }
   return vc;
 }

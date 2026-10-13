@@ -1623,7 +1623,243 @@ int main(int argc, char** argv) {
         bad += (gbad != 0) ? 1 : 0;
         std::fprintf(stderr, "\n");
         std::fflush(stderr);
-      }      std::printf("%s\n", bad == 0 ? "self-test PASSED" : "self-test FAILED");
+      }
+
+      // Diffusion kernels: Floyd-Steinberg and Atkinson must place error on the
+      // documented neighbours and must never write into the NEXT row from the
+      // right edge.  The reference below is transcribed from the kernel diagrams
+      // at the head of each algorithm in rd_dithers.cc, independently of the
+      // implementation being tested.  It fails on the current code: FS puts its
+      // 5/16 at below-right and its 1/16 one pixel further right (so `below`
+      // never receives 5/16), and both algorithms leak the right-edge tap into
+      // the next row's first pixel because Accumulate only rejects i >= n.
+      {
+        std::fprintf(stderr, "diffusion kernels:\n");
+        int kbad = 0;
+        auto kcheck = [&](const char* what, bool ok) {
+          std::fprintf(stderr, "  %-52s %s\n", what, ok ? "ok" : "FAIL");
+          std::fflush(stderr);
+          if (!ok) ++kbad;
+        };
+
+        const std::size_t kw = 6, kh = 4, kn = kw * kh;
+        // Heap, not stack: Palette is ~2 MiB (see rd_plugin.h).
+        //
+        // Four entries, not two, and the 127/128 pair is the reason this test
+        // has teeth: every ordinary pixel sits EXACTLY on entry 127 (error 0,
+        // so untouched pixels contribute nothing downstream), and any positive
+        // diffused error of 0.5 or more moves it to 128.  A two-colour palette
+        // with off-palette pixels was tried first and passed against the BUGGY
+        // code -- the different error fields quantised to the same colours, so
+        // the comparison had no discriminating power at all.
+        auto kpal = std::make_unique<rd::Palette>();
+        kpal->count = 4;
+        kpal->entries[0].r = kpal->entries[0].g = kpal->entries[0].b = 0.0;
+        kpal->entries[1].r = kpal->entries[1].g = kpal->entries[1].b = 127.0;
+        kpal->entries[2].r = kpal->entries[2].g = kpal->entries[2].b = 128.0;
+        kpal->entries[3].r = kpal->entries[3].g = kpal->entries[3].b = 255.0;
+
+        std::vector<rd::RgbaF> src(kn, rd::RgbaF{});
+        for (std::size_t i = 0; i < kn; ++i) {
+          src[i].r = src[i].g = src[i].b = 127.0f;
+          src[i].a = 65535.0f;
+        }
+        // Two error sources, both with error +63: (1,1) is interior so all four
+        // FS taps and all six Atkinson taps land inside the frame; (0,5) is the
+        // right-edge pixel, where the right tap must NOT reach (1,0).
+        src[1 * kw + 1].r = src[1 * kw + 1].g = src[1 * kw + 1].b = 63.0f;
+        src[0 * kw + 5].r = src[0 * kw + 5].g = src[0 * kw + 5].b = 63.0f;
+
+        // The shared rules, transcribed from rd_dither_common.h: nearest entry
+        // with the tie going to the lowest index, on this palette.
+        auto nearest2 = [](float r, float, float) {
+          static const float kPal[4] = {0.0f, 127.0f, 128.0f, 255.0f};
+          int best = 0;
+          float bd = -1.0f;
+          for (int k = 0; k < 4; ++k) {
+            const float d = (r - kPal[k]) * (r - kPal[k]);
+            if (bd < 0.0f || d < bd) {
+              bd = d;
+              best = k;
+            }
+          }
+          return kPal[best];
+        };
+
+        // Floyd-Steinberg per the diagram in rd_dithers.cc:
+        //        *  7/16
+        //     3/16 5/16 1/16
+        // with off-frame taps dropped (the policy ImageMagick's own
+        // FloydSteinbergDither uses) except below-left at column 0, which this
+        // codebase has always clamped to `below`.
+        auto ref_fs = [&](std::vector<rd::RgbaF> px) {
+          std::vector<float> er(kn, 0.0f), eg(kn, 0.0f), eb(kn, 0.0f);
+          auto acc = [&](std::size_t idx, float wgt, float dr, float dg, float db) {
+            if (idx >= kn) return;
+            er[idx] += wgt * dr;
+            eg[idx] += wgt * dg;
+            eb[idx] += wgt * db;
+          };
+          for (std::size_t y = 0; y < kh; ++y) {
+            for (std::size_t x = 0; x < kw; ++x) {
+              const std::size_t i = y * kw + x;
+              const float r = px[i].r + er[i];
+              const float g = px[i].g + eg[i];
+              const float b = px[i].b + eb[i];
+              const float c = nearest2(r, g, b);
+              const float dr = r - c, dg = g - c, db = b - c;
+              if (x + 1 < kw) acc(i + 1, 7.0f / 16.0f, dr, dg, db);
+              acc(i + kw - (x > 0 ? 1 : 0), 3.0f / 16.0f, dr, dg, db);
+              acc(i + kw, 5.0f / 16.0f, dr, dg, db);
+              if (x + 1 < kw) acc(i + kw + 1, 1.0f / 16.0f, dr, dg, db);
+              px[i].r = px[i].g = px[i].b = c;
+            }
+          }
+          return px;
+        };
+
+        // Atkinson per its diagram, taps as rd_dithers.cc currently intends them
+        // (the interior tap set is pinned as-is; whether it matches the classic
+        // Atkinson layout is a separate question this test does not decide) --
+        // with the right-edge guard that is missing today.
+        auto ref_at = [&](std::vector<rd::RgbaF> px) {
+          std::vector<float> er(kn, 0.0f), eg(kn, 0.0f), eb(kn, 0.0f);
+          auto acc = [&](std::size_t idx, float wgt, float dr, float dg, float db) {
+            if (idx >= kn) return;
+            er[idx] += wgt * dr;
+            eg[idx] += wgt * dg;
+            eb[idx] += wgt * db;
+          };
+          const float k = 1.0f / 8.0f;
+          for (std::size_t y = 0; y < kh; ++y) {
+            for (std::size_t x = 0; x < kw; ++x) {
+              const std::size_t i = y * kw + x;
+              const float r = px[i].r + er[i];
+              const float g = px[i].g + eg[i];
+              const float b = px[i].b + eb[i];
+              const float c = nearest2(r, g, b);
+              const float dr = r - c, dg = g - c, db = b - c;
+              if (x + 1 < kw) acc(i + 1, k, dr, dg, db);
+              if (x > 0) acc(i + kw - 1, k, dr, dg, db);
+              acc(i + kw, k, dr, dg, db);
+              if (x + 1 < kw) acc(i + kw + 1, k, dr, dg, db);
+              if (y + 1 < kh) {
+                acc(i + 2 * kw, k, dr, dg, db);
+                if (x + 1 < kw) acc(i + 2 * kw + 1, k, dr, dg, db);
+              }
+              px[i].r = px[i].g = px[i].b = c;
+            }
+          }
+          return px;
+        };
+
+        auto run_cmp = [&](const rd::DitherAlgorithm* algo,
+                           const std::vector<rd::RgbaF>& expect,
+                           const char* what) {
+          std::vector<rd::RgbaF> got = src;
+          rd::DitherJob job;
+          job.palette = kpal.get();
+          job.width = kw;
+          job.height = kh;
+          job.frames = 1;
+          job.diffusion = 1.0;
+          const rd::DitherResult rr = algo->run(job, got.data());
+          if (!rr.error.empty()) {
+            std::fprintf(stderr, "  %-52s FAIL (%s)\n", what, rr.error.c_str());
+            std::fflush(stderr);
+            ++kbad;
+            return;
+          }
+          for (std::size_t i = 0; i < kn; ++i) {
+            if (got[i].r != expect[i].r || got[i].g != expect[i].g ||
+                got[i].b != expect[i].b) {
+              std::fprintf(stderr,
+                           "  %-52s FAIL\n"
+                           "    first diff at (%zu,%zu): got %g want %g\n",
+                           what, i % kw, i / kw, static_cast<double>(got[i].r),
+                           static_cast<double>(expect[i].r));
+              std::fflush(stderr);
+              ++kbad;
+              return;
+            }
+          }
+          kcheck(what, true);
+        };
+
+        const rd::DitherAlgorithm* fs = rd::FindDither("floyd-steinberg");
+        const rd::DitherAlgorithm* at = rd::FindDither("atkinson");
+        kcheck("floyd-steinberg registered", fs != nullptr);
+        kcheck("atkinson registered", at != nullptr);
+        if (fs != nullptr) {
+          run_cmp(fs, ref_fs(src), "floyd-steinberg matches its documented kernel");
+        }
+        if (at != nullptr) {
+          run_cmp(at, ref_at(src), "atkinson matches its documented kernel");
+        }
+        bad += (kbad != 0) ? 1 : 0;
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+      }
+
+      // void-and-cluster must build a real rank distribution.  The builder seeds
+      // its binary image with EVERY pixel ON (rd_dithers_ordered.cc), and a
+      // blur of a uniform field is uniform, so argmax/argmin both return index 0
+      // on every step: rank[0] ends at n*n and every other rank is 0 -- the
+      // "64x64 and 32x32 differ by only ~32 pixels" loose end in that file is
+      // this.  Observable: OrderedPick's threshold t is 0 nearly everywhere, so
+      // a flat value nearer black sends ~every pixel to white.  A real 32x32
+      // matrix spreads t over [0,1), and the far-entry fraction lands near the
+      // pixel's own ratio (d_near/d_far)^2 ~ 0.18 at 0.3 of white.
+      {
+        std::fprintf(stderr, "void-and-cluster matrix:\n");
+        int vbad = 0;
+        auto vcheck = [&](const char* what, bool ok) {
+          std::fprintf(stderr, "  %-52s %s\n", what, ok ? "ok" : "FAIL");
+          std::fflush(stderr);
+          if (!ok) ++vbad;
+        };
+        const rd::DitherAlgorithm* vc = rd::FindDither("void-and-cluster-fast");
+        vcheck("void-and-cluster-fast registered", vc != nullptr);
+        if (vc != nullptr) {
+          const std::size_t vw = 96, vh = 96, vn = vw * vh;  // 3x3 tiles of 32
+          auto vpal = std::make_unique<rd::Palette>();
+          vpal->count = 2;
+          vpal->entries[0].r = vpal->entries[0].g = vpal->entries[0].b = 0.0;
+          vpal->entries[1].r = vpal->entries[1].g = vpal->entries[1].b = 65535.0;
+          std::vector<rd::RgbaF> img(vn);
+          const float v = 0.30f * 65535.0f;
+          for (std::size_t i = 0; i < vn; ++i) {
+            img[i].r = img[i].g = img[i].b = v;
+            img[i].a = 65535.0f;
+          }
+          rd::DitherJob job;
+          job.palette = vpal.get();
+          job.width = vw;
+          job.height = vh;
+          job.frames = 1;
+          job.diffusion = 1.0;
+          const rd::DitherResult rr = vc->run(job, img.data());
+          vcheck("runs without error", rr.error.empty());
+          if (rr.error.empty()) {
+            std::size_t far_count = 0;
+            for (std::size_t i = 0; i < vn; ++i) {
+              if (img[i].r > 30000.0f) ++far_count;
+            }
+            const double frac = static_cast<double>(far_count) / static_cast<double>(vn);
+            std::fprintf(stderr,
+                         "  far-entry fraction: %.4f (degenerate matrix: ~1.0,"
+                         " correct: ~0.18)\n",
+                         frac);
+            std::fflush(stderr);
+            vcheck("threshold ranks are spread, not all at zero",
+                   frac > 0.10 && frac < 0.30);
+          }
+        }
+        bad += (vbad != 0) ? 1 : 0;
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+      }
+      std::printf("%s\n", bad == 0 ? "self-test PASSED" : "self-test FAILED");
       return bad == 0 ? 0 : 5;
     }
     PrintUsage();

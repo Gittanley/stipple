@@ -98,11 +98,24 @@ DitherResult FloydSteinberg(DitherJob& job, RgbaF* px) {
         const float er = r - static_cast<float>(c.r);
         const float eg = g - static_cast<float>(c.g);
         const float eb = b - static_cast<float>(c.b);
-        Accumulate(e, n, i + 1, 7.0f / 16.0f, 7.0f / 16.0f, 7.0f / 16.0f, er, eg, eb);
+        // The right tap is guarded: at the last column i+1 is the FIRST pixel
+        // of the NEXT row, and Accumulate's only check is i >= n, so the
+        // unguarded 7/16 used to land there -- a cross-row write that nothing
+        // bounds.  Off-frame taps are dropped, which is what ImageMagick's own
+        // FloydSteinbergDither does with its edge taps (quantize.c: its 3/16
+        // and 1/16 carries are guarded by x > 0 and x < columns-1).
+        if (x + 1 < w) {
+          Accumulate(e, n, i + 1, 7.0f / 16.0f, 7.0f / 16.0f, 7.0f / 16.0f, er, eg, eb);
+        }
+        // below-left: clamped to `below` at column 0, as it has always been.
         Accumulate(e, n, i + w - (x > 0 ? 1 : 0), 3.0f / 16.0f, 3.0f / 16.0f, 3.0f / 16.0f, er, eg, eb);
-        Accumulate(e, n, i + w + 1, 5.0f / 16.0f, 5.0f / 16.0f, 5.0f / 16.0f, er, eg, eb);
-        if (x + 2 < w) {
-          Accumulate(e, n, i + w + 2, 1.0f / 16.0f, 1.0f / 16.0f, 1.0f / 16.0f, er, eg, eb);
+        // below is i + w.  It used to be i + w + 1, with 1/16 at i + w + 2:
+        // `below` never received 5/16 at all, below-right got 5/16, and one
+        // pixel further right got 1/16 -- three taps displaced by one column,
+        // caught by --self-test's reference transcription.
+        Accumulate(e, n, i + w, 5.0f / 16.0f, 5.0f / 16.0f, 5.0f / 16.0f, er, eg, eb);
+        if (x + 1 < w) {
+          Accumulate(e, n, i + w + 1, 1.0f / 16.0f, 1.0f / 16.0f, 1.0f / 16.0f, er, eg, eb);
         }
         WriteChosen(frame[i], c);
       }
@@ -159,7 +172,11 @@ DitherResult Atkinson(DitherJob& job, RgbaF* px) {
         // Right, then the three below, then down-left and down-right.  No
         // same-row-left and no two-rows-down: those are exactly the two Atkinson
         // drops relative to Floyd-Steinberg.
-        Accumulate(e, n, i + 1, k, k, k, er, eg, eb);
+        //
+        // Guarded at the last column: i + 1 there is the first pixel of the
+        // NEXT row, and Accumulate only rejects i >= n, so the unguarded 1/8
+        // used to leak across the row boundary.
+        if (x + 1 < w) Accumulate(e, n, i + 1, k, k, k, er, eg, eb);
         if (x > 0) Accumulate(e, n, i + w - 1, k, k, k, er, eg, eb);
         Accumulate(e, n, i + w, k, k, k, er, eg, eb);
         if (x + 1 < w) Accumulate(e, n, i + w + 1, k, k, k, er, eg, eb);
