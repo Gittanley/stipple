@@ -88,3 +88,49 @@ were measured and **rejected**:
 The dithered images contain ~6,875 unique colours, because dithering deliberately
 introduces local variation that defeats palette-based compression. That is the
 algorithm working as intended, not an inefficiency to optimise away.
+
+## Benchmark clip
+
+`tools\bench.ps1` measures throughput on a **real** clip, because an fps figure taken
+from a `lavfi` gradient describes a gradient. The `video-fps` suite refuses to run
+without `-ClipFile` and refuses to run against the synthetic fixture, for the same
+reason the image suites report dropped configurations instead of hiding them.
+
+The clip is **not committed** — 529.9 MB — and is fetched on demand:
+
+| field | value |
+|---|---|
+| title | *Waves off of dock at Boston harbor* |
+| url | <https://upload.wikimedia.org/wikipedia/commons/a/ac/Waves_off_of_dock_at_Boston_harbor._1080P_60fps._No_Audio.ogg> |
+| description page | <https://commons.wikimedia.org/wiki/File:Waves_off_of_dock_at_Boston_harbor._1080P_60fps._No_Audio.ogg> |
+| author | Adam S. Keck (Commons user *Ghostis*) |
+| licence | **CC BY-SA 4.0** |
+| copyright status | **copyrighted** — *not* public domain, unlike every image above |
+| size | 555,660,139 bytes (529.9 MB) |
+| sha256 | `F2F353C3D88AE91D620AB1F57E6D8043688AB62E76EAEFC6C0CF6E7B257BDF55` |
+| measured properties | 1920x1080, `r_frame_rate` 60000/1001, **3643** frames, 60.777383 s, Theora |
+
+Properties are from `ffprobe -count_frames` on the downloaded file, not from the file
+name: the name says "1080P 60fps", the container says 60000/1001.
+
+Because the licence is share-alike rather than public domain, this clip is kept out of
+the repository rather than committed alongside the examples; a redistributed derivative
+would carry the same licence.
+
+Benchmarks run against a **6-second excerpt**, so that a sweep over four engines and
+three repetitions costs minutes instead of an hour:
+
+| field | value |
+|---|---|
+| sha256 | `E0BF918DFBC3CA8E5C1D981D94E28E6AA36F1E9DB8BB47D56603033347F97644` |
+| properties | 1920x1080, **360** frames, 6.006 s, `r_frame_rate` 19001/317 |
+| encode | libx264 `-preset veryfast -crf 12 -pix_fmt yuv444p` |
+
+```
+ffmpeg -ss 10 -i waves.ogg -t 6 -an -c:v libx264 -preset veryfast -crf 12 -pix_fmt yuv444p waves_6s.mkv
+```
+
+The excerpt is re-encoded rather than stream-copied because `ogg`/`theora` does not cut
+on a frame boundary predictably. `-crf 12 -pix_fmt yuv444p` keeps the source's own
+colour space and introduces no chroma subsampling, so the frames reaching `rdither` are
+not already degraded before the dithering is measured.
