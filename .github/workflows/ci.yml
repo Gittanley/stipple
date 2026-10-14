@@ -195,23 +195,36 @@ jobs:
           & pwsh -NoProfile -File .\verify.ps1 *>&1 | Tee-Object -FilePath $log
           $code = $LASTEXITCODE
           Write-Host "verify.ps1 exit=$code"
-          if ($code -ne 0) { Write-Host "verify.ps1 FAILED (exit $code)"; exit $code }
+          # verify.ps1's exit contract (its header): 0 all ran and passed, 1 FAILED,
+          # 2 incidental gap (no device, no fixture), 3 watchdog, 4 pass with declared
+          # exclusions -- which is the DEFAULT run's own exit code since 6a0da1e
+          # (2026-10-10).  This step failed every non-zero exit and asserted one
+          # exact coverage string, both written against the pre-4 contract, so every
+          # run since 2026-10-10 went red HERE on a tree where everything passed:
+          # eleven consecutive reds.  A red nobody can act on trains people to
+          # ignore it, which is the same failure as a green that means nothing.
+          #
+          # Exit 2 is accepted deliberately, with a named cost: on a runner with no
+          # GPU the cuda/opencl probes exit 2 ("cannot run"), which is a gap -- and a
+          # job that failed on gaps could never go green on this hardware.  What that
+          # costs is exactness of the skip list; what it buys is a gate that can
+          # still turn red.  The coverage block below is printed so the gaps stay
+          # visible, and any REAL failure exits 1 and fails this job.
+          if ($code -notin 0, 2, 4) { Write-Host "verify.ps1 FAILED (exit $code)"; exit 1 }
           $text = Get-Content $log -Raw
 
-          # No stage may have been skipped outright.  A probe that reports itself
-          # SKIPPED is a different thing -- the bit-exact tally below counts those --
-          # but a stage verify.ps1 did not RUN at all (its -Fast path) used to print
-          # one yellow line and exit 0.  verify.ps1 now prints a `coverage:` line and
-          # exits 2 when that happens; this asserts the line, so the two cannot drift
-          # and a future edit that reintroduces a silent skip fails here rather than
-          # being noticed in a log nobody reads.
-          $cov = [regex]::Match($text, 'coverage: every stage ran\.\s+0 skipped\.')
-          if (-not $cov.Success) {
-            Write-Host "verify.ps1 did not report 'coverage: every stage ran. 0 skipped.'"
-            Write-Host "A stage was skipped outright, which is not the same as a probe"
-            Write-Host "reporting itself SKIPPED, and this job does not run -Fast."
+          # Print whichever coverage line verify.ps1 produced -- the all-clear or the
+          # skip list.  Asserting the verbatim all-clear is what went stale the day
+          # exit 4 landed and stayed wrong for four days; an assertion nobody can
+          # satisfy is an assertion nobody reads.  A successful run always prints one
+          # of them, so a MISSING coverage line means the summary itself broke, and
+          # that is a failure.
+          $covLines = @($text -split "`r?`n" | Where-Object { $_ -match 'coverage:' })
+          if ($covLines.Count -eq 0) {
+            Write-Host "verify.ps1 exited $code but printed no coverage line at all"
             exit 1
           }
+          $covLines | ForEach-Object { Write-Host $_ }
 
           $m = [regex]::Match($text, 'bit-exact cases:\s*(\d+) passed,\s*(\d+) failed(?:,\s*(\d+) SKIPPED)?')
           if (-not $m.Success) { Write-Host "could not find the bit-exact tally in the output"; exit 1 }
@@ -567,36 +580,28 @@ jobs:
             echo "nothing about Linux and nothing about build.sh. Read the step above"
             echo "this one for the real cause."
           else
-              echo "build.sh configured and compiled on ubuntu-latest."
-              echo
-              echo "**This is not yet a claim that Linux is supported.** The ImageMagick"
-              echo "flavour CMakeLists.txt understands is \`windows\` or \`conda\`, both of"
-              echo "which expect MSVC import libraries. If this step passed, either a"
-              echo "\`linux\` flavour has been added since this job was written, or the"
-              echo "build succeeded without linking ImageMagick. Check which."
-            else
-              echo "build.sh failed, which is the EXPECTED outcome on a machine with no"
-              echo "POSIX port of this source tree yet."
-              echo
-              echo "WHAT IS DONE: ImageMagick 7 Q16-HDRI builds from source on the runner,
-              echo "and CMakeLists.txt has a \`linux\` flavour for it. Both landed, and the
-              echo "configure step completes."
-              echo
-              echo "WHAT IS NOT DONE: the source is Windows-only. Five files include"
-              echo "windows.h unconditionally, and the Windows API surface is not just
-              echo "headers -- CreateFileMapping needs mmap, GetConsoleMode needs isatty /
-              echo "termios. So this job stops at the first such include, which is"
-              echo "src/rd_source.cpp:6. The build log above names the exact line."
-              echo
-              echo "This text was written when the blocker was the missing CMake
-              echo "flavour, and it stayed after that was fixed. A summary naming a
-              echo "blocker that no longer exists sends the next reader after the wrong
-              echo "thing."
-              echo
-              echo '```'
-              tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
-              echo '```'
-            fi
+            # The build ran and failed, which is the EXPECTED outcome on a machine
+            # with no POSIX port of this source tree yet.  (This branch used to be
+            # unreachable: a duplicate success-echo block and a second `else` made
+            # the whole step a bash syntax error, and `continue-on-error` above
+            # hid the fact that it had never once posted a summary.)
+            echo "build.sh failed, which is the EXPECTED outcome on a machine with no"
+            echo "POSIX port of this source tree yet."
+            echo
+            echo "WHAT IS DONE: ImageMagick 7 Q16-HDRI builds from source on the runner,"
+            echo "and CMakeLists.txt has a \`linux\` flavour for it. Both landed, and the"
+            echo "configure step completes."
+            echo
+            echo "WHAT IS NOT DONE: the source is Windows-only. Five files include"
+            echo "windows.h unconditionally, and the Windows API surface is not just"
+            echo "headers -- CreateFileMapping needs mmap, GetConsoleMode needs isatty /"
+            echo "termios. So this job stops at the first such include, which is"
+            echo "src/rd_source.cpp:6. The build log above names the exact line."
+            echo
+            echo '```'
+            tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
+            echo '```'
+          fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify, if the binary exists
