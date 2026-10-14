@@ -7,11 +7,6 @@
        pixel-for-pixel;
     2. `magick compare -metric AE`, an independent path through the CLI.
 
-  Every case is checked twice:
-    1. rdither --verify, which runs IM's full pipeline internally and diffs
-       pixel-for-pixel;
-    2. `magick compare -metric AE`, an independent path through the CLI.
-
   EXIT CODES -- these are load-bearing, and 4 was added on 2026-10-10 because the suite
   could not otherwise tell a caller "everything passed" from "something could not run":
 
@@ -149,10 +144,23 @@ if ($BudgetMinutes -gt 0) {
       }
       Write-Host "Killing the run. Exit 3: neither a pass nor a failure -- it did not finish." -ForegroundColor Red
       # The timer fires on a threadpool thread, so it cannot simply 'return' out of the
-      # script. Stop-Process on the parent is what actually ends it; the pending native
-      # children die with the pipeline.
+      # script.  The process is ended from the thread itself; the exit code is part of
+      # the documented contract (header: "3 the -BudgetMinutes watchdog fired") and used
+      # to be a lie: Stop-Process has no -ExitCode parameter, so the kill left the
+      # process's termination status at -1 and no caller could tell a budget kill from
+      # a crash.  Measured on this box:
+      #     pwsh -Command 'Stop-Process -Id $PID -Force'      -> exit -1
+      #     pwsh -Command '[Environment]::Exit(3)'            -> exit 3
+      # Native children do NOT die with the pipeline on Windows, so the direct
+      # children are killed explicitly first.  Grandchildren (ffmpeg under a probe's
+      # pwsh) can still outlive this -- a full tree kill needs a job object, which is
+      # more machinery than a 25-minute ceiling warrants -- stated here rather than
+      # assumed away.  The env var below is set on a process that dies in the next
+      # statement; nothing can read it, and it is kept only as a marker in any case.
+      Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID" -EA SilentlyContinue |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
       $env:RD_BUDGET_KILLED = '1'
-      Stop-Process -Id $PID -Force
+      [Environment]::Exit(3)
     }
   })
   $watch.Start()
@@ -224,6 +232,15 @@ $ErrorActionPreference = "Continue"
 $env:MAGICK_HOME = if ($env:MAGICK_HOME) { $env:MAGICK_HOME } else { "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI" }
 
 if (-not (Test-Path $Rdither)) { throw "rdither not found at $Rdither (run build.bat first)" }
+# Every probe below runs in a PowerShell 7 child (`& pwsh -NoProfile -File ...`).
+# Without pwsh on PATH each call raises CommandNotFoundException, which is
+# statement-terminating and EAP=Continue swallows into the log: execution
+# continues, $LASTEXITCODE keeps its PREVIOUS value -- typically 0 from an
+# earlier magick call -- and every probe would report pass without running.
+# Refuse loudly here instead of reporting a gate that examined nothing.
+if (-not (Get-Command pwsh -EA SilentlyContinue)) {
+  throw "pwsh (PowerShell 7) not found on PATH -- the probes run under it, and a gate without its probes is not a gate"
+}
 
 # ---- fixtures ---------------------------------------------------------------
 $fixtures = @{
@@ -354,7 +371,11 @@ foreach ($img in $images) {
       if ($skipEngines -contains $e.name) { $skipped++; continue }
       $out = Join-Path $ImageDir "$($img)_$($c)_$($e.name -replace '/','_').png"
       $text = (& $Rdither @($e.args) --colors $c --verify --quiet $src $out 2>&1 | Out-String)
-      $internal = $text -match "BIT-EXACT"
+      # The exit code is part of the verdict.  Without it a run that printed the
+      # BIT-EXACT line and then exited non-zero counted as a pass, because only
+      # the text was matched.
+      $rc = $LASTEXITCODE
+      $internal = ($rc -eq 0) -and ($text -match "BIT-EXACT")
       # Independent confirmation through the ImageMagick CLI.  `compare -metric`
       # prints to stderr, so it is funnelled through cmd to keep the number
       # clean instead of wrapped in a PowerShell ErrorRecord.
@@ -434,6 +455,12 @@ if (Test-Path $det) {
     2 { Skip-CannotRun "determinism" }
     default { Write-Host "determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  # A missing probe used to vanish: every guard here was `if (Test-Path $x)` with
+  # no else, so a deleted script added nothing to $stagesSkipped and the summary
+  # still printed "coverage: every stage ran" -- the precise lie this suite's own
+  # header (lines 30-33) exists to prevent. Recorded as the gap it is.
+  Skip-Stage 'determinism' 'probe script missing: tools\probe-determinism.ps1'
 }
 
 # The video pipeline is a third comparison, and neither of the two above can stand
@@ -515,6 +542,8 @@ if ($Fast) {
     2 { Skip-CannotRun "video" }
     default { Write-Host "video: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'video exactness' 'probe script missing: tools\probe-video-exact.ps1'
 }
 $swVid.Stop(); Add-Stage 'video exactness' $swVid.Elapsed.TotalMilliseconds
 
@@ -533,6 +562,8 @@ if (Test-Path $unv) {
     2 { Skip-CannotRun "unvisited pixel" }
     default { Write-Host "unvisited pixel: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'unvisited pixel' 'probe script missing: tools\probe-unvisited-pixel.ps1'
 }
 
 # A sixth: SourcePixFmtHasAlpha, the guard that decides whether the palette decoder gets 3
@@ -571,6 +602,8 @@ if (Test-Path $ag) {
     2 { Skip-CannotRun "alpha guard" }
     default { Write-Host "alpha guard: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'alpha guard' 'probe script missing: tools\probe-alpha-guard.ps1'
 }
 
 # And an eighth: the palette/reader overlap.  The flag is OPT-IN and off by default,
@@ -599,6 +632,8 @@ if ($Slow) {
       2 { Skip-CannotRun "palette overlap" }
       default { Write-Host "palette overlap: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
     }
+  } else {
+    Skip-Stage 'palette overlap' 'probe script missing: tools\probe-palette-overlap.ps1 (-Slow was requested)'
   }
 } else {
   Skip-ByDefault 'palette overlap' '295 s, and it gates a flag that ships OFF (KNOWN-ISSUES 4).  Run verify.ps1 -Slow.'
@@ -624,6 +659,8 @@ if (Test-Path $sd) {
     2 { Skip-CannotRun "split decode" }
     default { Write-Host "split decode: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'split decode' 'probe script missing: tools\probe-split-decode.ps1'
 }
 
 # And a tenth: does --palette-budget-ms actually bound the palette stage?  It did not until
@@ -644,6 +681,8 @@ if (Test-Path $pd) {
     2 { Skip-CannotRun "palette deadline" }
     default { Write-Host "palette deadline: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'palette deadline' 'probe script missing: tools\probe-palette-deadline.ps1'
 }
 
 # And an eleventh: is the HOST path bit-identical to the DEVICE path?
@@ -667,6 +706,8 @@ if (Test-Path $ho) {
     2 { Skip-CannotRun "host oracle" }
     default { Write-Host "host oracle: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'host oracle' 'probe script missing: tools\probe-host-oracle.ps1'
 }
 
 # And a fifth: the image determinism probe again, pointed at VIDEO.  The image one
@@ -690,6 +731,8 @@ if ($Fast) {
     2 { Skip-CannotRun "video determinism" }
     default { Write-Host "video determinism: FAILED (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
   }
+} else {
+  Skip-Stage 'video determinism' 'probe script missing: tools\probe-video-determinism.ps1'
 }
 $swVdet.Stop(); Add-Stage 'video determinism' $swVdet.Elapsed.TotalMilliseconds
 # And a sixth, and the one that closes a gap four faults lived in: does the video
