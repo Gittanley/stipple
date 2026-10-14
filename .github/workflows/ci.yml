@@ -239,6 +239,17 @@ jobs:
           }
           Write-Host "OK: $passed real bit-exact cases passed on a GPU-less runner"
 
+          # An explicit exit 0, because the runner runs this file as
+          # `pwsh -command ". '<file>'"` and appends its own
+          # `if (Test-Path variable:\LASTEXITCODE) { exit $LASTEXITCODE }`.
+          # An `exit N` executed inside an invoked script does not carry N out
+          # to the process as N: measured locally (pwsh 7.6.6) and reproduced on
+          # this job's own log, a $LASTEXITCODE of 2 left standing for that
+          # append exits 1 -- so this step went red on a run where every
+          # assertion above passed.  `exit 0` resets what the append will see;
+          # the failure branches above exit 1 and stay 1.
+          exit 0
+
   cuda:
     # Compilation only in practice: nvcc compiles and links without a device, so this
     # verifies the CUDA build is not broken, and then verify.ps1 reports the GPU checks
@@ -620,6 +631,13 @@ jobs:
           & pwsh -NoProfile -File ./verify.ps1 *>&1 | Tee-Object -FilePath $log
           $code = $LASTEXITCODE
           Write-Host "verify.ps1 exit=$code"
+          # The same exit contract as the Windows job's Verify step (verify.ps1's
+          # header): 0 all ran and passed, 1 FAILED, 2 incidental gap, 4 pass with
+          # declared exclusions.  This step used to assert only the tally below,
+          # which let a verify.ps1 that exited 1 pass whenever its tally line still
+          # read "0 failed" -- an exit code is the summary of every assertion the
+          # suite makes, and the tally is one of them.
+          if ($code -notin 0, 2, 4) { Write-Host "verify.ps1 FAILED (exit $code)"; exit 1 }
           $text = Get-Content $log -Raw
           $cov = [regex]::Match($text, 'coverage: every stage ran\.\s+0 skipped\.')
           if (-not $cov.Success) {
@@ -640,3 +658,10 @@ jobs:
           Write-Host "OK: $passed bit-exact cases against a LINUX ImageMagick."
           Write-Host "That is the first time this project's core claim has been tested"
           Write-Host "against a non-Windows ImageMagick."
+          # Explicit exit 0 for the same reason as the Windows job's Verify step:
+          # the runner's appended `exit $LASTEXITCODE` collapses an N >= 2 left
+          # over from verify.ps1 down to a process exit of 1.  This step is
+          # guarded by the build succeeding (which it does not yet on a hosted
+          # runner), so the bug is latent here -- but it would otherwise fail a
+          # first fully-passing Linux run, which is the worst time to find it.
+          exit 0
