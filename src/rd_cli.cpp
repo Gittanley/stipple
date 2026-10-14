@@ -1519,7 +1519,9 @@ int main(int argc, char** argv) {
                     mismatches == 0 ? "match" : "DIFFER");
         if (mismatches != 0 && level <= 3) {
           // Small enough to dump.  The last entry is the trailing
-          // ForgetGravity visit, which is the origin, not a d2xy cell.
+          // ForgetGravity visit: one more visit at the resting cursor,
+          // wherever the last curve step left it -- not necessarily the
+          // origin (measured: level 1 rests at (1,1)).
           const std::size_t side = static_cast<std::size_t>(1) << level;
           std::vector<rd::CurveStepEntry> curve(rd::CurveEntryCount(level));
           rd::BuildCurveSequence(level, side, side, curve.data());
@@ -1532,9 +1534,12 @@ int main(int argc, char** argv) {
                           curve[n].x, curve[n].y, x, y);
             }
           }
-          if (leaves > 0 && (curve[leaves].x != 0 || curve[leaves].y != 0)) {
-            std::printf("    trailing visit=(%d,%d), expected the origin\n",
-                        curve[leaves].x, curve[leaves].y);
+          if (leaves > 0 &&
+              (curve[leaves].x != curve[leaves - 1].x ||
+               curve[leaves].y != curve[leaves - 1].y)) {
+            std::printf("    trailing visit=(%d,%d), but the last step rested at (%d,%d)\n",
+                        curve[leaves].x, curve[leaves].y,
+                        curve[leaves - 1].x, curve[leaves - 1].y);
           }
         }
         bad += (mismatches != 0) ? 1 : 0;
@@ -1628,11 +1633,14 @@ int main(int argc, char** argv) {
       // Diffusion kernels: Floyd-Steinberg and Atkinson must place error on the
       // documented neighbours and must never write into the NEXT row from the
       // right edge.  The reference below is transcribed from the kernel diagrams
-      // at the head of each algorithm in rd_dithers.cc, independently of the
-      // implementation being tested.  It fails on the current code: FS puts its
-      // 5/16 at below-right and its 1/16 one pixel further right (so `below`
-      // never receives 5/16), and both algorithms leak the right-edge tap into
-      // the next row's first pixel because Accumulate only rejects i >= n.
+      // at the head of each algorithm in rd_dithers.cc.  It was written while the
+      // code was still wrong and failed then; since 4ac7c05 (FS tap placement,
+      // Atkinson right-edge guard) it passes, and it must stay green.  One known
+      // caveat, recorded rather than hidden: the Atkinson INTERIOR tap set here
+      // pins the code's current set, which differs from the canonical
+      // {i+1, i+2, i+w-1, i+w, i+w+1, i+2w} (see notes on the Atkinson interior
+      // finding) -- so a future canonicalisation must edit this reference too,
+      // deliberately, not discover it as a surprise failure.
       {
         std::fprintf(stderr, "diffusion kernels:\n");
         int kbad = 0;

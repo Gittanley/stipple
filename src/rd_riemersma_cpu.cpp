@@ -215,8 +215,16 @@ std::size_t CurveTransformMismatches(int level, int transform) {
     }
     if (tx != curve[n].x || ty != curve[n].y) ++mismatches;
   }
-  // The trailing visit is the origin: the Hilbert path closes on itself.
-  if (curve[leaves].x != 0 || curve[leaves].y != 0) ++mismatches;
+  // The trailing entry is one more visit at the RESTING cursor with no advance
+  // (quantize.c: RiemersmaDither(ForgetGravity) after the loop).  This line
+  // used to assert the ORIGIN on the comment "the Hilbert path closes on
+  // itself" -- measured, it does not: at level 1 the last step rests at (1,1),
+  // and BuildCurveSequence used to hardcode (0,0) into the trailing slot, so a
+  // constant satisfied the assertion and the check could never fail.  The
+  // honest property is no-advance: the trailing visit is exactly where the
+  // last curve step left the cursor.
+  if (curve[leaves].x != curve[leaves - 1].x ||
+      curve[leaves].y != curve[leaves - 1].y) ++mismatches;
   return mismatches;
 }
 
@@ -234,6 +242,15 @@ void BuildCurveSequence(int level, std::size_t /*width*/, std::size_t /*height*/
     out[n].x = vx;
     out[n].y = vy;
     out[n].dir = static_cast<int>(dir);
+    // Track the resting cursor.  These two assignments were missing, so x,y
+    // stayed (0,0) from their initialiser, the trailing ForgetGravity entry
+    // below was hardcoded (0,0), and the self-test that "verifies" it
+    // (CurveTransformMismatches) compared a constant with itself -- incapable
+    // of failing, and destined to turn RED the moment anyone made this
+    // producer honest.  A check must be able to fail before it can mean
+    // anything.
+    x = vx;
+    y = vy;
     ++n;
   });
   // quantize.c:DitherImage() finishes with RiemersmaDither(ForgetGravity):

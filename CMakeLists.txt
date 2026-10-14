@@ -179,12 +179,19 @@ if(RD_WITH_CUDA)
     message(WARNING "No CUDA compiler found; building the CPU engine only.")
     set(RD_WITH_CUDA OFF)
   else()
-    enable_language(CUDA)
+    # Before enable_language, on purpose.  With cmake_minimum_required(3.24) the
+    # CMP0104 NEW behaviour initialises CMAKE_CUDA_ARCHITECTURES during
+    # enable_language(CUDA), so a `NOT DEFINED` guard placed AFTER it never
+    # fires: measured on this box, the cache held "75" (detected from the local
+    # GPU) and the `75 90` written here never applied, so the Hopper-forward
+    # half of the comment below was never true.  Set first, and both the
+    # documented default and a -D override work as advertised.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
       # sm_75 covers the GTX 1650 SUPER present on this machine; 90 is forward
       # looking for Hopper.  Override with -DCMAKE_CUDA_ARCHITECTURES=...
       set(CMAKE_CUDA_ARCHITECTURES 75 90)
     endif()
+    enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     # FMA contraction and fast-math would break bit-exactness on the device, so
