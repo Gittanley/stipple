@@ -152,8 +152,17 @@ for ($r = 1; $r -le $Reps; $r++) {
     try { $exitCode = $p.ExitCode } catch { $exitCode = $null }
 
     $text = (Get-Content $log -EA SilentlyContinue) -join "`n"
+    # The fps the summary prints is `(N.N fps, palette included)` (rd_cli.cpp:
+    # the "frames : ... in ... s" line).  The regex used to demand ` fps)` --
+    # an immediate close paren -- which that line never has, so EVERY rep was
+    # voided as 'no "(N.N fps)" in the output' and the fps column of this probe
+    # has been empty since the initial commit.  A table that looks complete
+    # while one of its columns never fills is the quiet half of this project's
+    # failure modes; matched against the real format now, and only that line --
+    # the earlier `@ 30.000 fps` header would be matched by a looser regex and
+    # is the wrong number.
     $fps = $null
-    if ($text -match '\(([\d.]+) fps\)') { $fps = [double]$Matches[1] }
+    if ($text -match '\(([\d.]+) fps, palette included\)') { $fps = [double]$Matches[1] }
 
     $why = $null; $cls = ''
     if ($exitCode -ne 0) { $why = "rdither exited $exitCode"; $cls = 'fail' }

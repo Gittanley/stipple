@@ -10,8 +10,14 @@
 
     A portable build is used rather than an installer for the same reason
     ImageMagick uses one in CI: an installer that can prompt is an installer that
-    will eventually hang a job.  The archive is pinned to a numbered release, not
-    to "latest", because a moving target turns a green build red with nothing in
+    will eventually hang a job.  MEASURED 2026-10-14: BtbN/FFmpeg-Builds publishes
+    ONE rolling release (tag `latest`, rebuilt every few days) and no versioned
+    releases, so the URL cannot be pinned -- an earlier comment here claimed a
+    numbered pin that never existed.  What is done instead: the zip is verified by
+    CONTENT against that release's own checksums.sha256 before use, and the
+    resolved hash is printed, so a log records which build a run used even though
+    the URL never changes.  A hard-coded hash pin was considered and rejected: it
+    would turn this step red every few days on BtbN's schedule, for nothing in
     this repository having changed.
 
     The BtbN archive nests as <root>\bin\ffmpeg.exe, so the bin directory is what
@@ -33,8 +39,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# A numbered release, not master.  "latest" on this repository is a nightly build
-# whose name changes every day, which would make this step unreproducible.
+# The URL is BtbN's rolling release and the asset name contains "latest" because
+# that is what BtbN ships (see the .DESCRIPTION above: one release, no versions).
+# Reproducibility comes from the checksum step below, not from this string.
 $Archive = 'ffmpeg-n8.1-latest-win64-gpl-8.1.zip'
 $Url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/$Archive"
 
@@ -56,6 +63,24 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
   }
 }
 Write-Host ("  {0:N1} MB" -f ((Get-Item $zip).Length / 1MB))
+
+# Content verification, because the URL above cannot pin anything.  The release
+# ships checksums.sha256 beside every asset; the zip is verified against it
+# BEFORE extraction, so a truncated download or an asset swapped under the same
+# name fails here with both hashes named, instead of becoming a confusing error
+# three probes later.
+$sums = Join-Path $Prefix 'checksums.sha256'
+Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/checksums.sha256' `
+                  -OutFile $sums -UseBasicParsing -TimeoutSec 300
+$wantLine = Get-Content $sums | Where-Object { $_ -match ([regex]::Escape($Archive) + '\s*$') } | Select-Object -First 1
+if (-not $wantLine) { throw "checksums.sha256 has no line for $Archive -- the asset was renamed; re-measure, do not guess" }
+$want = ($wantLine -split '\s+')[0].ToLowerInvariant()
+$got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+Write-Host "  sha256: $got   (release's checksums.sha256: $want)"
+if ($got -ne $want) {
+  throw "checksum mismatch for ${Archive}: release says $want, download is $got"
+}
+Write-Host "  [ok] matches the release's own checksums.sha256"
 
 # Expand-Archive, not 7-Zip, and that is a deliberate change from the first draft of
 # this script.  The first draft shelled out to C:\Program Files\7-Zip\7z.exe, which
