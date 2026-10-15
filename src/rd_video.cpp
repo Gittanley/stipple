@@ -1337,18 +1337,26 @@ bool VideoProbe(const std::string& path, VideoInfo* out, std::string* error) {
   // One frame, one palette, exit 0. `want` clamps to its floor of 1 and the montage is a
   // single cell. See docs\KNOWN-ISSUES.md item 2.
   //
-  // So when the declared count is absent, COUNT it. `-count_frames` decodes the stream, so
-  // this is not free -- it is a second pass over the file -- and it is paid exactly once,
-  // only when the cheap answer was unavailable. That ordering is the whole design: trust
-  // the declared count when there is one, and only spend a decode when there is not.
+  // So when the declared count is absent, COUNT it. `-count_packets` counts by
+  // DEMUXING the stream rather than decoding it -- a read of packet headers, not a
+  // full decode pass -- and it is paid exactly once, only when the cheap answer was
+  // unavailable. That ordering is the whole design: trust the declared count when
+  // there is one, and only spend a pass when there is not.
+  //
+  // `-count_packets` answers the same number as `-count_frames` on every shape that
+  // reaches this branch (measured with ffprobe side by side: tests\clip1920_audio.mkv
+  // 60 == 60, ffv1 yuv444p fixtures 30 == 30, the same clip remuxed to mpegts 60 == 60
+  // -- all three declared `N/A`, so all three take this path). One video packet is
+  // one frame on these containers; a container where that is false would have to
+  // declare its count wrong too, to be affected here.
   //
   // Cached in `out->frames`, so every caller sees one number and the cost is never paid
   // twice. A source that declares 0 frames AND cannot be counted keeps 0, which is the
   // pre-existing behaviour rather than a new failure.
   if (out->frames <= 0) {
     const std::string cargs =
-        "-v error -select_streams v:0 -count_frames "
-        "-show_entries stream=nb_read_frames -of default=nw=1:nk=1 " + Quote(path);
+        "-v error -select_streams v:0 -count_packets "
+        "-show_entries stream=nb_read_packets -of default=nw=1:nk=1 " + Quote(path);
     Child counter;
     if (counter.Start(ffprobe, cargs, /*capture_stdout=*/true,
                       /*feed_stdin=*/false, error, "probe-count")) {
