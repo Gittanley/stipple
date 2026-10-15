@@ -124,20 +124,45 @@ inline int OrderedPick(const Palette& pal, float r, float g, float b, float t) {
     }
   }
   if (d_second < 0.0f) return first;  // one-colour palette: nothing to choose between
-  // How far along the spectrum the pixel is, as a RATIO of the two distances: 0 when it
-  // sits on `first`, large when it sits on `second`.  The ratio -- not
-  // d_first/(d_first+d_second), which is what the first version of this function used
-  // -- is what makes the endpoints come out right.  With the sum form, a pixel exactly
-  // on an entry has d_first = 0, so the fraction is 0, and the old `fraction < t` test
-  // then selected the FARTHER entry: every pixel that landed cleanly on a palette entry
-  // was pushed off it, and the output came out flat.  Caught by cropping three adjacent
-  // pixels and noticing all three were identical.
+  // Where the pixel sits along the first -> second segment, as a LINEAR fraction:
+  // square roots because d_first/d_second above are squared distances (that is
+  // the search's currency -- one multiply-free compare per entry, no sqrt in the
+  // loop), and the sum form because the endpoints are what it has to get right.
+  // With d_near <= d_far the result lies in [0, 0.5]; at most the midpoint,
+  // where the two distances reach equality.
   //
-  // d_second can be 0 only if two palette entries coincide; the division is guarded
-  // rather than allowed to produce an infinity, because a NaN here would make the
-  // comparison false and silently collapse the dither.
+  // Two properties fall out of that range, and both were broken by the ratio of
+  // SQUARED distances this replaced:
+  //
+  //   * THE DIFFUSION-0 CONTRACT stated at the top of this function: frac <= 0.5
+  //     means `t < frac` at t = 0.5 is never true, so --diffusion 0 emits the
+  //     nearest entry everywhere.  The squared ratio could exceed 0.5 --
+  //     (d_near/d_far)^2 > 0.5 whenever d_near > 0.707 * d_far -- so every pixel
+  //     in the band between that bound and the midpoint was pushed off its
+  //     nearest entry.  Measured: gray 64 against {0,127,128,255} (distances 63
+  //     and 64, ratio 0.97) emitted entry 0 while its nearest entry was 127.
+  //     Pinned by the self-test block "bayer-ordered diffusion-0 contract".
+  //
+  //   * THE RAMP: a pixel whose linear position from its nearest entry is p is
+  //     emitted as the far entry for the threshold fraction p of the matrix, so
+  //     a uniform matrix renders position p as p far-colour.  Under the squared
+  //     ratio that fraction was (p/(1-p))^2 instead: position 0.25 rendered at
+  //     0.111, darks crushed -- a gamma bias, not a rounding difference.
+  //
+  // The endpoint case that once drove this function away from the sum form was
+  // a DIRECTION bug, not the sum: a pixel exactly on an entry has frac = 0, the
+  // old test read `frac < t`, and 0 < t chose the FARTHER entry for every clean
+  // palette hit -- caught originally by cropping three adjacent pixels and
+  // finding all three identical.  Under `t < frac` the sum form returns `first`
+  // there, the entry the pixel sits on, which is the whole point.
+  //
+  // d_second can be 0 only if two palette entries coincide; the division is
+  // guarded rather than allowed to produce a NaN, because a NaN here would make
+  // the comparison false and silently collapse the dither.
   if (d_second <= 0.0f) return second;  // duplicate entries: the nearer is the answer
-  const float frac = d_first / d_second;
+  const float s1 = std::sqrt(d_first);
+  const float s2 = std::sqrt(d_second);
+  const float frac = s1 / (s1 + s2);
   return (t < frac) ? second : first;
 }
 

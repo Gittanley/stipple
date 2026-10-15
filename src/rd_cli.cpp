@@ -1839,6 +1839,90 @@ int main(int argc, char** argv) {
         std::fflush(stderr);
       }
 
+      // --diffusion 0 collapses every threshold to 0.5 (scaled = 0.5 + (t - 0.5) *
+      // diffusion, in BayerOrdered), and the contract at OrderedPick's definition
+      // is that this "always picks the nearer entry -- plain nearest-colour".
+      // That held only while frac <= 0.5, which the sum form
+      // d_near/(d_near + d_far) guarantees because d_near <= d_far.  The ratio of
+      // SQUARED distances the function used could reach 1: gray 64 against
+      // {0,127,128,255} has nearest distance 63 and second 64, squared ratio
+      // 0.97 > 0.5, so the old code emitted entry 0 for a pixel whose nearest
+      // entry was 127.  The grays below straddle that bound -- 64, 115, 191 and
+      // 200 all trip it, the on-entry values 0/127/128/255 must not move -- and
+      // every output pixel must equal the scalar nearest entry of its input.
+      {
+        std::fprintf(stderr, "bayer-ordered diffusion-0 contract:\n");
+        int obad = 0;
+        auto ocheck = [&](const char* what, bool ok) {
+          std::fprintf(stderr, "  %-52s %s\n", what, ok ? "ok" : "FAIL");
+          std::fflush(stderr);
+          if (!ok) ++obad;
+        };
+        const rd::DitherAlgorithm* bo = rd::FindDither("bayer-ordered");
+        ocheck("bayer-ordered registered", bo != nullptr);
+        if (bo != nullptr) {
+          const std::size_t ow = 6, oh = 4, on = ow * oh;
+          const float entries[4] = {0.0f, 127.0f, 128.0f, 255.0f};
+          const float grays[8] = {0.0f, 64.0f, 115.0f, 127.0f,
+                                  128.0f, 191.0f, 200.0f, 255.0f};
+          // Heap: Palette is ~2 MiB (see rd_plugin.h).
+          auto opal = std::make_unique<rd::Palette>();
+          opal->count = 4;
+          for (int e = 0; e < 4; ++e) {
+            opal->entries[e].r = opal->entries[e].g = opal->entries[e].b =
+                entries[e];
+          }
+          std::vector<rd::RgbaF> ramp(on);
+          for (std::size_t i = 0; i < on; ++i) {
+            const float gv = grays[i % 8];
+            ramp[i].r = ramp[i].g = ramp[i].b = gv;
+            ramp[i].a = 65535.0f;
+          }
+          rd::DitherJob job2;
+          job2.palette = opal.get();
+          job2.width = ow;
+          job2.height = oh;
+          job2.frames = 1;
+          job2.diffusion = 0;
+          const rd::DitherResult rr = bo->run(job2, ramp.data());
+          ocheck("runs without error", rr.error.empty());
+          if (rr.error.empty()) {
+            std::size_t bad_i = on;
+            float bad_got = 0.0f, bad_want = 0.0f, bad_gray = 0.0f;
+            for (std::size_t i = 0; i < on; ++i) {
+              const float gv = grays[i % 8];
+              float best_d = 1e30f;
+              int best = 0;
+              for (int e = 0; e < 4; ++e) {
+                const float dd = gv - entries[e];
+                const float ad = dd < 0.0f ? -dd : dd;
+                if (ad < best_d) {
+                  best_d = ad;
+                  best = e;
+                }
+              }
+              if (ramp[i].r != entries[best]) {
+                bad_i = i;
+                bad_got = ramp[i].r;
+                bad_want = entries[best];
+                bad_gray = gv;
+                break;
+              }
+            }
+            if (bad_i < on) {
+              std::fprintf(stderr,
+                           "    first bad gray %g at (%zu,%zu): got %g want %g\n",
+                           bad_gray, bad_i % ow, bad_i / ow, bad_got, bad_want);
+            }
+            ocheck("diffusion 0 emits the nearest entry at every pixel",
+                   bad_i == on);
+          }
+        }
+        bad += (obad != 0) ? 1 : 0;
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+      }
+
       // void-and-cluster must build a real rank distribution.  The builder seeds
       // its binary image with EVERY pixel ON (rd_dithers_ordered.cc), and a
       // blur of a uniform field is uniform, so argmax/argmin both return index 0
@@ -1846,8 +1930,8 @@ int main(int argc, char** argv) {
       // "64x64 and 32x32 differ by only ~32 pixels" loose end in that file is
       // this.  Observable: OrderedPick's threshold t is 0 nearly everywhere, so
       // a flat value nearer black sends ~every pixel to white.  A real 32x32
-      // matrix spreads t over [0,1), and the far-entry fraction lands near the
-      // pixel's own ratio (d_near/d_far)^2 ~ 0.18 at 0.3 of white.
+      // matrix spreads t over [0,1), and the far-entry fraction lands at the
+      // pixel's linear position d_near/(d_near + d_far) = 0.30 at 0.3 of white.
       {
         std::fprintf(stderr, "void-and-cluster matrix:\n");
         int vbad = 0;
@@ -1886,11 +1970,11 @@ int main(int argc, char** argv) {
             const double frac = static_cast<double>(far_count) / static_cast<double>(vn);
             std::fprintf(stderr,
                          "  far-entry fraction: %.4f (degenerate matrix: ~1.0,"
-                         " correct: ~0.18)\n",
+                         " correct: ~0.30)\n",
                          frac);
             std::fflush(stderr);
             vcheck("threshold ranks are spread, not all at zero",
-                   frac > 0.10 && frac < 0.30);
+                   frac > 0.15 && frac < 0.45);
           }
         }
         bad += (vbad != 0) ? 1 : 0;

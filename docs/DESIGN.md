@@ -3678,6 +3678,18 @@ review.
 
 ### The void-and-cluster anomaly, measured properly and still not explained
 
+STATUS 2026-10-15: re-measured after `OrderedPick`'s threshold became the linear
+fraction `d_near/(d_near + d_far)` instead of the ratio of squared distances (the
+gamma-bias fix). The table below carries the new numbers. The anomaly as stated --
+two tile sizes that agree far more than they should -- no longer reproduces: the
+same two builds now disagree at 139,092 of 196,608 pixels (70.7%) at
+`--diffusion 1`. The only change between the old measurement and this one is that
+decision function, so the old near-agreement is now known to have been a property
+of it rather than of the rank fields. The control is unchanged and still
+load-bearing: `--diffusion 0` is exactly 0 differing in both eras. It is only
+post-fix, though, that 0 differing means "both filters are plain nearest-colour" --
+see the correction under the table.
+
 The README carried a sentence that had been there long enough to be treated as settled:
 the 64x64 and 32x32 void-and-cluster outputs "differ by only ~32 pixels in half a
 million, which is less than a tile-size change should produce and is not yet explained".
@@ -3691,9 +3703,9 @@ project a full afternoon once already -- see the note in probe-video-determinism
 | | differing pixels |
 |---|---|
 | `--diffusion 0` | **0** of 196,608 |
-| `--diffusion 1` | 144 (0.073%) |
-| `--diffusion 2` | 144 |
-| `--diffusion 8` | 144 |
+| `--diffusion 1` | **139,092** (70.7458%) |
+| `--diffusion 2` | 145,567 (74.0392%) |
+| `--diffusion 8` | 147,862 (75.2065%) |
 
 The zero at diffusion 0 is the load-bearing measurement. `--diffusion` reaches exactly
 one place in the ordered path -- `scaled = 0.5 + (t - 0.5) * diffusion`, feeding
@@ -3702,22 +3714,30 @@ filters plain nearest-colour. They then agree perfectly. So the entire disagreem
 in the threshold decision and nowhere else: not the palette, not the search, not the
 write-back.
 
-The invariance across 1, 2 and 8 is the strange part, and it is not an artefact of the
-measurement: each filter's own output hash does change with diffusion (verified
-separately), so those were four genuinely different renders. Scaling both thresholds
-about 0.5 widens the gap between them by the scale factor, which should sweep in more
-pixels each time. It does not, and the same 144 positions differ every time.
+That sentence was an inference the old measurement did not support, and it is worth
+saying so because it read as settled. With the squared-distance ratio a constant
+threshold of 0.5 did NOT mean nearest-colour: `frac` could exceed 0.5, so every pixel
+with `d_near > 0.707 * d_far` went to its farther entry. The two filters agreed at 0
+because a collapsed threshold makes the matrix irrelevant -- both ran the identical
+function -- not because the function was correct. The self-test's "bayer-ordered
+diffusion-0 contract" block fails on the old code exactly there (gray 64 emitted 0,
+nearest 127) and passes on this one, so post-fix the sentence is true as written and
+was true of neither filter before it.
 
-Mapping those positions back through the tiling:
-
-  * all 144 lie on a 32-tile seam; **none** is strictly interior;
-  * they are the image positions of exactly **3 cells of the 64x64 matrix** --
-    (32,0), (0,32) and (32,32);
-  * all three of those correspond to **(0,0) in the 32x32 grid**.
-
-So as far as the decision function can reveal it, the two rank fields agree at 4093 of
-4096 positions, and the entire disagreement is one cell of the 32x32 grid against the
-four quadrant origins of the 64x64 one.
+PRE-FIX HISTORY. The invariance across 1, 2 and 8 was the strange part of the old
+measurement, and it was not an artefact of it: each filter's own output hash did change
+with diffusion (verified separately), so those were four genuinely different renders, and
+still exactly the same 144 positions differed every time. Mapping those positions back
+through the tiling put all 144 on a 32-tile seam -- image positions of exactly **3 cells
+of the 64x64 matrix**, `(32,0)`, `(0,32)`, `(32,32)`, all corresponding to **(0,0) in
+the 32x32 grid** -- from which "the two rank fields agree at 4093 of 4096 positions" was
+concluded. None of that survives the decision-function fix: the counts now vary with the
+scale (139,092 / 145,567 / 147,862) and the position mapping was not repeated, because
+what it was mapping moved when the formula moved. The single variable between the two
+measurements is that formula, so the near-agreement it described was the old function's
+behaviour, not a property of the rank fields. The old numbers and the cell mapping stay
+in this file's git history rather than being restated here as if they described the
+product.
 
 What is NOT the cause, having been checked rather than assumed:
 
@@ -3731,11 +3751,14 @@ What is NOT the cause, having been checked rather than assumed:
     were each re-rendered to distinct filenames after the first measurement loop proved
     unable to tell them apart.
 
-Why two independently computed blue-noise rank fields agree that closely is not
-established. It is not a defect in the product's promise -- these are dither *choices*,
-documented as bit-exact with nothing and not trying to be -- but it does mean
-`void-and-cluster-fast` is 9x cheaper for an output that is 99.93% the same, which is
-either a bug or a documentation problem, and I cannot yet say which.
+Why two independently computed blue-noise rank fields agreed that closely has dissolved
+rather than been answered: with the decision function fixed, they do not -- the same two
+builds disagree at 70.7% of pixels at `--diffusion 1`. What remains open is the quality
+claim itself: whether either rank field is actually blue, which needs the spectrum
+measured directly and is still the README's "Not verified". Neither output is bit-exact
+with anything and neither claims to be; the 9x build-cost ratio now buys a genuinely
+different output rather than a 99.93% identical one, and which tile size is worth that
+cost is a quality question no check here answers.
 
 The next step, if anyone wants it, is to dump both rank fields directly and diff them,
 which a fixture that exposes the raw matrix would allow; the obstacle noted in the

@@ -642,23 +642,26 @@ dither *choices*. See [Where bit-exactness holds](#where-bit-exactness-holds).
 each is deterministic across repeated runs (`probe-determinism.ps1` sweeps 8 algorithms
 over 4 runs each).
 
-**Not verified:** that the void-and-cluster spectrum is actually blue, and the two tile
-sizes agree far more than they should. Measured on `tests\noisy.png` at 16 colours, the
-64×64 and 32×32 outputs differ by **144 pixels in 196,608 (0.073%)**, and:
+**Not verified:** that the void-and-cluster spectrum is actually blue. Measured on
+`tests\noisy.png` at 16 colours, the 64×64 and 32×32 outputs differ by **139,092
+pixels in 196,608 (70.7%)** at `--diffusion 1` — 145,567 at 2, 147,862 at 8 — and:
 
 - at `--diffusion 0` they differ by **zero** pixels, which localises the entire
-  disagreement to the threshold decision — diffusion is the only thing that flag touches;
-- it is **exactly 144 at `--diffusion` 1, 2 and 8**, though each render does change, so it
-  is not an artefact of how far the thresholds are scaled;
-- those 144 pixels are the image positions of **3 cells of the 64×64 matrix** —
-  `(32,0)`, `(0,32)`, `(32,32)` — and all three correspond to **`(0,0)` in the 32×32
-  grid**. Every one lies on a 32-tile seam; none is strictly interior.
+  disagreement to the threshold decision — diffusion is the only thing that flag touches —
+  and at that setting both really are plain nearest-colour, pinned per pixel by
+  `--self-test`;
+- the two tile sizes used to disagree at only **144 pixels (0.073%)** at every
+  diffusion above 0, and the old analysis concluded the matrices "agree at 4093 of
+  4096 positions". That near-agreement was a property of `OrderedPick`'s old
+  squared-distance threshold, not of the rank fields: the fix that gave the
+  threshold its linear fraction (see [docs/DESIGN.md](docs/DESIGN.md)) is the only
+  change between the two measurements, and with it the same two builds disagree at
+  70% of pixels. The old seam mapping died with it and is kept only as history.
 
-So the two matrices agree, as far as the decision function can show, at 4093 of 4096
-positions. Both really are built — the tables are separate statics and the build costs
-differ 9.4× — so *why* two independently computed blue-noise rank fields agree that
-closely is not established. The filters are sound and distinct; the quality claim is not
-yet earned. See [docs/DESIGN.md](docs/DESIGN.md).
+Both really are built — the tables are separate statics and the build costs differ
+9.4×. The filters are distinct (now measured, not inferred); whether either spectrum
+is blue, and so which tile size is worth its build cost, is not yet earned. See
+[docs/DESIGN.md](docs/DESIGN.md).
 
 Writing your own is three steps: copy that file, write the kernel, add it to
 `RD_SOURCES` in `CMakeLists.txt`. [include/rd_plugin.h](include/rd_plugin.h) has the
