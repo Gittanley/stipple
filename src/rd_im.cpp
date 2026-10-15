@@ -397,11 +397,25 @@ bool ImStore(const LoadedImage& loaded, const PixelStore& store,
              std::string* error) {
   Image* source = static_cast<Image*>(loaded.handle);
   ScopedException exc;
-  Image* out = CloneImage(source, 0, 0, MagickFalse, exc.get());
+  // Full extent rather than (0, 0).  The zero-extent path hands the clone a
+  // REFERENCE to the source's pixel cache (ReferencePixelCache), so the first
+  // QueueAuthenticPixels below copy-on-writes the whole image -- and every row of
+  // that image gets overwritten from `store` anyway, every call.  The non-zero
+  // extent path instead gives the clone a fresh empty cache (ClonePixelCache ->
+  // AcquirePixelCache + SetImageExtent) while still copying everything the write
+  // reads: channel map, alpha_trait, colormap, colorspace, profiles, properties,
+  // artifacts, blob.  The two paths differ only in pixel backing and in
+  // montage/directory, which the zero-extent path clones and this one skips --
+  // carried over below so an MIFF montage still travels to the output.
+  Image* out =
+      CloneImage(source, source->columns, source->rows, MagickFalse, exc.get());
   if (out == nullptr) {
     *error = "CloneImage failed: " + DescribeException(exc.get());
     return false;
   }
+  if (source->montage != nullptr) CloneString(&out->montage, source->montage);
+  if (source->directory != nullptr)
+    CloneString(&out->directory, source->directory);
   // RD_STORE_DUMP=<prefix> writes the store's raw bytes on entry and on exit, so
   // a store that is correct when the engine returns but wrong by the time it is
   // written is distinguishable from one that was always wrong.  That is the
