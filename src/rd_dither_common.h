@@ -17,8 +17,6 @@
 #include "rd_plugin.h"
 
 #include <cstddef>
-#include <cstdint>
-#include <cstring>
 #include <vector>
 
 namespace rd {
@@ -57,100 +55,6 @@ inline int NearestEntry(const Palette& pal, float r, float g, float b) {
   }
   return best;
 }
-
-// Exact-key memo around NearestEntry.
-//
-// NearestEntry scans the whole palette per call -- up to 256 squared-distance
-// computations per pixel -- but a diffusion dither reaches the SAME float triple
-// many times over a clip: flat source regions that accumulate the same
-// dithered value, and repeated frames across shots.  This memoises the scan on
-// the EXACT float bits of (r, g, b), so a hit returns precisely the index the
-// scan would have returned: no quantisation, no tolerance, no changed
-// tie-break.  Output is bit-identical by construction; only the cost of a
-// repeated colour changes.  Exact bits also make the memo safe for values that
-// quantise-style caches get wrong: -0.0f hits alongside +0.0f with the same
-// index, and NaN never hits, so NaN always takes the scan it took before.
-//
-// A miss pays one table probe and then the ordinary scan.  The table stops
-// ADMITTING new keys at half capacity, which bounds memory and keeps the probe
-// short; a full table is only slower, never wrong, because every slot stores
-// its exact key and a mismatch falls through to the scan.  That is also why
-// there is no eviction policy: a wrong answer is impossible to arrange through
-// table state.
-//
-// Palette identity: a hit is valid only for the palette it was computed
-// against.  The palette POINTER is not that identity -- an allocator reuses
-// addresses, the same trap the OpenCL F3 cache records in src/rd_opencl.cpp --
-// so the memo shadows the palette entries and rebuilds whenever they differ.
-// The comparison runs once per job (per NearestMemo instance), not per pixel.
-class NearestMemo {
- public:
-  NearestMemo() : table_(kSlots) { Clear(); }
-
-  int Nearest(const Palette& pal, float r, float g, float b) {
-    if (shadow_.size() != static_cast<std::size_t>(pal.count) ||
-        (pal.count > 0 &&
-         std::memcmp(shadow_.data(), pal.entries,
-                     static_cast<std::size_t>(pal.count) *
-                         sizeof(PaletteEntry)) != 0)) {
-      shadow_.assign(pal.entries, pal.entries + pal.count);
-      Clear();
-    }
-    const std::uint32_t h = Hash(r, g, b);
-    const std::size_t mask = kSlots - 1;
-    std::size_t i = static_cast<std::size_t>(h) & mask;
-    for (;;) {
-      const Slot& s = table_[i];
-      if (s.index == kEmpty) break;
-      if (s.hash == h && s.r == r && s.g == g && s.b == b) return s.index;
-      i = (i + 1) & mask;
-    }
-    const int best = NearestEntry(pal, r, g, b);
-    if (used_ < kSlots / 2) {
-      table_[i] = Slot{r, g, b, best, h};
-      ++used_;
-    }
-    return best;
-  }
-
- private:
-  static constexpr int kEmpty = -1;
-  // 8192 slots x 20 B = 160 KiB per memo, one memo per dither call.  Half-full
-  // stop means a probe chain never exceeds a few slots.
-  static constexpr std::size_t kSlots = 1 << 13;
-  struct Slot {
-    float r, g, b;
-    int index;
-    std::uint32_t hash;
-  };
-
-  static std::uint32_t Hash(float r, float g, float b) {
-    std::uint32_t h = 2166136261u;  // FNV-1a over the raw bits
-    auto mix = [&](float f) {
-      std::uint32_t v;
-      std::memcpy(&v, &f, sizeof(v));
-      h ^= v;
-      h *= 16777619u;
-    };
-    mix(r);
-    mix(g);
-    mix(b);
-    return h;
-  }
-
-  void Clear() {
-    for (Slot& s : table_) {
-      s.index = kEmpty;
-      s.hash = 0;
-      s.r = s.g = s.b = 0.0f;
-    }
-    used_ = 0;
-  }
-
-  std::vector<PaletteEntry> shadow_;
-  std::vector<Slot> table_;
-  std::size_t used_ = 0;
-};
 
 // One float per pixel per channel, zeroed.
 //
