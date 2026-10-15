@@ -441,6 +441,18 @@ bool JoinSegments(const std::string& out_path, const rd::Checkpoint& cp,
     *error = "the joined output is empty";
     return false;
   }
+  // Success: every segment's bytes are inside out_path now and nothing else needs
+  // them.  The deletion belongs HERE, behind the non-empty-output check, because
+  // the caller's failure message promises "the segments are intact; re-run to
+  // resume" -- so a failed or empty join must leave every part on disk, and only
+  // a verified join may consume them.  Failures are ignored in the same spirit as
+  // the list file's: an undeletable part is disk clutter, not a failed conversion.
+  // Order matters too -- the parts go before the checkpoint file at the call site,
+  // so a crash in between finds recorded segments missing, redoes them, and never
+  // the reverse, which would orphan the parts with nothing left to name them.
+  for (const rd::SegmentRecord& s : cp.segments) {
+    (void)DeleteFileA(s.path.c_str());
+  }
   return true;
 }
 

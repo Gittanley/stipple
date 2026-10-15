@@ -90,7 +90,8 @@ bool CheckpointValidate(Checkpoint* cp, const std::string& input,
 // Default checkpoint path for an output: "out.mkv" -> "out.mkv.rdcheck".
 std::string CheckpointPathFor(const std::string& out_path);
 
-// Segment path for output "out.mkv", segment 3: "out.mkv.part0003.mkv".
+// Segment path for output "out.mkv", segment index 3: "out.part0003.mkv".
+// The tag goes before the extension, and indices are 0-based.
 std::string SegmentPathFor(const std::string& out_path, int index);
 
 }  // namespace rd

@@ -25,6 +25,11 @@
 #      rate control per segment, and a byte comparison would fail forever on correct
 #      code.  Under ffv1 there is no encoder state to restart, so any difference is
 #      a difference in what rdither did.
+#   5. no `.partNNNN` files are left behind after a successful arm.  JoinSegments
+#      deleted the concat list but never the segments themselves, so every
+#      multi-segment run left its entire rendering on disk beside the joined
+#      output -- and once the checkpoint was gone (deleted on success), nothing
+#      could ever find or clean them up again.
 #
 # IT IS NOT TESTED against.  The gate compares decoded pixels, not hashes of files:
 # container bytes differ for reasons that have nothing to do with the dither, and a
@@ -111,6 +116,17 @@ try {
       $log | Select-Object -Last 6 | ForEach-Object { Write-Host "    $_" }
       return $null
     }
+    # Teeth for the orphaned-segments defect: a successful run must CONSUME its
+    # parts.  The single-segment arm does (the rename moves the only one); the
+    # multi-segment arm used to leave every one of them sitting in $tmp.  The tag
+    # goes BEFORE the extension -- out.mkv parts are out.part0000.mkv -- which is
+    # what the naive `out.mkv.part*` filter would look for and never find.
+    $orphan = @(Get-ChildItem -Path $tmp -Filter ($label + '.part*') -EA SilentlyContinue)
+    if ($orphan.Count -gt 0) {
+      Write-Host "    FAILED (left $($orphan.Count) part file(s) behind after success)"
+      foreach ($p in $orphan) { Write-Host "    orphan: $($p.Name)" }
+      return $null
+    }
     return $out
   }
 
@@ -153,7 +169,7 @@ try {
 
   if ($failures -eq 0) {
     ""
-    "segment frames: ok -- all arms exited 0 and the segmented pixels match"
+    "segment frames: ok -- all arms exited 0, pixels match, no parts left behind"
     exit 0
   }
   ""
