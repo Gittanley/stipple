@@ -23,7 +23,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cstdio>
@@ -263,6 +265,125 @@ void RawToFloats(const std::uint16_t* raw, RgbaF* dst, std::size_t pixels,
   }
 }
 
+// ---------------------------------------------------------------------------
+// The batch pool (P2).  One set of worker threads for the whole process, instead
+// of a fresh std::vector<std::thread> per call.
+//
+// The four frame-parallel converters below -- RawToFloatsParallel,
+// RawYuv444ToFloatsParallel, FloatsToYuv444Parallel, FloatsToRawParallel -- all
+// had the same shape: build a vector, emplace_back workers-1 threads, run the
+// caller's own chunk, join.  Each call happens PER BATCH: the reader converts
+// every batch it uploads and the writer converts every batch it does not skip,
+// so an 18001-frame run at --batch-frames 16 pays a spawn/join cycle ~1125 times
+// per site that runs.  A thread spawn is tens of microseconds of kernel time
+// that scales only with the batch count -- divide the clip finer and it gets
+// slower for no added work.
+//
+// What changes is the threads' lifetime.  The work is untouched: same chunks,
+// same lambdas, same arithmetic, the caller still runs chunk 0 -- so the bytes
+// are identical and only the scheduling differs.
+//
+// Contract: Submit and Wait are paired inside one converter call, and no caller
+// returns with work outstanding.  That is what lets ~BatchPool() discard its
+// queue rather than drain it: by static destruction every Pending has been
+// waited on, so nothing races teardown.
+// ---------------------------------------------------------------------------
+class BatchPool {
+ public:
+  // Handle for one Submit.  `left` counts tasks not yet finished; Wait blocks
+  // until it reads 0.
+  struct Pending {
+    std::shared_ptr<std::atomic<int>> left;
+  };
+
+  static BatchPool& Get() {
+    static BatchPool pool;
+    return pool;
+  }
+
+  // Queues every task for a pool worker and returns immediately.  Workers grow
+  // on demand: a burst larger than the idle workforce spawns more threads (up to
+  // the 64 ceiling the curve generator also uses) instead of queueing, so a
+  // machine with the reader and the writer converting at once gets the same
+  // parallelism the per-call pools gave it.
+  Pending Submit(std::vector<std::function<void()>> tasks) {
+    Pending pend{std::make_shared<std::atomic<int>>(static_cast<int>(tasks.size()))};
+    if (tasks.empty()) return pend;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (std::function<void()>& t : tasks) q_.push_back(Task{std::move(t), pend.left});
+      while (q_.size() > static_cast<std::size_t>(idle_) && workers_.size() < kMax) {
+        workers_.emplace_back([this] { Loop(); });
+      }
+    }
+    cv_.notify_all();
+    return pend;
+  }
+
+  // Blocks until THIS Submit's tasks have all finished.  The predicate is the
+  // caller's own counter, so a reader thread and a writer thread waiting at the
+  // same time never wait on each other's work.
+  static void Wait(const Pending& pend) {
+    if (pend.left->load() == 0) return;
+    BatchPool& self = Get();
+    std::unique_lock<std::mutex> lk(self.mu_);
+    self.done_.wait(lk, [&] { return pend.left->load() == 0; });
+  }
+
+ private:
+  static constexpr std::size_t kMax = 64;
+  struct Task {
+    std::function<void()> fn;
+    std::shared_ptr<std::atomic<int>> left;
+  };
+
+  BatchPool() {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const std::size_t n = hw < kMax ? hw : kMax;
+    for (std::size_t i = 0; i < n; ++i) workers_.emplace_back([this] { Loop(); });
+  }
+  ~BatchPool() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (std::thread& t : workers_) t.join();
+  }
+  BatchPool(const BatchPool&) = delete;
+  BatchPool& operator=(const BatchPool&) = delete;
+
+  void Loop() {
+    std::unique_lock<std::mutex> lk(mu_);
+    for (;;) {
+      while (!stop_ && q_.empty()) {
+        ++idle_;
+        cv_.wait(lk);
+        --idle_;
+      }
+      if (stop_) return;
+      Task task = std::move(q_.front());
+      q_.pop_front();
+      lk.unlock();
+      task.fn();
+      lk.lock();
+      // Decrement and the notify stay under the lock: Wait's predicate is read
+      // under the same lock, so a count that reaches 0 cannot slip between a
+      // waiter's check and its wait.
+      if (task.left->fetch_sub(1) == 1) done_.notify_all();
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;    // work arrived, or stop_
+  std::condition_variable done_;  // a Pending's count reached 0
+  std::deque<Task> q_;
+  std::vector<std::thread> workers_;
+  int idle_ = 0;
+  bool stop_ = false;
+};
+
 // The same conversion split across cores, by frame.
 //
 // This is the reader's dominant cost and it was entirely single-threaded.  Measured
@@ -285,23 +406,26 @@ void RawToFloatsParallel(const std::uint16_t* raw, RgbaF* dst, std::size_t pixel
     RawToFloats(raw, dst, static_cast<std::size_t>(frames) * pixels, channels);
     return;
   }
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  std::vector<std::function<void()>> tasks;
+  tasks.reserve(static_cast<std::size_t>(workers) - 1);
   const int chunk = (frames + workers - 1) / workers;
   for (int w = 1; w < workers; ++w) {
     const int f0 = w * chunk;
     if (f0 >= frames) break;
     const int f1 = std::min(frames, f0 + chunk);
-    pool.emplace_back([=]() {
+    tasks.push_back([=]() {
       RawToFloats(raw + static_cast<std::size_t>(f0) * pixels *
                                  static_cast<std::size_t>(channels),
                   dst + static_cast<std::size_t>(f0) * pixels,
                   static_cast<std::size_t>(f1 - f0) * pixels, channels);
     });
   }
+  // Submit before this thread starts its own chunk, so the workers overlap it --
+  // the same order spawn-then-run gave, minus the spawn.
+  auto pending = BatchPool::Get().Submit(std::move(tasks));
   const int f1 = std::min(frames, chunk);
   RawToFloats(raw, dst, static_cast<std::size_t>(f1) * pixels, channels);
-  for (std::thread& t : pool) t.join();
+  BatchPool::Wait(pending);
 }
 
 // SwsClip16 and SwsYuvToRgb16 now live in include/rd_types.h, which rd_riemersma.h
@@ -356,22 +480,24 @@ void RawYuv444ToFloatsParallel(const unsigned char* raw, RgbaF* dst, std::size_t
     return;
   }
   const int workers = std::max(1, std::min(threads, frames));
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  std::vector<std::function<void()>> tasks;
+  tasks.reserve(static_cast<std::size_t>(workers) - 1);
   const int chunk = (frames + workers - 1) / workers;
   for (int w = 1; w < workers; ++w) {
     const int f0 = w * chunk;
     if (f0 >= frames) break;
     const int f1 = std::min(frames, f0 + chunk);
-    pool.emplace_back([=]() {
+    tasks.push_back([=]() {
       RawYuv444ToFloats(raw + static_cast<std::size_t>(f0) * pixels * 3,
                         dst + static_cast<std::size_t>(f0) * pixels, pixels,
                         static_cast<std::size_t>(f1 - f0));
     });
   }
+  // BatchPool: see RawToFloatsParallel for why the pool exists.
+  auto pending = BatchPool::Get().Submit(std::move(tasks));
   const int f1 = std::min(frames, chunk);
   RawYuv444ToFloats(raw, dst, pixels, static_cast<std::size_t>(f1));
-  for (std::thread& t : pool) t.join();
+  BatchPool::Wait(pending);
 }
 
 void FloatsToRaw(const RgbaF* src, std::uint16_t* dst, std::size_t pixels) {
@@ -468,18 +594,20 @@ void FloatsToYuv444Parallel(const RgbaF* src, unsigned char* dst,
   // byte range instead would hand one thread part of the Y plane and another part of
   // the U plane, which is the same class of mistake as the one this function exists to
   // fix.
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  std::vector<std::function<void()>> tasks;
+  tasks.reserve(static_cast<std::size_t>(workers) - 1);
   const int chunk = (frames + workers - 1) / workers;
   const int first = std::min(frames, chunk);
   for (int w = 1; w < workers; ++w) {
     const int f0 = w * chunk;
     if (f0 >= frames) break;
     const int f1 = std::min(frames, f0 + chunk);
-    pool.emplace_back([=]() { convert_frames(f0, f1); });
+    tasks.push_back([=]() { convert_frames(f0, f1); });
   }
+  // BatchPool: see RawToFloatsParallel for why the pool exists.
+  auto pending = BatchPool::Get().Submit(std::move(tasks));
   convert_frames(0, first);
-  for (std::thread& t : pool) t.join();
+  BatchPool::Wait(pending);
 }
 
 std::string Quote(const std::string& s) { return "\"" + s + "\""; }
@@ -635,23 +763,25 @@ void FloatsToRawParallel(const RgbaF* src, std::uint16_t* dst, std::size_t pixel
     FloatsToRaw(src, dst, static_cast<std::size_t>(frames) * pixels);
     return;
   }
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<std::size_t>(workers) - 1);
+  std::vector<std::function<void()>> tasks;
+  tasks.reserve(static_cast<std::size_t>(workers) - 1);
   const int chunk = (frames + workers - 1) / workers;
   for (int w = 1; w < workers; ++w) {
     const int f0 = w * chunk;
     if (f0 >= frames) break;
     const int f1 = std::min(frames, f0 + chunk);
-    pool.emplace_back([=]() {
+    tasks.push_back([=]() {
       FloatsToRaw(src + static_cast<std::size_t>(f0) * pixels,
                   dst + static_cast<std::size_t>(f0) * pixels * 4,
                   static_cast<std::size_t>(f1 - f0) * pixels);
     });
   }
   // The calling thread takes the first chunk rather than idling.
+  // BatchPool: see RawToFloatsParallel for why the pool exists.
+  auto pending = BatchPool::Get().Submit(std::move(tasks));
   const int f1 = std::min(frames, chunk);
   FloatsToRaw(src, dst, static_cast<std::size_t>(f1) * pixels);
-  for (std::thread& t : pool) t.join();
+  BatchPool::Wait(pending);
 }
 
 bool VideoFindTools(std::string* ffmpeg, std::string* ffprobe,
