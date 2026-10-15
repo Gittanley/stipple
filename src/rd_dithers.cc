@@ -48,7 +48,7 @@ namespace {
 
 using dither_common::Accumulate;
 using dither_common::ErrorPlane;
-using dither_common::NearestEntry;
+using dither_common::NearestMemo;
 using dither_common::Prepare;
 using dither_common::WriteChosen;
 
@@ -78,6 +78,7 @@ DitherResult FloydSteinberg(DitherJob& job, RgbaF* px) {
   const Palette& pal = *pal_ptr;  // by reference: see rd_dither_common.h
   const std::size_t w = job.width;
   const std::size_t n = w * job.height;
+  NearestMemo memo;  // exact-key cache; see rd_dither_common.h
 
   ErrorPlane e;
   for (int f = 0; f < job.frames; ++f) {
@@ -93,7 +94,7 @@ DitherResult FloydSteinberg(DitherJob& job, RgbaF* px) {
         const float r = frame[i].r + e.r[i] * static_cast<float>(job.diffusion);
         const float g = frame[i].g + e.g[i] * static_cast<float>(job.diffusion);
         const float b = frame[i].b + e.b[i] * static_cast<float>(job.diffusion);
-        const int best = NearestEntry(pal, r, g, b);
+        const int best = memo.Nearest(pal, r, g, b);
         const PaletteEntry& c = pal.entries[best];
         const float er = r - static_cast<float>(c.r);
         const float eg = g - static_cast<float>(c.g);
@@ -151,6 +152,7 @@ DitherResult Atkinson(DitherJob& job, RgbaF* px) {
   const std::size_t w = job.width;
   const std::size_t n = w * job.height;
   const float k = 1.0f / 8.0f;
+  NearestMemo memo;  // exact-key cache; see rd_dither_common.h
 
   ErrorPlane e;
   for (int f = 0; f < job.frames; ++f) {
@@ -164,7 +166,7 @@ DitherResult Atkinson(DitherJob& job, RgbaF* px) {
         const float r = frame[i].r + e.r[i] * d;
         const float g = frame[i].g + e.g[i] * d;
         const float b = frame[i].b + e.b[i] * d;
-        const int best = NearestEntry(pal, r, g, b);
+        const int best = memo.Nearest(pal, r, g, b);
         const PaletteEntry& c = pal.entries[best];
         const float er = r - static_cast<float>(c.r);
         const float eg = g - static_cast<float>(c.g);
@@ -221,6 +223,7 @@ DitherResult Jarvis(DitherJob& job, RgbaF* px) {
   const std::size_t w = job.width;
   const std::size_t h = job.height;
   const std::size_t n = w * h;
+  NearestMemo memo;  // exact-key cache; see rd_dither_common.h
 
   ErrorPlane e;
   for (int f = 0; f < job.frames; ++f) {
@@ -234,7 +237,7 @@ DitherResult Jarvis(DitherJob& job, RgbaF* px) {
         const float r = frame[i].r + e.r[i] * d;
         const float g = frame[i].g + e.g[i] * d;
         const float b = frame[i].b + e.b[i] * d;
-        const int best = NearestEntry(pal, r, g, b);
+        const int best = memo.Nearest(pal, r, g, b);
         const PaletteEntry& c = pal.entries[best];
         const float er = r - static_cast<float>(c.r);
         const float eg = g - static_cast<float>(c.g);
