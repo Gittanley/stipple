@@ -562,7 +562,7 @@ __kernel void scatter_yuv444(__global const int* curve, __global const int* owne
 __kernel void fill_unvisited_yuv444(__global const int* owner,
                                      __global const uchar* src,
                                      __global uchar* dst,
-                                     int npix, int frames) {
+                                     int npix, int frames, int copy_src) {
   const ulong slot = get_global_id(0);
   const ulong total = (ulong)npix * (ulong)frames;
   if (slot >= total) return;
@@ -572,9 +572,21 @@ __kernel void fill_unvisited_yuv444(__global const int* owner,
   // Same plane arithmetic as scatter_yuv444, so the two agree bit for bit on where a
   // pixel lives: Y at base, U at base + npix, V at base + 2*npix.
   const ulong base = (ulong)frame * 3 * (ulong)npix + (ulong)pixel;
-  dst[base] = src[base];
-  dst[base + npix] = src[base + npix];
-  dst[base + 2 * (ulong)npix] = src[base + 2 * (ulong)npix];
+  // copy_src separates the two inputs this kernel now covers.  With a planar source
+  // (yuv444 in) the unvisited pixel keeps the source's own three bytes, which is what
+  // the whole-frame copy was for.  Without one (rgba64le in) there are no planar
+  // source bytes to read, and the whole-buffer fills used to answer that case with
+  // Y=0, U=V=128 for every pixel; here the same three constants land on the only
+  // pixels that keep them -- the visited ones are written by the scatter afterwards.
+  if (copy_src) {
+    dst[base] = src[base];
+    dst[base + npix] = src[base + npix];
+    dst[base + 2 * (ulong)npix] = src[base + 2 * (ulong)npix];
+  } else {
+    dst[base] = 0;
+    dst[base + npix] = 128;
+    dst[base + 2 * (ulong)npix] = 128;
+  }
 }
 
 // F1 for the interleaved uint16 output -- the production video path, and the one
@@ -908,25 +920,6 @@ cl_int CopyBytes(cl_command_queue queue, cl_mem src, cl_mem dst, std::size_t src
   const cl_int e = clEnqueueCopyBuffer(queue, src, dst, src_off, dst_off, bytes, 0,
                                        nullptr, nullptr);
   if (e == CL_SUCCESS && io != nullptr) CountBytes(&io->d2d, &io->d2d_calls, bytes);
-  return e;
-}
-
-// The only way this file issues a clEnqueueFillBuffer.  Exists for the same reason
-// MakeBuffer and CopyBytes exist: so that every device write lands in a bucket, and so
-// that the four raw call sites cannot drift apart again.
-//
-// `pattern_size` is passed through rather than assumed, because it must be 1, 2, 4, 8
-// ... -- passing 3 is CL_INVALID_VALUE on any conformant runtime, which is the bug
-// recorded at the call site below.
-cl_int FillBytes(cl_command_queue queue, cl_mem dst, const void* pattern,
-                 std::size_t pattern_size, std::size_t offset, std::size_t bytes,
-                 IoTally* io) {
-  const cl_int e = clEnqueueFillBuffer(queue, dst, pattern, pattern_size, offset, bytes,
-                                       0, nullptr, nullptr);
-  // Count the BYTES WRITTEN, not bytes moved: a fill has no source, so `bytes` is the
-  // only honest measure of the work it did, and it is the number that shows how much of
-  // it the scatter went on to overwrite.
-  if (e == CL_SUCCESS && io != nullptr) CountBytes(&io->fill, &io->fill_calls, bytes);
   return e;
 }
 
@@ -1884,33 +1877,47 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
       clSetKernelArg(ctx->k_fill_unvisited_yuv, 2, sizeof(cl_mem), &b_out_yuv);
       clSetKernelArg(ctx->k_fill_unvisited_yuv, 3, sizeof(int), &np);
       clSetKernelArg(ctx->k_fill_unvisited_yuv, 4, sizeof(int), &frames);
+      {
+        const int copy_src = 1;
+        clSetKernelArg(ctx->k_fill_unvisited_yuv, 5, sizeof(int), &copy_src);
+      }
       e = clEnqueueNDRangeKernel(ctx->queue, ctx->k_fill_unvisited_yuv, 1, nullptr,
                                  &gf, &local, 0, nullptr, nullptr);
       if (e == CL_SUCCESS) e = clFinish(ctx->queue);
       } else {
-      // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so fill
-      // with neutral black (Y=0, and 128 for the chroma centre) rather than leave
-      // the buffer undefined.
+      // rgba64le in, planar 4:4:4 out: there is no planar source to copy, so the
+      // unvisited pixel gets neutral black (Y=0, and 128 for the chroma centre)
+      // rather than whatever the driver left in the buffer.
       //
-      // clEnqueueFillBuffer requires pattern_size to be 1, 2, 4, 8, ...  Passing 3 --
-      // one byte per plane -- is CL_INVALID_VALUE on any conformant runtime, so this
-      // call ALWAYS failed.  `--engine opencl --input-mode rgba64` with the default
-      // planar output exited 1 and left a 565-byte container ffprobe calls malformed.
-      // docs\OPENCL.md records that this combination needs RD_YUV444_OUT=0, but a
-      // documented caveat is not a check, and what the user saw was an internal OpenCL
-      // error string rather than anything they could act on.
+      // This used to be three whole-buffer clEnqueueFillBuffer calls.  The FIRST
+      // version passed pattern_size=3 -- one byte per plane -- which is
+      // CL_INVALID_VALUE on any conformant runtime, so `--engine opencl
+      // --input-mode rgba64` with the default planar output exited 1 and left a
+      // 565-byte container ffprobe calls malformed (docs\OPENCL.md records that
+      // combination as needing RD_YUV444_OUT=0; a documented caveat is not a
+      // check, and what the user saw was an internal OpenCL error string rather
+      // than anything they could act on).  Three one-byte fills fixed the error
+      // and are what the comment history above preserved.
       //
-      // Three fills of one byte each instead.  The layout is Y, then U, then V, each
-      // yuv_bytes / 3, so the intent -- luma 0, chroma at the 128 centre -- is kept
-      // exactly and no byte-pattern trick is needed.
-      const std::size_t plane3 = yuv_bytes / 3;
-      const cl_uchar luma_fill = 0;
-      const cl_uchar chroma_fill = 128;
-      e = FillBytes(ctx->queue, b_out_yuv, &luma_fill, 1, 0, plane3, &io);
-      if (e == CL_SUCCESS)
-        e = FillBytes(ctx->queue, b_out_yuv, &chroma_fill, 1, plane3, plane3, &io);
-      if (e == CL_SUCCESS)
-        e = FillBytes(ctx->queue, b_out_yuv, &chroma_fill, 1, 2 * plane3, plane3, &io);
+      // They were still the whole buffer: yuv_bytes = 99,532,800 B per 1080p
+      // batch of 16 written so that the scatter could overwrite nearly all of it
+      // again -- the same accounting the F1 copy failed, for the same single
+      // unvisited pixel per frame.  The owner-gated kernel with copy_src=0 writes
+      // the identical three constants at exactly the pixels the scatter will not
+      // cover, and nothing elsewhere; visited pixels still come from the scatter
+      // at the run_pipeline call, so every pixel is still written exactly once.
+      const std::size_t gf = global_for(static_cast<std::size_t>(np) *
+                                        static_cast<std::size_t>(frames));
+      const int copy_src = 0;
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 0, sizeof(cl_mem), &b_owner);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 1, sizeof(cl_mem), &b_out_yuv);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 2, sizeof(cl_mem), &b_out_yuv);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 3, sizeof(int), &np);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 4, sizeof(int), &frames);
+      clSetKernelArg(ctx->k_fill_unvisited_yuv, 5, sizeof(int), &copy_src);
+      e = clEnqueueNDRangeKernel(ctx->queue, ctx->k_fill_unvisited_yuv, 1, nullptr,
+                                 &gf, &local, 0, nullptr, nullptr);
+      if (e == CL_SUCCESS) e = clFinish(ctx->queue);
     }
     if (e != CL_SUCCESS) return fail("fill(yuv444 out)");
   } else if (want_u16) {
