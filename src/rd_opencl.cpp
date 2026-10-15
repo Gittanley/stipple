@@ -789,6 +789,20 @@ inline void CountBytes(std::uint64_t* bytes, std::uint64_t* calls, std::size_t n
   ++*calls;
 }
 
+// Every transfer door, so a transfer cannot be counted by one door and issued
+// outside it.  All blocking, as every call they replace was.
+cl_int WriteBytes(cl_command_queue queue, cl_mem buf, std::size_t offset,
+                  std::size_t bytes, const void* src, bool is_input,
+                  IoTally* io) {
+  const cl_int e = clEnqueueWriteBuffer(queue, buf, CL_TRUE, offset, bytes, src,
+                                        0, nullptr, nullptr);
+  if (e == CL_SUCCESS && io != nullptr) {
+    CountBytes(&io->h2d, &io->h2d_calls, bytes);
+    if (is_input) io->h2d_input += static_cast<std::uint64_t>(bytes);
+  }
+  return e;
+}
+
 // THE ONLY WAY HOST BYTES REACH THE DEVICE IN THIS FILE.  Ten call sites used to
 // say CL_MEM_COPY_HOST_PTR themselves; all ten come through here now.
 //
@@ -822,16 +836,11 @@ cl_mem MakeBuffer(cl_context ctx, cl_command_queue queue, cl_mem_flags flags,
   if (buf == nullptr) return nullptr;
 
   if (host != nullptr) {
-    const cl_int we = clEnqueueWriteBuffer(queue, buf, CL_TRUE, 0, bytes, host, 0,
-                                           nullptr, nullptr);
+    const cl_int we = WriteBytes(queue, buf, 0, bytes, host, is_input, io);
     if (we != CL_SUCCESS) {
       clReleaseMemObject(buf);
       *err = we;
       return nullptr;
-    }
-    if (io != nullptr) {
-      CountBytes(&io->h2d, &io->h2d_calls, bytes);
-      if (is_input) io->h2d_input += static_cast<std::uint64_t>(bytes);
     }
   }
   if (io != nullptr && wanted_implicit) {
@@ -840,8 +849,6 @@ cl_mem MakeBuffer(cl_context ctx, cl_command_queue queue, cl_mem_flags flags,
   return buf;
 }
 
-// The other two doors, so a transfer cannot be counted by one door and issued
-// outside it.  Both blocking, as every call they replace was.
 cl_int ReadBytes(cl_command_queue queue, cl_mem buf, std::size_t offset,
                  std::size_t bytes, void* dst, bool diagnostic, IoTally* io) {
   const cl_int e =
@@ -1005,6 +1012,33 @@ struct Ctx {
   // closes the one hole a pointer key cannot: a palette MUTATED IN PLACE between batches
   // would keep &palette identical while changing what b_pal ought to contain.
   std::vector<double> ck_pal_shadow;
+
+  // The per-batch WORK buffers, kept across batches.  These seven used to be
+  // clCreateBuffer + clReleaseMemObject on every call -- about 1.1 GB of device
+  // allocation churn per batch at 1920x1080 with --batch-frames 16 (b_pix 506 MiB,
+  // b_cx 506 MiB, both yuv buffers 250 MiB each, b_idx 33 MiB).  The F3 cache above
+  // proved the pattern: same slot, same lifetime, keyed reuse.  The difference is
+  // that F3 needed a CONTENT key because its content is reused; these never reuse
+  // content -- every batch uploads the full logical input, the kernels write every
+  // reachable output byte, and the readbacks read only the logical size -- so the
+  // only key needed is CAPACITY.  A cached buffer with capacity >= need replaces an
+  // allocation; a smaller one is released and replaced.  Content on a hit is stale
+  // and must never be trusted, which is why nothing reads a byte the batch did not
+  // write or upload.
+  cl_mem b_pix = nullptr;
+  cl_mem b_in16 = nullptr;
+  cl_mem b_out16 = nullptr;
+  cl_mem b_in_yuv = nullptr;
+  cl_mem b_out_yuv = nullptr;
+  cl_mem b_cx = nullptr;
+  cl_mem b_idx = nullptr;
+  std::size_t b_pix_cap = 0;
+  std::size_t b_in16_cap = 0;
+  std::size_t b_out16_cap = 0;
+  std::size_t b_in_yuv_cap = 0;
+  std::size_t b_out_yuv_cap = 0;
+  std::size_t b_cx_cap = 0;
+  std::size_t b_idx_cap = 0;
 
   std::string detail;
   bool built = false;
@@ -1407,6 +1441,36 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // using npix*F for the chroma planes reads frame f-1's chroma as frame f's luma.
   const std::size_t yuv_bytes = npix * static_cast<std::size_t>(frames) * 3;
 
+  // Capacity-keyed reuse of the per-batch work buffers, cached on the slot.  A hit
+  // needs no key beyond the byte count: the content of these buffers is never read
+  // before this batch uploads or writes it, so capacity >= need is the whole
+  // contract.  On a miss the old buffer is released first, so a geometry change
+  // never holds two sizes at once.  `e` is the shared error out-parameter, set only
+  // on failure, exactly as clCreateBuffer would have set it.
+  auto acquire = [&](cl_mem* slot, std::size_t* cap, std::size_t need,
+                     cl_mem_flags flags) -> cl_mem {
+    if (*slot != nullptr && *cap >= need) return *slot;
+    if (*slot != nullptr) {
+      clReleaseMemObject(*slot);
+      *slot = nullptr;
+    }
+    cl_mem b = clCreateBuffer(g_context, flags, need, nullptr, &e);
+    if (b == nullptr) {
+      *cap = 0;
+      return nullptr;
+    }
+    *slot = b;
+    *cap = need;
+    return b;
+  };
+  // Formats an error against the shared `e`.  The work buffers are no longer
+  // released on failure: they belong to the slot and the next batch rewrites
+  // every byte it reads, so a failed batch leaves nothing the next one inherits
+  // that its own upload or kernel launch would not replace.
+  auto fail = [&](const char* what) {
+    return std::string("opencl: ") + what + " failed (" + ClErrorName(e) + ")";
+  };
+
   // The video pipe asks for the uint16 data path in both directions at once, and
   // the single-image path asks for neither.  Each is honoured only if the caller
   // actually supplied the buffer, so a caller that sets the flag without the
@@ -1438,52 +1502,53 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   cl_mem b_out16 = nullptr;  // rgba64le out
   cl_mem b_in_yuv = nullptr;  // planar 4:4:4 in
   cl_mem b_out_yuv = nullptr;  // planar 4:4:4 out
+  cl_mem b_cx = nullptr;    // walk positions, written by the gather
+  cl_mem b_idx = nullptr;   // chosen palette index per visit, written by the walk
 
   // The three input uploads.  All three used to be CL_MEM_COPY_HOST_PTR, which put
   // the host-to-device copy inside clCreateBuffer where nothing could count it --
   // and these are the ONLY byte volumes in this file that the conservation
-  // assertion below is about.  MakeBuffer issues a real, blocking
-  // clEnqueueWriteBuffer for the same bytes in the same place in the sequence,
-  // so the pixels the device sees are unchanged; only the accounting is new.
+  // assertion below is about.  The buffer now comes from the slot cache and the
+  // upload is a real, blocking WriteBytes in the same place in the sequence, so
+  // the pixels the device sees are unchanged; only the allocation is new.
   if (in_yuv444) {
-    b_in_yuv = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, yuv_bytes,
-                          in_u16, true, &io, &e);
-    if (e != CL_SUCCESS || b_in_yuv == nullptr) return "clCreateBuffer(in yuv444)";
+    b_in_yuv = acquire(&ctx->b_in_yuv, &ctx->b_in_yuv_cap, yuv_bytes,
+                       CL_MEM_READ_WRITE);
+    if (e != CL_SUCCESS || b_in_yuv == nullptr) return fail("acquire(in yuv444)");
+    e = WriteBytes(ctx->queue, b_in_yuv, 0, yuv_bytes, in_u16, true, &io);
+    if (e != CL_SUCCESS) return fail("write(in yuv444)");
   } else if (want_in_u16) {
     // READ_WRITE, not READ_ONLY: the source is copied into the output buffer
     // below, so that the pixel the curve never visits keeps its SOURCE value
     // rather than uninitialised memory.  See the copy below.
-    b_in16 = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, u16_bytes, in_u16,
-                        true, &io, &e);
+    b_in16 = acquire(&ctx->b_in16, &ctx->b_in16_cap, u16_bytes, CL_MEM_READ_WRITE);
+    if (e != CL_SUCCESS || b_in16 == nullptr) return fail("acquire(in16)");
+    e = WriteBytes(ctx->queue, b_in16, 0, u16_bytes, in_u16, true, &io);
+    if (e != CL_SUCCESS) return fail("write(in16)");
   } else {
-    b_pix = MakeBuffer(g_context, ctx->queue, CL_MEM_READ_WRITE, pix_bytes, batch,
-                       true, &io, &e);
+    b_pix = acquire(&ctx->b_pix, &ctx->b_pix_cap, pix_bytes, CL_MEM_READ_WRITE);
+    if (e != CL_SUCCESS || b_pix == nullptr) return fail("acquire(pix)");
+    e = WriteBytes(ctx->queue, b_pix, 0, pix_bytes, batch, true, &io);
+    if (e != CL_SUCCESS) return fail("write(pix)");
   }
   if (out_yuv444) {
-    b_out_yuv = clCreateBuffer(g_context, CL_MEM_READ_WRITE, yuv_bytes, nullptr, &e);
+    b_out_yuv = acquire(&ctx->b_out_yuv, &ctx->b_out_yuv_cap, yuv_bytes,
+                        CL_MEM_READ_WRITE);
+    // The inputs are cached on the slot now, so this failure must NOT release
+    // them -- they used to be released here because a failed batch freed
+    // everything it had allocated.  Nothing leaks: the cached inputs belong to
+    // the slot and are reused or replaced by the next batch.
     if (e != CL_SUCCESS || b_out_yuv == nullptr) {
-      // This is the one bare return in the function.  `all[]`, release_all() and fail()
-      // are declared further down, because `all[]` is initialised from the pointers
-      // after they are assigned -- so fail() cannot be called from here, and the bare
-      // return that used to be here leaked the input buffer created immediately above:
-      // up to 506 MiB at 1920x1080 with --batch-frames 16.  Reachable on the DEFAULT
-      // configuration (--input-mode yuv444, RD_YUV444_OUT unset => out_yuv444) if this
-      // second allocation returns CL_MEM_OBJECT_ALLOCATION_FAILURE or
-      // CL_OUT_OF_RESOURCES.  The three input buffers are mutually exclusive branches
-      // above, so at most one is non-null here.
-      if (b_in_yuv != nullptr) clReleaseMemObject(b_in_yuv);
-      if (b_in16 != nullptr) clReleaseMemObject(b_in16);
-      if (b_pix != nullptr) clReleaseMemObject(b_pix);
-      return std::string("opencl: clCreateBuffer(out yuv444) failed (") +
-             ClErrorName(e) + ")";
+      return fail("acquire(out yuv444)");
     }
   } else if (want_u16) {
-    b_out16 = clCreateBuffer(g_context, CL_MEM_READ_WRITE, u16_bytes, nullptr, &e);
+    b_out16 = acquire(&ctx->b_out16, &ctx->b_out16_cap, u16_bytes,
+                      CL_MEM_READ_WRITE);
   } else if (b_pix == nullptr) {
     // Nothing to scatter into except the float buffer, so one is needed either
     // way: as the gather's source when uploading uint16, as the scatter's
     // destination otherwise.
-    b_pix = clCreateBuffer(g_context, CL_MEM_READ_WRITE, pix_bytes, nullptr, &e);
+    b_pix = acquire(&ctx->b_pix, &ctx->b_pix_cap, pix_bytes, CL_MEM_READ_WRITE);
   }
 
   // The derived uploads: the curve, the owner map, the mirrored tree, the flat
@@ -1501,8 +1566,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
   // earlier investigation chased were computed, not remembered -- and it has been
   // removed rather than left as a live branch on buffer creation, re-asking a
   // settled question on every launch.
-  cl_mem b_cx = clCreateBuffer(g_context, CL_MEM_READ_WRITE, cx_bytes, nullptr, &e);
-  cl_mem b_idx = clCreateBuffer(g_context, CL_MEM_WRITE_ONLY, idx_bytes, nullptr, &e);
+  b_cx = acquire(&ctx->b_cx, &ctx->b_cx_cap, cx_bytes, CL_MEM_READ_WRITE);
+  b_idx = acquire(&ctx->b_idx, &ctx->b_idx_cap, idx_bytes, CL_MEM_WRITE_ONLY);
   cl_mem b_curve = nullptr;
   cl_mem b_owner = nullptr;
   cl_mem b_nodes = nullptr;
@@ -1591,23 +1656,11 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     ctx->ck_pal_shadow = hpal;
   }
 
-  // The six F3 buffers are NOT in here.  They belong to the slot, not to the batch, and
-  // release_all() runs on every return path -- including a launch failure part way
-  // through the pipeline -- so listing them would free the cache the next batch reuses,
-  // turning a saved upload into a use-after-free.
-  cl_mem all[7] = {b_pix, b_in16, b_out16, b_in_yuv, b_out_yuv, b_cx, b_idx};
-  // Releases every buffer, then says what went wrong.  Split from the reporting so
-  // it can run on the success path too, and so the pipeline lambda below can report
-  // a launch failure without releasing anything out from under its caller.
-  auto release_all = [&]() {
-    for (cl_mem b : all) {
-      if (b != nullptr) clReleaseMemObject(b);
-    }
-  };
-  auto fail = [&](const char* what) {
-    release_all();
-    return std::string("opencl: ") + what + " failed (" + ClErrorName(e) + ")";
-  };
+  // The seven work buffers and the six F3 buffers all belong to the slot now, not
+  // to the batch, so there is no per-batch release list: release_all() used to run
+  // on every return path and freeing cached state there would turn the next
+  // batch's cache hit into a use-after-free.  Ownership lives on the Ctx for the
+  // life of the slot; fail() (defined with acquire above) only formats the error.
   // b_in16 and b_out16 are legitimately absent -- they exist only on the paths
   // that asked for them -- so only the buffers that were supposed to be created
   // are checked for null.
@@ -2103,7 +2156,6 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // flag (MakeBuffer strips it and issues the explicit write), so the bytes are
     // counted twice in the reader's mental model and the call site is stale.
     if (delta != 0) {
-      release_all();
       return "opencl: byte conservation failed: uploaded " +
              std::to_string(uploaded) + " B of input, expected " +
              std::to_string(expected) + " B (" + std::to_string(width) + "x" +
@@ -2113,7 +2165,6 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
              "line above.";
     }
     if (io.host_copy != 0) {
-      release_all();
       return "opencl: " + std::to_string(io.host_copy) +
              " B were requested through CL_MEM_COPY_HOST_PTR in " +
              std::to_string(io.host_copy_calls) +
@@ -2123,10 +2174,8 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     }
   }
 
-  release_all();
   return msg;
 }
-
 }  // namespace rd
 
 #else  // !RD_WITH_OPENCL

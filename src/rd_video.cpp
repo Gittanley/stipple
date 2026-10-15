@@ -3775,12 +3775,28 @@ bool VideoProcess(const std::string& in, const std::string& out,
                   NowMs() - static_cast<double>(last_gpu_ms.load()));
               // The GPU moved recently, so it is keeping up: let it go first.
               if (waited >= budget || since > budget) break;
+              // Bounded poll for the grace deadline.  At most `budget` worth
+              // of 2ms ticks while work is actually sitting here, which is
+              // the same wait this loop has always done -- the difference is
+              // that it no longer also runs while the queue is EMPTY.
+              cv_ready.wait_for(lock, std::chrono::milliseconds(2));
+              waited += 2;
             } else if (eof || failed) {
               break;
+            } else {
+              // Empty queue and the clip is not finished.  This used to be
+              // the same 2ms timed wait plus a notify_all per iteration,
+              // which spun at 500 Hz for the whole clip and woke the GPU
+              // workers and the writer on every tick to re-check a predicate
+              // nothing had changed.  The producer already notifies cv_ready
+              // when it pushes a batch or reaches EOF (:3720, :3623), and
+              // the interrupt path notifies after setting failed (:3795), so
+              // a blocking predicate wait observes exactly those events --
+              // the same ones the 2ms poll was burning CPU to notice late.
+              cv_ready.wait(lock, [&] {
+                return !ready.empty() || eof || failed;
+              });
             }
-            cv_ready.wait_for(lock, std::chrono::milliseconds(2));
-            waited += 2;
-            cv_ready.notify_all();  // re-broadcast: cv_ready is signalled, not waited
           }
         }
         if (failed) return;
