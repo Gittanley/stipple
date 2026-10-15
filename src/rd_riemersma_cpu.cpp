@@ -37,7 +37,7 @@ inline void Advance(Gravity dir, int* x, int* y) {
 // `cache` is quantize.c's memo table (-1 == not computed yet).  It is part of
 // the observable behaviour, not an optimisation -- see rd_types.h.
 inline void Visit(const Palette& palette, const DitherParams& params,
-                  const double (&weights)[kErrorQueueLength],
+                  const double (&scaled_weights)[kErrorQueueLength],
                   RgbaD (&error)[kErrorQueueLength], int* cache,
                   const ColorTree& tree, std::size_t width, std::size_t height,
                   RgbaF* pixels, int x, int y) {
@@ -51,10 +51,13 @@ inline void Visit(const Palette& palette, const DitherParams& params,
   associate_alpha_pixel(palette.associate_alpha, *px, &pixel);
 
   // Distribute error.  Both the accumulation order and the parenthesisation of
-  // the product are IM's, and both matter for the final bit.
-  const double erb = kErrorRelativeWeight;
+  // the product are IM's, and both matter for the final bit.  The product itself
+  // is pre-scaled by the caller (kErrorRelativeWeight * params.diffusion is
+  // job-constant, and was recomputed per pixel per queue slot here) with the same
+  // left-to-right order, so the doubles are bit-identical; only the redundant
+  // multiplication is gone.
   for (int i = 0; i < kErrorQueueLength; ++i) {
-    const double w = erb * params.diffusion * weights[i];
+    const double w = scaled_weights[i];
     pixel.r += w * error[i].r;
     pixel.g += w * error[i].g;
     pixel.b += w * error[i].b;
@@ -74,9 +77,12 @@ inline void Visit(const Palette& palette, const DitherParams& params,
   if (index < 0) {
     // quantize.c: descend from the root, then search node_info->parent's
     // SUBTREE.  The subtree restriction is observable, so the tree is required.
+    // The clamp+scale inside NodeId is level-independent, so it is packed once
+    // (same shape as the CUDA engine's d_packed_channels).
+    const ColorTree::PackedChannels packed = tree.PackChannels(pixel);
     std::int32_t node = tree.root();
     for (int i = kMaxTreeDepth - 1; i > 0; --i) {
-      const std::size_t id = tree.NodeId(pixel, i);
+      const std::size_t id = tree.NodeId(packed, i);
       const std::int32_t child = tree.Child(node, id);
       if (child < 0) break;
       node = child;
@@ -356,6 +362,15 @@ void RiemersmaWalkCpu(const Palette& palette, const DitherParams& params,
                       const CurveStepEntry* curve) {
   double weights[kErrorQueueLength];
   build_error_weights(weights);
+  // Fold IM's kErrorRelativeWeight * params.diffusion into the weights once.
+  // Same operands in the same left-to-right order as the expression Visit used
+  // to evaluate per pixel, so the doubles are bit-identical.  The CUDA blocks
+  // engine hoisted this same invariant (src/rd_blocks_cuda.cu); the host was the
+  // only path still paying for it per pixel.
+  double scaled_w[kErrorQueueLength];
+  for (int k = 0; k < kErrorQueueLength; ++k) {
+    scaled_w[k] = kErrorRelativeWeight * params.diffusion * weights[k];
+  }
 
   // DitherImage() zeroes the whole queue before the first visit.
   RgbaD error[kErrorQueueLength];
@@ -379,7 +394,7 @@ void RiemersmaWalkCpu(const Palette& palette, const DitherParams& params,
     const int level = ComputeCurveLevel(width, height);
     const std::size_t count = CurveEntryCount(level);
     for (std::size_t i = 0; i < count; ++i) {
-      Visit(palette, params, weights, error, cache_data, tree, width, height,
+      Visit(palette, params, scaled_w, error, cache_data, tree, width, height,
             pixels, curve[i].x, curve[i].y);
     }
     return;
@@ -389,7 +404,7 @@ void RiemersmaWalkCpu(const Palette& palette, const DitherParams& params,
   int x = 0, y = 0;
   if (level > 0) {
     WalkCurve(level, [&](int vx, int vy, Gravity dir) {
-      Visit(palette, params, weights, error, cache_data, tree, width, height,
+      Visit(palette, params, scaled_w, error, cache_data, tree, width, height,
             pixels, vx, vy);
       x = vx;
       y = vy;
@@ -397,7 +412,7 @@ void RiemersmaWalkCpu(const Palette& palette, const DitherParams& params,
     });
   }
   // Trailing RiemersmaDither(ForgetGravity): visit the resting cursor, no move.
-  Visit(palette, params, weights, error, cache_data, tree, width, height, pixels,
+  Visit(palette, params, scaled_w, error, cache_data, tree, width, height, pixels,
         x, y);
 }
 
@@ -573,6 +588,14 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
   const std::size_t pixels = width * height;
   double weights[kErrorQueueLength];
   build_error_weights(weights);
+  // Same invariant fold as RiemersmaWalkCpu: kErrorRelativeWeight *
+  // params.diffusion is job-constant, so the 16 products are computed once per
+  // batch instead of per pixel.  Same left-to-right order as the old inner
+  // expression, so the doubles are bit-identical.
+  double scaled_w[kErrorQueueLength];
+  for (int k = 0; k < kErrorQueueLength; ++k) {
+    scaled_w[k] = kErrorRelativeWeight * params.diffusion * weights[k];
+  }
 
   const int level = ComputeCurveLevel(width, height);
   const CachedCurve& cached = CachedCurveFor(level, width, height);
@@ -631,7 +654,7 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
                                            : frame[curve[i]],
                               &pixel);
         for (int k = 0; k < kErrorQueueLength; ++k) {
-          const double w = kErrorRelativeWeight * params.diffusion * weights[k];
+          const double w = scaled_w[k];
           pixel.r += w * error[k].r;
           pixel.g += w * error[k].g;
           pixel.b += w * error[k].b;
@@ -644,9 +667,11 @@ void RiemersmaBlocksCpu(const Palette& palette, const DitherParams& params,
           pixel.a = static_cast<double>(clamp_pixel(pixel.a));
         }
         // Cache-free on both paths, so the two agree; see rd_blocks_cuda.cu.
+        // Packed once: the clamp+scale is level-independent, only the shift changes.
+        const ColorTree::PackedChannels packed = tree.PackChannels(pixel);
         std::int32_t node = tree.root();
         for (int i2 = kMaxTreeDepth - 1; i2 > 0; --i2) {
-          const std::size_t id = tree.NodeId(pixel, i2);
+          const std::size_t id = tree.NodeId(packed, i2);
           const std::int32_t child = tree.Child(node, id);
           if (child < 0) break;
           node = child;

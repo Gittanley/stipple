@@ -311,13 +311,14 @@ DitherResult ClusteredDot(DitherJob& job, RgbaF* px) {
   // dark photograph has a much narrower range, and a screen tuned to 65535 would
   // fire every threshold and come out solid.
   double lo = 0.0, hi = 0.0;
+  int lo_i = 0, hi_i = 0;
   bool first = true;
   for (int i = 0; i < pal.count; ++i) {
     const PaletteEntry& c = pal.entries[i];
     // Rec. 601 luma, the same weighting ImageMagick uses to decide a pixel is gray.
     const double l = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
-    if (first || l < lo) lo = l;
-    if (first || l > hi) hi = l;
+    if (first || l < lo) { lo = l; lo_i = i; }
+    if (first || l > hi) { hi = l; hi_i = i; }
     first = false;
   }
   const double span = (hi > lo) ? (hi - lo) : 1.0;
@@ -341,16 +342,11 @@ DitherResult ClusteredDot(DitherJob& job, RgbaF* px) {
         // Two candidates only: the palette's darkest and lightest entries, which is
         // what a halftone screen actually resolves to.  Searching all 16 would let a
         // mid-tone entry win and turn the screen back into a diffusion dither.
-        int lo_i = 0, hi_i = 0;
-        double lo_l = 0.0, hi_l = 0.0;
-        bool seen = false;
-        for (int k = 0; k < pal.count; ++k) {
-          const double l = 0.299 * pal.entries[k].r + 0.587 * pal.entries[k].g +
-                           0.114 * pal.entries[k].b;
-          if (!seen || l < lo_l) { lo_l = l; lo_i = k; }
-          if (!seen || l > hi_l) { hi_l = l; hi_i = k; }
-          seen = true;
-        }
+        // Which entries those are does not depend on the pixel -- the palette is
+        // fixed for the whole job -- so lo_i/hi_i come from the range pass above
+        // rather than being rescanned per pixel.  Same strict-first-wins ties, same
+        // values, bit-exact; the rescan cost pal.count luma evaluations PER PIXEL
+        // and this costs pal.count once.
         const int best = (level >= dark) ? lo_i : hi_i;
         WriteChosen(frame[i], pal.entries[best]);
       }

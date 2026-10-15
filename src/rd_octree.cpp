@@ -47,13 +47,21 @@ std::int32_t ColorTree::NewNode(std::uint32_t id, std::uint32_t level,
   return static_cast<std::int32_t>(nodes_.size() - 1);
 }
 
-std::size_t ColorTree::NodeId(const RgbaD& pixel, int index) const {
-  std::size_t id =
-      static_cast<std::size_t>((scale_quantum_to_char(clamp_pixel(pixel.r)) >> index) & 0x01);
-  id |= static_cast<std::size_t>((scale_quantum_to_char(clamp_pixel(pixel.g)) >> index) & 0x01) << 1;
-  id |= static_cast<std::size_t>((scale_quantum_to_char(clamp_pixel(pixel.b)) >> index) & 0x01) << 2;
+ColorTree::PackedChannels ColorTree::PackChannels(const RgbaD& pixel) const {
+  PackedChannels packed;
+  packed.c[0] = scale_quantum_to_char(clamp_pixel(pixel.r));
+  packed.c[1] = scale_quantum_to_char(clamp_pixel(pixel.g));
+  packed.c[2] = scale_quantum_to_char(clamp_pixel(pixel.b));
+  packed.c[3] = scale_quantum_to_char(clamp_pixel(pixel.a));
+  return packed;
+}
+
+std::size_t ColorTree::NodeId(const PackedChannels& packed, int index) const {
+  std::size_t id = static_cast<std::size_t>((packed.c[0] >> index) & 0x01);
+  id |= static_cast<std::size_t>((packed.c[1] >> index) & 0x01) << 1;
+  id |= static_cast<std::size_t>((packed.c[2] >> index) & 0x01) << 2;
   if (associate_alpha_) {
-    id |= static_cast<std::size_t>((scale_quantum_to_char(clamp_pixel(pixel.a)) >> index) & 0x01) << 3;
+    id |= static_cast<std::size_t>((packed.c[3] >> index) & 0x01) << 3;
   }
   return id;
 }
@@ -310,9 +318,11 @@ void ColorTree::Build(const RgbaF* pixels, std::size_t width, std::size_t height
       double bisect = (kQuantumRange + 1.0) / 2.0;
       double mid[4] = {midpoint, midpoint, midpoint, midpoint};
       std::int32_t node = root_;
+      // Pack once: the clamp+scale is level-independent, only the shift changes.
+      const PackedChannels packed = PackChannels(pixel);
       for (int level = 1; level <= level_limit; ++level) {
         bisect *= 0.5;
-        const std::size_t id = NodeId(pixel, index);
+        const std::size_t id = NodeId(packed, index);
         mid[0] += (id & 1) ? bisect : -bisect;
         mid[1] += (id & 2) ? bisect : -bisect;
         mid[2] += (id & 4) ? bisect : -bisect;

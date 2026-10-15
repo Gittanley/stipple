@@ -67,7 +67,18 @@ class ColorTree {
   const std::vector<QNode>& nodes() const { return nodes_; }
 
   // quantize.c:ColorToQNodeId().
-  std::size_t NodeId(const RgbaD& pixel, int index) const;
+  //
+  // The descent calls this once per level, and the clamp+scale it used to
+  // perform per call is level-independent -- only the shift changes.  That was
+  // 32 float divisions per pixel where 4 suffice.  The CUDA engine packed the
+  // channels once per pixel already (d_packed_channels/d_node_id_packed in
+  // include/rd_cuda_common.cuh, with the same justification); this is the host
+  // catching up.  Pack once per pixel, then one shift per level.
+  struct PackedChannels {
+    unsigned int c[4];
+  };
+  PackedChannels PackChannels(const RgbaD& pixel) const;
+  std::size_t NodeId(const PackedChannels& packed, int index) const;
 
   // quantize.c:ClosestColor() restricted to the subtree rooted at
   // `node_info->parent`, with the traversal and the early exits reproduced.
