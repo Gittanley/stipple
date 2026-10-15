@@ -576,6 +576,46 @@ __kernel void fill_unvisited_yuv444(__global const int* owner,
   dst[base + npix] = src[base + npix];
   dst[base + 2 * (ulong)npix] = src[base + 2 * (ulong)npix];
 }
+
+// F1 for the interleaved uint16 output -- the production video path, and the one
+// that still paid the whole-frame copy (265,420,800 B per 1920x1080 batch of 16,
+// device-to-device, to define typically ONE pixel per frame).  Same owner-scan
+// argument as the yuv444 kernel above: owner[pixel] >= 0 means the scatter will
+// write that pixel, owner < 0 means nothing else will, so every pixel lands
+// exactly once -- structural, at any geometry.  Same slot math too; only the
+// address differs, because this buffer is interleaved rgba64le: four uint16 per
+// pixel at (frame*npix + pixel)*4.
+//
+// copy_src separates the two cases the old code covered with a whole-frame copy
+// and a whole-buffer FillBytes.  With a source (rgba64le in) it copies the four
+// channels, which is what the copy was for.  Without one -- a float or planar
+// source under an interleaved output, where the layouts do not match -- it writes
+// four zeros: the same black the whole-buffer fill produced, for the only pixel
+// that needs defining.  The visited pixels are written by the scatter afterwards,
+// so zeroing them early was never load-bearing.
+__kernel void fill_unvisited_u16(__global const int* owner,
+                                 __global const ushort* src,
+                                 __global ushort* dst,
+                                 int npix, int frames, int copy_src) {
+  const ulong slot = get_global_id(0);
+  const ulong total = (ulong)npix * (ulong)frames;
+  if (slot >= total) return;
+  const int frame = (int)(slot / (ulong)npix);
+  const int pixel = (int)(slot - (ulong)frame * (ulong)npix);
+  if (owner[pixel] >= 0) return;
+  const ulong base = ((ulong)frame * (ulong)npix + (ulong)pixel) * 4UL;
+  if (copy_src) {
+    dst[base + 0] = src[base + 0];
+    dst[base + 1] = src[base + 1];
+    dst[base + 2] = src[base + 2];
+    dst[base + 3] = src[base + 3];
+  } else {
+    dst[base + 0] = 0;
+    dst[base + 1] = 0;
+    dst[base + 2] = 0;
+    dst[base + 3] = 0;
+  }
+}
 )CLC";
 
 // ---------------------------------------------------------------------------
@@ -958,6 +998,7 @@ struct Ctx {
   // owner < 0.  One entry per slot like every other kernel, because clSetKernelArg
   // mutates the object and two slots cannot share one.
   cl_kernel k_fill_unvisited_yuv = nullptr;
+  cl_kernel k_fill_unvisited_u16 = nullptr;
   cl_kernel k_walk = nullptr;
   cl_kernel k_scatter = nullptr;
   cl_kernel k_scatter_u16 = nullptr;
@@ -1194,7 +1235,7 @@ bool BuildSlotLocked(int n) {
     return false;
   }
 
-  struct { const char* name; cl_kernel* out; } kernels[8] = {
+  struct { const char* name; cl_kernel* out; } kernels[9] = {
       {"gather", &s.k_gather}, {"gather_u16", &s.k_gather_u16},
       {"walk", &s.k_walk},
       {"scatter", &s.k_scatter}, {"scatter_u16", &s.k_scatter_u16},
@@ -1203,6 +1244,7 @@ bool BuildSlotLocked(int n) {
       {"gather_yuv444", &s.k_gather_yuv444},
       {"scatter_yuv444", &s.k_scatter_yuv444},
       {"fill_unvisited_yuv444", &s.k_fill_unvisited_yuv},
+      {"fill_unvisited_u16", &s.k_fill_unvisited_u16},
   };
   for (auto& kn : kernels) {
     cl_kernel k = clCreateKernel(prog, kn.name, &e);
@@ -1893,23 +1935,54 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // the planar-4:4:4 case rather than round-tripping them through RGB, so it
     // matches what this pre-fill produces on the same input.
     if (b_in16 != nullptr) {
-      // The production combination: the source is the caller's rgba64le, so copy
-      // it and let the scatter overwrite the visited pixels.  This makes the
-      // uint16 path's unvisited pixel agree with the float path's exactly.
-      e = CopyBytes(ctx->queue, b_in16, b_out16, 0, 0, u16_bytes, &io);
+      // F1 here too, and this is the branch that mattered: the copy this replaced
+      // moved u16_bytes device-to-device every batch (265,420,800 B at 1920x1080
+      // with --batch-frames 16) to define typically ONE pixel per frame.  Same
+      // kernel and same owner-scan guarantee as the yuv444 fill above -- see the
+      // source's comment for why every pixel lands exactly once -- and it copies
+      // the four channels verbatim, so the uint16 path's unvisited pixel agrees
+      // with the float path's exactly, which is what the whole-frame copy was for.
+      const std::size_t gf = global_for(static_cast<std::size_t>(np) *
+                                        static_cast<std::size_t>(frames));
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 0, sizeof(cl_mem), &b_owner);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 1, sizeof(cl_mem), &b_in16);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 2, sizeof(cl_mem), &b_out16);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 3, sizeof(int), &np);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 4, sizeof(int), &frames);
+      const int copy_src = 1;
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 5, sizeof(int), &copy_src);
+      e = clEnqueueNDRangeKernel(ctx->queue, ctx->k_fill_unvisited_u16, 1, nullptr,
+                                 &gf, &local, 0, nullptr, nullptr);
+      if (e == CL_SUCCESS) e = clFinish(ctx->queue);
     } else {
       // uint16 out with no rgba64le source: either a float4 source, or a planar
       // 4:4:4 source -- the latter reaches here under RD_YUV444_OUT=0 with
       // --input-mode yuv444, and its Y/U/V planes are not the rgba64le layout
       // this buffer holds, so there is no plain byte copy to make (copying
       // b_in_yuv into b_out16 would scatter plane bytes into colour channels).
-      // Define the unvisited pixel as black rather than as garbage.  Not
-      // identical to the planar-in/planar-out branch, which can copy the source
-      // verbatim because the layouts match -- but deterministic, which is the
-      // property that matters, and this cross-layout combination is not what the
-      // video pipe uses.
-      const cl_uint zero = 0;
-      e = FillBytes(ctx->queue, b_out16, &zero, sizeof(zero), 0, u16_bytes, &io);
+      // Define the unvisited pixel as black rather than as garbage: the kernel
+      // writes four zeros at the owner<0 slots instead of the old whole-buffer
+      // FillBytes, which zeroed pixels the scatter was about to overwrite anyway.
+      // Not identical to the planar-in/planar-out branch, which can copy the
+      // source verbatim because the layouts match -- but deterministic, which is
+      // the property that matters, and this cross-layout combination is not what
+      // the video pipe uses.
+      const std::size_t gf = global_for(static_cast<std::size_t>(np) *
+                                        static_cast<std::size_t>(frames));
+      // b_out16 stands in as the unused source: the kernel reads it only when
+      // copy_src is set, and a non-null argument avoids leaning on every
+      // conformant runtime accepting a NULL cl_mem.
+      cl_mem src16 = b_out16;
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 0, sizeof(cl_mem), &b_owner);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 1, sizeof(cl_mem), &src16);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 2, sizeof(cl_mem), &b_out16);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 3, sizeof(int), &np);
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 4, sizeof(int), &frames);
+      const int copy_src = 0;
+      clSetKernelArg(ctx->k_fill_unvisited_u16, 5, sizeof(int), &copy_src);
+      e = clEnqueueNDRangeKernel(ctx->queue, ctx->k_fill_unvisited_u16, 1, nullptr,
+                                 &gf, &local, 0, nullptr, nullptr);
+      if (e == CL_SUCCESS) e = clFinish(ctx->queue);
     }
     if (e != CL_SUCCESS) return fail("fill(u16 out)");
   }
