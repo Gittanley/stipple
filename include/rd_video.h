@@ -360,6 +360,16 @@ struct VideoResult {
   double encode_ms = 0.0;
   double convert_ms = 0.0;   // writer: float -> uint16 (host, per pixel)
   double pipe_ms = 0.0;      // writer: the ffmpeg pipe write
+  // True only if the host actually performed some float -> uint16 conversion.
+  // convert_ms is a raw [e0,e1) timer around the writer's `if (!b.raw_ready)`
+  // block, so it is ALWAYS accumulated -- including the default run, where the
+  // GPU's fused scatter set raw_ready on every batch, the conversion was skipped
+  // entirely, and convert_ms sits at exactly 0.0.  Gating the summary on
+  // `convert_ms > 0` would have been the same shape of mistake: on the default
+  // path it is 0, but under --gpu-float-out the host converts (raw_ready false)
+  // and any near-zero measurement could be dropped by an epsilon.  A set-where-
+  // it-happens flag has no such coincidence to rely on.
+  bool host_converted = false;
   // End to end, INCLUDING the palette stage.  This used to be the pipeline's own
   // elapsed time, taken inside VideoProcess, which starts after VideoBuildPalette has
   // already returned -- so the reported fps silently excluded the palette, and a run

@@ -374,10 +374,32 @@ void PrintVideoSummary(const rd::VideoResult& result, bool quiet) {
   // The writer's cost split, because the two halves scale differently and only
   // one of them is a candidate for moving to the GPU.  These two DO add up to the
   // encode figure above; the three beside it do not add up to the wall.
-  std::printf("             writer %.0f ms of that encode figure: %.0f ms "
-              "float->uint16 on the host, %.0f ms pushing the pipe\n",
-              result.convert_ms + result.pipe_ms, result.convert_ms,
-              result.pipe_ms);
+  //
+  // Printed ONLY when the host actually converted.  On the default run the GPU's
+  // fused scatter set raw_ready on every batch, the host conversion was skipped,
+  // and convert_ms is exactly 0.0 -- so the line printed "0 ms float->uint16 on
+  // the host" for work that never happened, naming a phase that did not run.  The
+  // gate is the flag set where the conversion happens (rd_video.cpp writer loop),
+  // not `convert_ms > 0`: on the default path that is 0 by the same coincidence
+  // that made the label wrong.
+  //
+  // The else arm names NO mechanism for the already-uint16 bytes.  Its first
+  // version said "the GPU wrote the uint16", which is a false attribution for
+  // `--engine cpu` -- measured: that engine takes this arm, because its fused
+  // scatter also sets raw_ready, and there was no GPU in the run at all.  Same
+  // defect class as the line it replaces: a summary that asserts which code did
+  // the work, when the summary cannot know it.
+  if (result.host_converted) {
+    std::printf("             writer %.0f ms of that encode figure: %.0f ms "
+                "float->uint16 on the host, %.0f ms pushing the pipe\n",
+                result.convert_ms + result.pipe_ms, result.convert_ms,
+                result.pipe_ms);
+  } else {
+    std::printf("             writer %.0f ms of that encode figure: all pushing "
+                "the pipe (no float->uint16 on the host; the batch was already "
+                "uint16)\n",
+                result.pipe_ms);
+  }
 }
 
 // Concatenates the recorded segments into the requested output.  Every segment
@@ -1004,6 +1026,9 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     result.encode_ms += seg_result.encode_ms;
     result.convert_ms += seg_result.convert_ms;
     result.pipe_ms += seg_result.pipe_ms;
+    // The flag is a fact, not a sum: any segment that converted on the host makes
+    // the summary's "float->uint16 on the host" line true.  OR, not +=.
+    result.host_converted = result.host_converted || seg_result.host_converted;
     result.cpu_frames += seg_result.cpu_frames;
     result.gpu_frames += seg_result.gpu_frames;
   }

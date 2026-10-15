@@ -4159,6 +4159,11 @@ bool VideoProcess(const std::string& in, const std::string& out,
       // move the conversion onto the GPU or to parallelise the encoder.
       convert_ms += (e1 - e0);
       pipe_ms += (NowMs() - e1);
+      // The conversion above ran iff we entered `if (!b.raw_ready)` -- the timer
+      // spans that block unconditionally, so the accumulated convert_ms is 0.0 on
+      // exactly the runs where the block was skipped.  Record the fact rather than
+      // leaving the summary to infer it from a measurement.
+      if (!b.raw_ready) result->host_converted = true;
       frames_read_now = frames_read;
       free_slots.push_back(slot);
     }
