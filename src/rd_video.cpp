@@ -2390,24 +2390,24 @@ class Pipeline {
     // budget is the number a user reads to decide whether to lower --queue-depth, and
     // a number that disagrees with the process is worse than no number at all.
     //
-    // `float_path_` is UNCONDITIONALLY true, so `b.pixels` is allocated on every video
-    // run at sizeof(RgbaF) = 16 bytes per pixel per slot -- 530,841,600 B, which is
-    // 506.25 MiB (not the 531 MiB an earlier comment here claimed), at 1080p with
-    // --batch-frames 16 -- including the default GPU runs where nothing reads it.
+    // `float_path_` is UNCONDITIONALLY true -- the FIELD is, and the option cannot
+    // be asked a question it does not answer -- but `b.pixels` is NOT allocated on
+    // every video run.  The resize in VideoProcess is gated on
+    // `host_touches_pixels` (`use_gpu && opt.gpu_float_out`, declared once with the
+    // RAM budget so the counted figure and the allocation cannot drift apart), the
+    // one configuration where the device hands floats back.  Under that gate the
+    // buffer is 16 bytes per pixel per slot -- 530,841,600 B, which is 506.25 MiB
+    // (not the 531 MiB an earlier comment here claimed), at 1080p with
+    // --batch-frames 16; outside it there is no buffer at all.
     //
-    // The unconditional form is deliberate and is not a simplification.  This used to
-    // be a condition over `opt.use_gpu`, `opt.gpu_float_out` and a host-worker count,
-    // and reading what the user REQUESTED rather than what the hardware turned out to
-    // be is what made `--cpu-threads 0` access-violate on a machine with no device:
-    // 0 is documented as "GPU only", the request says use_gpu and gpu_float_out is
-    // false, so the whole expression evaluated false and the float4 buffer was never
-    // allocated -- while RunVideo, having found no device, launched a host worker that
-    // dereferenced exactly that buffer.  0xC0000005, after a 577-byte container that
-    // ffprobe calls malformed.
-    //
-    // What the field's being constant costs, and what would have to be proved before
-    // dropping the allocation, is written out at the `b.pixels.resize` in
-    // VideoProcess.
+    // The constant field is old and the reason is worth keeping: this used to be
+    // a condition over `opt.use_gpu`, `opt.gpu_float_out` and a host-worker count,
+    // and reading what the user REQUESTED rather than what the hardware resolved is
+    // what made `--cpu-threads 0` access-violate on a machine with no device --
+    // 0xC0000005, after a 577-byte container that ffprobe calls malformed.  What
+    // survived it was to stop asking the FIELD: the allocation gate names the
+    // resolved engine and the one consumer left, and the experiment that proved
+    // the default runs need none of it is at the `b.pixels.resize` in VideoProcess.
     float_path_ = true;
 
     // ---- RAM budget --------------------------------------------------------
@@ -3016,15 +3016,15 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // follows twice over, for the 4:4:4 plane stride and the input/output size collision.
   //
   // `cpu_threads > 0` is the THIRD disjunct, and it is here because the consumer of
-  // b.pixels is not only the GPU.  The reader's widening condition below tests
-  // `!use_gpu || opt.gpu_float_out || cpu_threads > 0` -- host workers dither b.pixels
-  // whenever cpu_threads > 0, which is exactly what --cpu-threads N asks for on a GPU
-  // machine.  This refusal enumerated only the first two, so fixing that condition (it
-  // used to omit the host-worker case, and every documented use of --cpu-threads on a
-  // GPU machine was dithering an unwritten buffer) made this combination reachable:
-  // RawToFloats then reads pixels*4 uint16 from a pixels*1.5 byte buffer, which at
-  // 1920x1080 with --batch-frames 16 is ~206 MiB past a 49.8 MB allocation.  Both
-  // conditions must name the same three things or one of them is a hole.
+  // b.pixels used to be not only the GPU.  The reader's widening condition below is
+  // now ONE predicate, `host_touches_pixels` (`use_gpu && opt.gpu_float_out`) --
+  // the fused gather took the host workers' need for b.pixels away, so they no
+  // longer dither it -- but every branch of this refusal still has to fire: without
+  // a GPU, or with a host worker in play, the host engine has no 4:2:0 chroma
+  // reconstruction at all, and with gpu_float_out the reader widens yuv420 through
+  // RawToFloats, which reads pixels*4 uint16 from a pixels*1.5 byte buffer -- at
+  // 1920x1080 with --batch-frames 16, ~206 MiB past a 49.8 MB allocation.  The
+  // condition must name the same cases as the paths it guards, or one is a hole.
   if (use_yuv420 && (!use_gpu || opt.gpu_float_out || cpu_threads > 0)) {
     *error =
         "[video] --input-mode yuv420 needs a GPU engine to reconstruct chroma; this\n"
@@ -3128,7 +3128,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // 1920x1080 and --batch-frames 16 (33,177,600 batch-pixels per slot):
   //
   //     buffer   bytes/pixel    per slot (B)      condition
-  //     pixels        16       530,841,600      always -- float_path_ is the constant true
+  //     pixels        16       530,841,600      gated -- float_path_ && host_touches_pixels (gpu_float_out only)
   //     input          3        99,532,800      pinned branch, yuv444p
   //                    8       265,420,800      pinned branch, rgba64le
   //                  1.5        49,766,400      pinned branch, yuv420p
@@ -3136,7 +3136,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
   //                    8       265,420,800      pinned branch, out rgba64le
   //                    8       265,420,800      pageable branch, either output
   //
-  // So, per pixel and per slot:
+  // So, per pixel and per slot (totals below INCLUDE the 16 above, which the gate turns OFF by default -- the default GPU yuv444 run is 6 B/px = 199,065,600 B):
   //
   //              input  output   total B/px   per slot (B)     per slot (MiB)
   //     GPU yuv444    3       3            22      729,907,200        696.09
@@ -3145,7 +3145,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
   //     host rgba64   8       8            32    1,061,683,200      1,012.50
   //
   // And here is where the four old sites went wrong, each in a DIFFERENT direction --
-  // which is the whole reason none of them looked broken on its own:
+  // which is the whole reason none of them looked broken on its own.  Pre-gate figures:
   //
   //   * The [ram] peak's per_batch_ used a FLAT 32 for all four, so it OVER-stated
   //     every GPU configuration: 1,012.50 MiB reported against 696.09 MiB held on the
@@ -3202,7 +3202,7 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // under-claiming today rather than over-claiming, so this is a correctness fix and
   // not a safety one -- but it is the whole reason the 4050 MiB reaches the queue.
   //
-  // Names the RESOLVED engine.  use_gpu is settled at :2720 and cpu_threads at :2702,
+  // Names the RESOLVED engine.  use_gpu is settled at :3007 and cpu_threads at :2989,
   // both above here.  c5efb68 was a crash because a neighbouring condition named the
   // REQUESTED branch instead.  (The line numbers were 2531 and 2609 until edits above
   // this one moved them; a citation that has drifted is worse than none, because it
@@ -3305,66 +3305,66 @@ bool VideoProcess(const std::string& in, const std::string& out,
   pipe.set_depth(depth);
   std::vector<Batch> slots(static_cast<std::size_t>(depth));
   for (Batch& b : slots) {
-    // RESEARCH ONLY -- DO NOT MAKE THIS CONDITIONAL YET.  Not edited below.
+    // RESEARCH NOTES -- the question these lines asked was "can this allocation be
+    // made conditional?", the answer was YES, and the gate now exists: the resize
+    // below runs under `host_touches_pixels` (`use_gpu && opt.gpu_float_out`,
+    // declared at :3225 with the RAM budget).  Kept because the wrong turns are
+    // the useful part; the current state and the experiment are the block below.
     //
-    // `float_path_` is the constant true, so this runs on EVERY video run and costs
-    // sizeof(RgbaF) = 16 B/px per slot: 530,841,600 B = 506.25 MiB per slot at
-    // 1920x1080 with --batch-frames 16, and 4,050 MiB at a queue depth of 8, which is
-    // 72.7% of that configuration's whole queue (5,568.7 MiB at the real 22 B/px).
-    // On the default video path nothing below reads it:
+    // The cost the gate makes optional: sizeof(RgbaF) = 16 B/px per slot --
+    // 530,841,600 B = 506.25 MiB per slot at 1920x1080 with --batch-frames 16,
+    // 4,050 MiB at a queue depth of 8, 72.7% of that configuration's whole queue
+    // (5,568.7 MiB at 22 B/px).  On the default path nothing reads it:
     //
-    //   * the reader's widening at :3210 is gated on
-    //     `!use_gpu || opt.gpu_float_out || cpu_threads > 0`, which is false for a
-    //     default run (GPU present, float-out off, cpu_threads auto-resolved to 0);
-    //   * the writer's convert at :3517 is gated on `!raw_ready`, and the GPU sets
-    //     raw_ready whenever upload_u16 && emit_u16, which is the default;
-    //   * the CUDA blocks engine allocates no device pixel buffer when upload_u16 (so
-    //     d_pixels_buf is not even cudaMalloc'd -- rd_blocks_cuda.cu:1001) and passes
-    //     d_pixels_out = nullptr to the scatter when emit_u16 (:1180), so the host
-    //     buffer is neither uploaded nor downloaded on that path.
+    //   * the reader's widening, gated on the SAME `host_touches_pixels` predicate
+    //     the allocation uses -- which is this block's whole lesson: two sites
+    //     spelling one condition drift apart, and here a mismatch is a crash or a
+    //     black frame, not a slow path;
+    //   * the writer's convert, gated on `!b.raw_ready` (:4108); raw_ready is set
+    //     once, at :3987 -- emit_u16 for the GPU (the default) and fused-scatter
+    //     success for the host;
+    //   * the CUDA blocks engine, which allocates no device pixel buffer under
+    //     upload_u16 (rd_blocks_cuda.cu:1190) and hands the scatter a nullptr
+    //     d_pixels_out under emit_u16 (rd_blocks_cuda.cu:1403), so the host buffer
+    //     is neither uploaded nor downloaded on that path.
     //
-    // WHAT WOULD HAVE TO HOLD for the allocation to be droppable.  Every consumer must
-    // either be unreachable under the same condition the allocation would be gated on,
-    // or tolerate a null/empty b.pixels.  The set of consumers in these two files is:
+    // WHAT THIS BLOCK USED TO PRESCRIBE: every consumer unreachable under the gate,
+    // or tolerating null/empty b.pixels.  Its four entries, and where each stands:
     //
-    //   1. RawYuv444ToFloatsParallel / RawToFloatsParallel -- the reader's widening,
-    //      rd_video.cpp:3216 and :3219, both writing b.pixels.data() as a
-    //      non-null destination.  Already gated on `!use_gpu || gpu_float_out ||
-    //      cpu_threads > 0`.  DROPPABLE only if that gate and the allocation gate are
-    //      the SAME predicate -- the exact lesson of the 0xC0000005 recorded on
-    //      float_path_ and of the --input-mode yuv420 refusal above.
-    //   2. FloatsToYuv444Parallel / FloatsToRawParallel -- the writer's convert,
-    //      rd_video.cpp:3534 and :3538, reading b.pixels.data().  Already gated on
-    //      `!b.raw_ready`.
-    //   3. RiemersmaBlocksCpu -- the host worker, rd_video.cpp:3392, writing
-    //      b.pixels.data().  Reached whenever cpu_threads > 0, i.e. --cpu-threads N
-    //      on a GPU machine.  MUST keep the buffer whenever any host worker can run.
-    //   4. RiemersmaBlocksCuda / RiemersmaBlocksOpencl -- rd_video.cpp:3377 and
-    //      :3372, passing b.pixels.data() as the `batch` argument.  THE ONE THAT IS
-    //      NOT SETTLED.  Passing nullptr is safe only if the engine never dereferences
-    //      it, and the two engines demonstrably differ: CUDA does not touch it under
-    //      upload_u16, but OpenCL's check_u16 path reads AND WRITES batch[i]
-    //      (rd_opencl.cpp:1517-1531, 1631, 1639) and its float-upload path does
-    //      MakeBuffer(..., batch, ...) at :1305.
-    //
-    // WHAT WOULD SETTLE THE OPENCL QUESTION.  Not inspection of the flags; a run.
-    // `RD_OCL_CHECK_U16=1` exists precisely to run the float and uint16 paths against
-    // each other on one input (rd_opencl.cpp:1483-1511) and it dereferences `batch` on
-    // the float pass, so it is the instrument already in the tree.  What is needed is
-    // one `--engine opencl --video` run with b.pixels allocated (today's behaviour)
-    // and the same run with it not allocated, over the same fixture, comparing the
-    // output files byte-for-byte -- plus one run with RD_OCL_CHECK_U16=1 under each.
-    // If they match, the allocation is droppable for OpenCL; if the CHECK_U16 run
-    // differs, it is not, and that is a NULL DEREFERENCE risk rather than a slow path,
-    // which is why this stays a note.
+    //   1. RawYuv444ToFloatsParallel / RawToFloatsParallel -- the reader's widening
+    //      (:3703, :3707), writing b.pixels.data().  Was gated on a three-disjunct
+    //      spelling (`!use_gpu || gpu_float_out || cpu_threads > 0`); now the one
+    //      predicate.  This block's condition -- that both gates be the SAME
+    //      predicate -- is what the code does, and the 0xC0000005 recorded on
+    //      float_path_ and the --input-mode yuv420 refusal above are the two
+    //      times it was not.
+    //   2. FloatsToYuv444Parallel / FloatsToRawParallel -- the writer's convert
+    //      (:4125, :4129), reading b.pixels.data().  Gated on `!b.raw_ready`, as
+    //      before.
+    //   3. RiemersmaBlocksCpu -- the host worker (:3951).  This block said "Reached
+    //      whenever cpu_threads > 0 ... MUST keep the buffer whenever any host
+    //      worker can run".  True when written, false now: the gather is fused
+    //      (the call passes gather_layout 3 or 4, and the engine ignores `batch`
+    //      whenever it is not 0), so the host engine reads the decoder's bytes.
+    //   4. RiemersmaBlocksCuda / RiemersmaBlocksOpencl (:3907, :3902), passing
+    //      b.pixels.data() as `batch`.  Marked THE ONE THAT IS NOT SETTLED, because
+    //      passing nullptr is safe only if the engine never dereferences it -- and
+    //      OpenCL's check_u16 path reads batch[i] (rd_opencl.cpp:1801) and writes
+    //      it back (:1812-1815), so a null there is a dereference risk.  Settled,
+    //      by running it rather than by reading flags: with the allocation gated
+    //      off, both engines produced identical decoded md5 at 320x180, with and
+    //      without the buffer, under RD_OCL_CHECK_U16=1 (rd_opencl.cpp:1794)
+    //      as well, whose whole purpose is to run the two paths against each other
+    //      while dereferencing `batch`.  The run is recorded in the block below;
+    //      its output files were not checked in, so the result is quoted, not shown.
     // `b.pixels` is 16 B/px -- 506.25 MiB per slot at 1080p and batch 16, so 4050 MiB
     // across a depth-8 queue.  It is only needed when something will actually READ it,
     // and on the default GPU video path (GPU on, gpu_float_out off, no host workers)
     // nothing does:
     //
-    //   - the reader's widening into it is gated on `host_touches_pixels` (:2882)
+    //   - the reader's widening into it is gated on `host_touches_pixels` (:3225)
     //   - the writer's convert is gated on !raw_ready, and the GPU writes raw itself
-    //   - rd_blocks_cuda.cu:1001 allocates no device pixel buffer under
+    //   - rd_blocks_cuda.cu:1190 allocates no device pixel buffer under
     //     upload_u16 && emit_u16, so the pointer it is handed goes unread
     //
     // ESTABLISHED BY EXPERIMENT, not by reading the code.  Gating the allocation off
@@ -3373,12 +3373,12 @@ bool VideoProcess(const std::string& in, const std::string& out,
     // reads AND writes batch[i] and was the reason this was not simply assumed.  The
     // negative control is what makes that meaningful -- the same gate on
     // --gpu-float-out and on --engine cpu gives 0xC0000005, an access violation, so the
-    // experiment does detect a missing buffer.  tools/probe-host-oracle.ps1 and
-    // artifacts/pixels_probe.ps1 are that experiment.
+    // experiment does detect a missing buffer.  The run was ad-hoc -- no script in
+    // the tree reproduces it (tools/probe-host-oracle.ps1 is the host==device probe).
     //
     // So the predicate names the RESOLVED engine, not the request.  That distinction
     // has bitten this file before: c5efb68 was a crash because the condition named the
-    // requested branch.  use_gpu is resolved at :2720 and cpu_threads at :2702, both
+    // requested branch.  use_gpu is resolved at :3007 and cpu_threads at :2989, both
     // above this point, so all three inputs are known here.
     // host_touches_pixels is declared once above, where the RAM budget uses it, so the
     // figure reported and the memory actually taken cannot drift apart.
@@ -3669,30 +3669,30 @@ bool VideoProcess(const std::string& in, const std::string& out,
         }
         segment_read += filled;
         // The dither engine works on RgbaF, but the pipe carries rgba64le.  On the
-        // GPU path this widening happens on the device now, so the reader stops
-        // here -- which is the whole point: the loop was the reader's dominant cost
-        // and it was bandwidth-bound, not compute-bound.
+        // default GPU path the engines gather fused from the decoder's own bytes, so
+        // the reader stops here -- which is the whole point: the loop was the reader's
+        // dominant cost and it was bandwidth-bound, not compute-bound.
         //
-        // The two host paths still need it.  Both are exact and lossless: Q16
-        // Quantum is a float, and the decoder's uint16 maps onto it exactly.  Skipping
-        // it where it *is* required leaves b.pixels at its zero-initialised value and
-        // the whole clip comes out black, so the condition is explicit.
-        // `|| cpu_threads > 0` is the fix, and it is the same mistake as the two above:
-        // the condition named the GPU, but the CONSUMER of `b.pixels` is not the GPU.
-        // Host workers dither `b.pixels`, and they exist whenever cpu_threads > 0 --
-        // which on a GPU machine is exactly what `--cpu-threads N` asks for.  With a
-        // GPU present, gpu_float_out off, and `--cpu-threads 4`, none of the original
-        // three disjuncts held, so the reader never widened into `b.pixels` and the
-        // host workers dithered a zero-initialised buffer: measured mean R 56.37
-        // against 120.74 for the same clip with the default `--cpu-threads 0`, and
-        // byte-identical for N=1 and N=4.  Silently, deterministically, exit 0.
+        // It runs today under ONE condition: `host_touches_pixels`, i.e. gpu_float_out
+        // -- the single configuration where `b.pixels` exists, the same predicate the
+        // allocation uses.  Skipping it where it *is* required leaves `b.pixels`
+        // zero-initialised and the whole clip comes out black, so it is explicit.
+        //
+        // History, because this condition has been wrong before, silently: it used to
+        // be three disjuncts, `|| cpu_threads > 0` among them, because host workers
+        // dithered `b.pixels` directly.  With a GPU present, gpu_float_out off and
+        // `--cpu-threads 4` none of the original three held, so the reader never
+        // widened into `b.pixels` and the host workers dithered a zero-initialised
+        // buffer -- measured mean R 56.37 against 120.74 for the same clip at the
+        // default `--cpu-threads 0`, byte-identical for N=1 and N=4.  Silently,
+        // deterministically, exit 0.
         //
         // It now reads `host_touches_pixels` rather than re-spelling the three
         // disjuncts, because it WAS re-spelling them.  That predicate is documented
         // as "declared once ... so the figure reported and the memory actually taken
         // cannot drift apart", and this second copy is exactly the drift it exists to
         // prevent -- two sites to edit, one of which the note above never mentions,
-        // and a mismatch here is not a slow path but a black or garbage frame.  The
+        // and a mismatch here is not a slow path but a crash or a black frame.  The
         // two conditions are equal today; the duplication is the defect, not the
         // value.
         if (host_touches_pixels) {
