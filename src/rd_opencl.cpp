@@ -1892,17 +1892,22 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
     // the source with one thread per frame.  It copies the source Y/U/V verbatim in
     // the planar-4:4:4 case rather than round-tripping them through RGB, so it
     // matches what this pre-fill produces on the same input.
-    if (want_in_u16) {
+    if (b_in16 != nullptr) {
       // The production combination: the source is the caller's rgba64le, so copy
       // it and let the scatter overwrite the visited pixels.  This makes the
       // uint16 path's unvisited pixel agree with the float path's exactly.
       e = CopyBytes(ctx->queue, b_in16, b_out16, 0, 0, u16_bytes, &io);
     } else {
-      // uint16 out from a float4 source: there is no rgba64le source to copy, so
-      // define the unvisited pixel as opaque black rather than as garbage.  Not
-      // identical to the float path here -- the float path would keep the source
-      // value -- but deterministic, which is the property that matters, and this
-      // combination is not what the video pipe uses.
+      // uint16 out with no rgba64le source: either a float4 source, or a planar
+      // 4:4:4 source -- the latter reaches here under RD_YUV444_OUT=0 with
+      // --input-mode yuv444, and its Y/U/V planes are not the rgba64le layout
+      // this buffer holds, so there is no plain byte copy to make (copying
+      // b_in_yuv into b_out16 would scatter plane bytes into colour channels).
+      // Define the unvisited pixel as black rather than as garbage.  Not
+      // identical to the planar-in/planar-out branch, which can copy the source
+      // verbatim because the layouts match -- but deterministic, which is the
+      // property that matters, and this cross-layout combination is not what the
+      // video pipe uses.
       const cl_uint zero = 0;
       e = FillBytes(ctx->queue, b_out16, &zero, sizeof(zero), 0, u16_bytes, &io);
     }
