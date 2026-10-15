@@ -116,6 +116,21 @@ elseif(EXISTS "${RD_IMAGEMAGICK_ROOT}/Library/include/ImageMagick-7/MagickCore/M
     # findable through RPATH or LD_LIBRARY_PATH.
     set(RD_IM_MAGICK_EXE "${RD_IMAGEMAGICK_ROOT}/bin/magick")
     file(GLOB _rd_im_libs "${RD_IMAGEMAGICK_ROOT}/lib/libMagick*")
+    # These two MUST be set, and their absence is why the Linux job could never
+    # link.  target_link_libraries below passes "${RD_IM_CORE_LIB}"
+    # "${RD_IM_WAND_LIB}" unconditionally; with both unset on this flavour the
+    # command expanded to two empty strings, handed the linker nothing, and every
+    # MagickCore reference became an undefined symbol -- a failure that reads like
+    # a missing dependency rather than like an unset variable.
+    #
+    # The unversioned development symlink is what the linker wants, not the
+    # versioned SONAME: -lMagickCore-7.Q16HDRI resolves through libMagickCore-
+    # 7.Q16HDRI.so, which the build creates beside the real libMagickCore-7.
+    # Q16HDRI.so.NN.  Handing it the versioned .so.NN directly would name a file
+    # the runtime linker resolves by SONAME anyway, and would break the moment the
+    # patch level moved.  So: the library NAME, letting -L find it.
+    set(RD_IM_CORE_LIB "MagickCore-7.Q16HDRI")
+    set(RD_IM_WAND_LIB "MagickWand-7.Q16HDRI")
   else()
   message(FATAL_ERROR
     "ImageMagick headers not found under ${RD_IMAGEMAGICK_ROOT}.  Expected one of\n"
@@ -323,10 +338,13 @@ add_executable(rdither ${RD_SOURCES})
 target_include_directories(rdither PRIVATE include "${RD_IM_INCLUDE}")
 target_link_directories(rdither PRIVATE "${RD_IM_LIB}")
 
-# The MSVC import libraries are named per-quantum.  Two naming schemes, picked by
-# the layout probe above: the official build says CORE_RL_MagickCore_.lib, conda
-# says MagickCore-7.Q16HDRI.dll.lib.  Hardcoding either one is what made the conda
-# toolchain unusable until the probe existed.
+# The ImageMagick link libraries are named per-flavour, picked by the layout probe
+# above: the official Windows build says CORE_RL_MagickCore_.lib, conda says
+# MagickCore-7.Q16HDRI.dll.lib, and a Linux source build says MagickCore-7.Q16HDRI
+# (a bare -l name, resolved through the unversioned .so symlink).  Hardcoding any
+# one is what made the other toolchains unusable until the probe existed.  All
+# three flavours set both variables -- an unset one here reaches the linker as an
+# empty string, which is a silent no-op, not an error.
 target_link_libraries(rdither PRIVATE "${RD_IM_CORE_LIB}" "${RD_IM_WAND_LIB}")
 
 if(RD_WITH_CUDA)

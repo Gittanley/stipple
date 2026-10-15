@@ -404,6 +404,35 @@ jobs:
           Write-Host "OpenCL-vs-CUDA sweep or the video probes, and those stay manual."
           & .\build\Release\rdither.exe --list-dithers
 
+      - name: Exercise the binary (compiled .cu, run with no device)
+        shell: pwsh
+        # Before this step the job only ran --list-dithers, which touches the CLI
+        # parser and essentially none of the CUDA object code -- so a .cu that
+        # compiled and linked but crashed at static init, or that mis-reported its
+        # device state, would have passed.  The point of a no-GPU runner is the
+        # ABSENCE of a device; the correct behaviour there is a clean, explained
+        # fallback, not a crash.
+        #
+        # The probes below are the ones a GPU-less binary must answer correctly.
+        # Each is expected to either succeed on CPU or exit 2 ("cannot run"), and
+        # exit 2 is checked for explicitly rather than swallowed -- a probe that
+        # exits 1 here is a real defect, not a gap.
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = ".\build\Release\rdither.exe"
+          # --help alone proves the executable starts and the CLI parser runs; there
+          # is no --version flag to double-check it with.  A missing flag would exit
+          # 2, so the probe asserts 0 rather than assuming it.
+          & $exe --help *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Host "--help exit=$LASTEXITCODE on a GPU-less CUDA build"; exit 1 }
+          Write-Host "--help exit=0 (binary starts)"
+          # Self-test runs the CPU-side dither logic that the CUDA build also
+          # compiles, and must not need a device.
+          & $exe --self-test 2>&1 | Select-Object -Last 4 | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { Write-Host "self-test failed on a GPU-less CUDA build"; exit 1 }
+          Write-Host "OK: the CUDA-linked binary runs, and self-test passes without a device."
+          exit 0
+
   # ############################################################################
   # LINUX.  Added because OpenCL is the PRIMARY accelerated path on Linux -- there
   # is no CUDA there at all, and Intel/AMD iGPU need it -- so "the project does not
@@ -608,6 +637,18 @@ jobs:
             echo "headers -- CreateFileMapping needs mmap, GetConsoleMode needs isatty /"
             echo "termios. So this job stops at the first such include, which is"
             echo "src/rd_source.cpp:6. The build log above names the exact line."
+            echo
+            echo "A PREREQUISITE THAT IS NOW FIXED, and worth knowing about before the"
+            echo "port lands. The linux ImageMagick flavour in CMakeLists.txt never set"
+            echo "RD_IM_CORE_LIB or RD_IM_WAND_LIB, and target_link_libraries passes both"
+            echo "unconditionally -- so they expanded to empty strings, handed the linker"
+            echo "nothing, and every MagickCore reference would have been an undefined"
+            echo "symbol. It links MagickCore-7.Q16HDRI / MagickWand-7.Q16HDRI now. That"
+            echo "is latent here (this job stops before linking), proven by expanding the"
+            echo "same unset-variable call in a scratch project, which failed LNK2019 and"
+            echo "linked clean once a real library name was set. So the port will reach"
+            echo "the link step and find it already correct, rather than finding a second"
+            echo "Linux-only defect there."
             echo
             echo '```'
             tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
