@@ -131,7 +131,11 @@ DitherResult FloydSteinberg(DitherJob& job, RgbaF* px) {
 // Michael Atkinson's 1986 simplification: six neighbours, every weight 1/8.
 //
 //        *  1/8  1/8
-//     1/8  1/8  1/8  1/8
+//     1/8  1/8  1/8
+//         1/8
+//
+// Two same-row taps, three in the row below, one two rows down: the layout in
+// Wikipedia's distribution matrix, row by row -- *, +1, +2 / -1, 0, +1 / 0.
 //
 // The weights sum to 6/8 = 0.75, not 1, and that is deliberate rather than sloppy:
 // Atkinson discards a quarter of the error on the floor, which lightens the texture
@@ -169,22 +173,22 @@ DitherResult Atkinson(DitherJob& job, RgbaF* px) {
         const float er = r - static_cast<float>(c.r);
         const float eg = g - static_cast<float>(c.g);
         const float eb = b - static_cast<float>(c.b);
-        // Right, then the three below, then down-left and down-right.  No
-        // same-row-left and no two-rows-down: those are exactly the two Atkinson
-        // drops relative to Floyd-Steinberg.
+        // Right, second right, the three below, then the one two rows down --
+        // the canonical six taps.  The interior used to be {+1, row1, +2w,
+        // +2w+1}: it dropped the second same-row tap and carried a two-rows-down
+        // right-diagonal one instead, a layout no reference states (Wikipedia's
+        // matrix and beyondloom's tap list both give +2 and not +2w+1).
         //
-        // Guarded at the last column: i + 1 there is the first pixel of the
-        // NEXT row, and Accumulate only rejects i >= n, so the unguarded 1/8
-        // used to leak across the row boundary.
+        // Guarded at the right edge: i + 1, i + 2, i + w + 1 there are pixels
+        // of the NEXT row, and Accumulate only rejects i >= n, so the unguarded
+        // 1/8 used to leak across the row boundary.
         if (x + 1 < w) Accumulate(e, n, i + 1, k, k, k, er, eg, eb);
+        if (x + 2 < w) Accumulate(e, n, i + 2, k, k, k, er, eg, eb);
         if (x > 0) Accumulate(e, n, i + w - 1, k, k, k, er, eg, eb);
         Accumulate(e, n, i + w, k, k, k, er, eg, eb);
         if (x + 1 < w) Accumulate(e, n, i + w + 1, k, k, k, er, eg, eb);
         if (y + 1 < job.height) {
           Accumulate(e, n, i + 2 * w, k, k, k, er, eg, eb);
-          if (x + 1 < w) {
-            Accumulate(e, n, i + 2 * w + 1, k, k, k, er, eg, eb);
-          }
         }
         WriteChosen(frame[i], c);
       }

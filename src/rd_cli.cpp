@@ -1694,6 +1694,17 @@ int main(int argc, char** argv) {
         // right-edge pixel, where the right tap must NOT reach (1,0).
         src[1 * kw + 1].r = src[1 * kw + 1].g = src[1 * kw + 1].b = 63.0f;
         src[0 * kw + 5].r = src[0 * kw + 5].g = src[0 * kw + 5].b = 63.0f;
+        // Third source, +73 -> chosen 255 -> error -55: a NEGATIVE error is what
+        // gives the Atkinson interior swap teeth here.  The two positive sources
+        // above diffuse only upward, so the canonical +2 tap and the old 2w+1
+        // tap put different MAGNITUDES at different pixels while both still land
+        // above the 127/128 boundary -- identical choices, exact-equality pass,
+        // no discriminating power.  (1,0) is where the tap sets diverge: the
+        // canonical +2 reaches (3,0), the old 2w+1 reaches (2,1), and a negative
+        // arrival at (2,1) flips it 128 -> 127 between the two layouts.  Measured
+        // as the fixture's original weak form did: this pixel was added because
+        // the ref-vs-code comparison passed while the layouts disagreed.
+        src[0 * kw + 1].r = src[0 * kw + 1].g = src[0 * kw + 1].b = 200.0f;
 
         // The shared rules, transcribed from rd_dither_common.h: nearest entry
         // with the tie going to the lowest index, on this palette.
@@ -1743,10 +1754,14 @@ int main(int argc, char** argv) {
           return px;
         };
 
-        // Atkinson per its diagram, taps as rd_dithers.cc currently intends them
-        // (the interior tap set is pinned as-is; whether it matches the classic
-        // Atkinson layout is a separate question this test does not decide) --
-        // with the right-edge guard that is missing today.
+        // Atkinson per the canonical layout: the Wikipedia distribution matrix
+        // (row 0 = *, +1, +2; row 1 = -1, 0, +1; row 2 = 0, each 1/8) and the
+        // beyondloom tap list agree on it.  This reference used to pin the
+        // code's own interior -- {+1, row1 x3, +2w, +2w+1}, with no second
+        // same-row tap -- which was the defect, not the standard; the comment
+        // that used to say "whether it matches the classic Atkinson layout is a
+        // separate question this test does not decide" decided it.  Right-edge
+        // guard as before.
         auto ref_at = [&](std::vector<rd::RgbaF> px) {
           std::vector<float> er(kn, 0.0f), eg(kn, 0.0f), eb(kn, 0.0f);
           auto acc = [&](std::size_t idx, float wgt, float dr, float dg, float db) {
@@ -1765,13 +1780,11 @@ int main(int argc, char** argv) {
               const float c = nearest2(r, g, b);
               const float dr = r - c, dg = g - c, db = b - c;
               if (x + 1 < kw) acc(i + 1, k, dr, dg, db);
+              if (x + 2 < kw) acc(i + 2, k, dr, dg, db);
               if (x > 0) acc(i + kw - 1, k, dr, dg, db);
               acc(i + kw, k, dr, dg, db);
               if (x + 1 < kw) acc(i + kw + 1, k, dr, dg, db);
-              if (y + 1 < kh) {
-                acc(i + 2 * kw, k, dr, dg, db);
-                if (x + 1 < kw) acc(i + 2 * kw + 1, k, dr, dg, db);
-              }
+              if (y + 1 < kh) acc(i + 2 * kw, k, dr, dg, db);
               px[i].r = px[i].g = px[i].b = c;
             }
           }
