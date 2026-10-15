@@ -562,12 +562,22 @@ extern "C" BOOL WINAPI ConsoleHandler(DWORD type) {
   return FALSE;
 }
 
+// Registration is idempotent: the handler now installs BEFORE the palette phase
+// as well as at the pre-existing sites, and two registrations would outlive a
+// single removal -- leaving the flag settable by a Ctrl-C nobody polls any more.
+// Called from the main thread only; the flag itself is what crosses threads.
+static bool g_handler_installed = false;
+
 void InstallInterruptHandler() {
+  if (g_handler_installed) return;
   SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+  g_handler_installed = true;
 }
 
 void RemoveInterruptHandler() {
+  if (!g_handler_installed) return;
   SetConsoleCtrlHandler(ConsoleHandler, FALSE);
+  g_handler_installed = false;
 }
 
 bool Interrupted() { return g_interrupted.load(); }
@@ -1450,6 +1460,7 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
     double pdecode = 0.0, pquant = 0.0;
     int sampled = 0;
     for (; sampled < static_cast<int>(want); ++sampled) {
+      if (Interrupted()) break;  // Ctrl-C: stop feeding the pool sampler
       const double d0 = NowMs();
       const std::size_t got =
           pchild.Read(raw.data(), raw.size() * sizeof(std::uint16_t));
@@ -2053,6 +2064,7 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
         std::vector<std::uint16_t> l16;
         if (!palette_8bit) l16.resize(static_cast<std::size_t>(pixels) * pal_ch);
         for (;;) {
+      if (Interrupted()) return;  // Ctrl-C: claim no further seeks
       const int attempt = next_sample.fetch_add(1);
       if (attempt >= want) return;
       // Bit-reversed, skipping the out-of-range half of the padded range.
@@ -2140,6 +2152,10 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
       deadline_hit.store(true);
       break;
     }
+    // Ctrl-C: stop asking the decoder for more frames.  Checked between reads, so
+    // the wait for the current frame is bounded by the decoder's pace (~ms), not
+    // by whatever the sampler would otherwise do with a partial palette.
+    if (Interrupted()) break;
     const double d0 = NowMs();
     std::size_t got = 0;
     if (palette_8bit) {

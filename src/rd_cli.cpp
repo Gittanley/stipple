@@ -520,6 +520,14 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
   // tools\probe-palette-overlap.ps1 reads this line to prove RD_PALETTE_OVERLAP reached the
   // code.  See the comment at the spawn site.
   bool overlapped = false;
+  // The handler goes in BEFORE the palette phase, not at the two sites further
+  // down that both ran after it.  A Ctrl-C during palette sampling hit the
+  // DEFAULT handler and killed the process with 0xC000013A -- no exit 130, no
+  // resume hint, and no flag for the sampler loops to notice (they polled
+  // nothing).  Measured: probe-interrupt -DelayMs 500 exited 3221225786 before
+  // this.  The install is idempotent, so the later calls on both paths are
+  // no-ops and RemoveInterruptHandler still removes the one registration.
+  rd::InstallInterruptHandler();
   rd::PaletteGate gate;
   std::thread palette_thread;
   rd::VideoResult result;
@@ -630,6 +638,11 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     });
   } else if (!rd::VideoBuildPalette(in_path, opt, info, palette.get(), tree.get(),
                                     &result, &error)) {
+    // Ctrl-C kills the sampler's ffmpeg child (same console group), the short
+    // stream fails the build, and without this check that failure printed
+    // "error: ..." and exited 1 -- the interrupt reclassified as an ordinary
+    // error.  The flag outranks the message, as everywhere else.
+    if (rd::Interrupted()) return ReportInterrupted(out_path);
     std::fprintf(stderr, "error: %s\n", error.c_str());
     return 1;
   } else {
@@ -747,6 +760,10 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
 
   if (opt.palette_only) {
     join_palette();
+    // An interrupt during palette-only used to be swallowed: the phase never
+    // polled the flag, and this path returned 0 over whatever it managed to
+    // build.  The interrupt outranks the report, same as on the full path.
+    if (rd::Interrupted()) return ReportInterrupted(out_path);
     if (report_palette() != 0) return 1;
     if (!opt.quiet) {
       std::printf("palette-only: stopping before the dither, as asked\n");
