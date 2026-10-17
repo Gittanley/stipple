@@ -545,12 +545,20 @@ compile errors above were only findable because the log was there.
 
 ## Remaining scope, honestly
 
-- **The planar-YUV gathers.** `--input-mode yuv420` / `yuv444` / `yuv444-prepass` and
-  the planar 4:4:4 output kernel are refused with a message. Each is a bit-exact
-  transliteration of a specific libswscale routine on the CUDA side, so this is real
-  work rather than a flag — but it is mechanical, and the shape is already proven by
-  the `rgba64le` path. Until it is done, `--engine opencl --video` needs
-  `--input-mode rgba64` and `RD_YUV444_OUT=0`.
+- **Planar 4:2:0 input and the yuv444 prepass.** `--input-mode yuv420` and
+  `--input-mode yuv444-prepass` are refused with a message (measured 2026-10-17:
+  exit 2, "Planar 4:2:0 and the yuv444-prepass are not ported to OpenCL.  Use
+  --engine blocks for that input.").  `--input-mode yuv444` is NOT in that
+  list — it is ported, and so is the planar 4:4:4 output kernel:
+  `tools\probe-determinism.ps1` runs `--engine opencl --input-mode yuv444` with
+  `RD_YUV444_OUT` unset on every run and passes 14/14, and
+  `tools\probe-video-exact.ps1` reports both data paths (rgba64le and yuv444p)
+  bit-identical.  So `--engine opencl --video` needs `--input-mode rgba64` or
+  `--input-mode yuv444`, and nothing about `RD_YUV444_OUT` is restricted.
+  An earlier version of this bullet claimed yuv444 and the planar output were
+  refused and that `RD_YUV444_OUT=0` was required; all three were false when
+  re-tested on 2026-10-17 — the shape of the failure a stale scope note causes:
+  readers keep off a path that works.
 - **Palettes above 16 colours.** The port carries the flattened search index only.
   CUDA falls back to the recursive `ClosestColor` when a palette does not fit the
   4-bit nibble packing; this engine refuses with a message instead, because
@@ -597,7 +605,7 @@ The cost centre is FP64. The Riemersma error queue carries the error as a double
 so the walk is double-precision throughout, and a consumer GPU's FP64 rate is
 usually **1/32 or 1/64** of its FP32 rate. That ratio is exactly where NVIDIA,
 AMD and Intel differ most, and it is not a detail: it can turn a large win into a
-large loss. So "OpenCL is 1.2-1.3x of CUDA" is a true statement about an NVIDIA
+large loss. So "OpenCL is about 1.07x of CUDA" is a true statement about an NVIDIA
 driver and says nothing about an iGPU.
 
 Two things make this cheap to answer rather than a research project:
