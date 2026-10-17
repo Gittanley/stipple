@@ -2152,22 +2152,50 @@ std::string RiemersmaBlocksOpencl(const Palette& palette,
         const std::size_t pal_bytes = hpal.size() * sizeof(double);
         std::vector<unsigned char> tmp_owner(owner_bytes);
         std::vector<unsigned char> tmp_pal(pal_bytes);
-        std::vector<unsigned char> tmp_pix(pix_bytes);
         ReadBytes(ctx->queue, b_owner, 0, owner_bytes, tmp_owner.data(), true, &io);
         ReadBytes(ctx->queue, b_pal, 0, pal_bytes, tmp_pal.data(), true, &io);
-        ReadBytes(ctx->queue, b_pix, 0, pix_bytes, tmp_pix.data(), true, &io);
         f = std::fopen((std::string(prefix) + ".owner.bin").c_str(), "wb");
         if (f != nullptr) { std::fwrite(tmp_owner.data(), 1, tmp_owner.size(), f); std::fclose(f); }
         f = std::fopen((std::string(prefix) + ".pal.bin").c_str(), "wb");
         if (f != nullptr) { std::fwrite(tmp_pal.data(), 1, tmp_pal.size(), f); std::fclose(f); }
-        f = std::fopen((std::string(prefix) + ".pix.bin").c_str(), "wb");
-        if (f != nullptr) { std::fwrite(tmp_pix.data(), 1, tmp_pix.size(), f); std::fclose(f); }
+        // `b_pix` and `batch` are the FLOAT copy of the input, which not every
+        // input path builds: the raw-upload video paths never construct them
+        // (measured: both `--input-mode rgba64` and the default yuv420 mode skip
+        // both files).  Both were used unconditionally here, and each failed on
+        // those paths differently:
+        //
+        //   - ReadBytes(b_pix=nullptr) returns CL_INVALID_MEM_OBJECT, whose error
+        //     this diagnostic block ignores -- so pix.bin WAS written, full size,
+        //     out of an uninitialized vector.  A file full of heap garbage that
+        //     looks like a valid dump is worse than no file.
+        //   - fwrite(batch, 1, pix_bytes, f) with batch==nullptr is not an error
+        //     the code can ignore: MSVC's invalid-parameter handler fastfails,
+        //     exit 0xC0000409 (-1073740791).  Measured on --input-mode rgba64:
+        //     cx/idx/owner/pal wrote fine, host.bin opened, received 0 bytes, and
+        //     the process died there.
+        //
+        // So each now skips with a line naming what is missing.  A file the run
+        // says it did not write beats a present file that lies.
+        if (b_pix != nullptr) {
+          std::vector<unsigned char> tmp_pix(pix_bytes);
+          ReadBytes(ctx->queue, b_pix, 0, pix_bytes, tmp_pix.data(), true, &io);
+          f = std::fopen((std::string(prefix) + ".pix.bin").c_str(), "wb");
+          if (f != nullptr) { std::fwrite(tmp_pix.data(), 1, tmp_pix.size(), f); std::fclose(f); }
+        } else {
+          std::fprintf(stderr, "[dump] this input path carries no float pix buffer "
+                               "(non-float upload); %s.pix.bin skipped\n", prefix);
+        }
         // ...and the same bytes AFTER the readback into `batch`, which is what the
         // image writer will actually see.  `pix` stable while `host` varies puts
         // the fault in the readback; both stable while the PNG varies puts it in
         // the writer.  That is the last split.
-        f = std::fopen((std::string(prefix) + ".host.bin").c_str(), "wb");
-        if (f != nullptr) { std::fwrite(batch, 1, pix_bytes, f); std::fclose(f); }
+        if (batch != nullptr) {
+          f = std::fopen((std::string(prefix) + ".host.bin").c_str(), "wb");
+          if (f != nullptr) { std::fwrite(batch, 1, pix_bytes, f); std::fclose(f); }
+        } else {
+          std::fprintf(stderr, "[dump] this input path has no host float batch "
+                               "(non-float upload); %s.host.bin skipped\n", prefix);
+        }
       }
     }
   }
