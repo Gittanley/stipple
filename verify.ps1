@@ -231,6 +231,19 @@ function Skip-ByDefault([string]$Name, [string]$Why) {
 $ErrorActionPreference = "Continue"
 $env:MAGICK_HOME = if ($env:MAGICK_HOME) { $env:MAGICK_HOME } else { "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI" }
 
+# TEMP is a Windows convention and is simply NOT SET on Linux, where the
+# convention is TMPDIR (often unset too).  Every probe below builds its scratch
+# directory with Join-Path $env:TEMP ..., and a null first argument makes
+# Join-Path fail AT EVERY USE: the video probe then ran rdither with a null
+# output path, rdither printed its usage text, and four checks "failed" for a
+# defect that was one missing environment variable.  Setting it here, once,
+# fixes every probe child (they inherit the process environment) without
+# touching any probe file; probes still run standalone on Windows, where TEMP
+# exists and this line is a no-op that leaves those runs byte-identical.
+# GetTempPath is the cross-platform read: %TEMP% on Windows, $TMPDIR or /tmp
+# on Linux.
+if (-not $env:TEMP) { $env:TEMP = [IO.Path]::GetTempPath() }
+
 if (-not (Test-Path $Rdither)) { throw "rdither not found at $Rdither (run build.bat first)" }
 # Every probe below runs in a PowerShell 7 child (`& pwsh -NoProfile -File ...`).
 # Without pwsh on PATH each call raises CommandNotFoundException, which is
@@ -377,9 +390,16 @@ foreach ($img in $images) {
       $rc = $LASTEXITCODE
       $internal = ($rc -eq 0) -and ($text -match "BIT-EXACT")
       # Independent confirmation through the ImageMagick CLI.  `compare -metric`
-      # prints to stderr, so it is funnelled through cmd to keep the number
-      # clean instead of wrapped in a PowerShell ErrorRecord.
-      $aeText = (& cmd /c "`"$Magick`" compare -metric AE `"$out`" `"$ref`" null: 2>&1" | Out-String).Trim()
+      # prints the number to stderr, and the verdict wants one clean token.  This
+      # used to funnel through `cmd /c "... 2>&1"`, where the WINDOWS shell did
+      # the stream merge; on Linux there is no cmd, every call errored, $ae came
+      # out empty, and all image cases failed with an empty compare_AE while the
+      # rdither-side compare itself said BIT-EXACT.  PowerShell merges native
+      # stderr itself: 2>&1 yields one ErrorRecord per stderr line, "$_" renders
+      # each to its message text, and the first whitespace-separated token of the
+      # result is the metric -- same string cmd used to produce, both platforms.
+      $aeText = ((& $Magick compare -metric AE "$out" "$ref" null: 2>&1 |
+                  ForEach-Object { "$_" }) | Out-String).Trim()
       $ae = ($aeText -split '\s+')[0]
       $ok = $internal -and ($ae -eq "0")
       if ($ok) { $pass++ } else {

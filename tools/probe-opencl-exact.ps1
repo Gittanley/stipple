@@ -73,17 +73,24 @@ if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Ou
 if (-not $FixtureDir) { $FixtureDir = Join-Path $env:TEMP 'rdocl_fixtures' }
 New-Item -ItemType Directory -Force -Path $FixtureDir | Out-Null
 
-& magick -size 64x48 xc:'#4080C0' "$FixtureDir\c_flat.png" 2>&1 | Out-Null
-& magick -size 64x48 gradient:black-white "$FixtureDir\c_ramp.png" 2>&1 | Out-Null
-& magick -size 96x64 plasma:fractal -seed 7 "$FixtureDir\c_plasma.png" 2>&1 | Out-Null
-& magick -size 96x64 xc:gray +noise Random "$FixtureDir\c_noise.png" 2>&1 | Out-Null
+# Paths below join with "/", not "\": on Linux a backslash is a literal filename
+# character, so "$FixtureDir\c_flat.png" writes a different file than the
+# Join-Path-based readers in the probes that consume these fixtures.  Forward
+# slashes work in Windows APIs and in ImageMagick, so one form is correct on both.
+& magick -size 64x48 xc:'#4080C0' "$FixtureDir/c_flat.png" 2>&1 | Out-Null
+& magick -size 64x48 gradient:black-white "$FixtureDir/c_ramp.png" 2>&1 | Out-Null
+& magick -size 96x64 plasma:fractal -seed 7 "$FixtureDir/c_plasma.png" 2>&1 | Out-Null
+& magick -size 96x64 xc:gray +noise Random "$FixtureDir/c_noise.png" 2>&1 | Out-Null
 # Uniform alpha: exercises the association without a discontinuity.
-& magick -size 96x64 gradient:red-blue "$FixtureDir\c_astuff.png" 2>&1 | Out-Null
-cmd /c "magick ""$FixtureDir\c_astuff.png"" -alpha set -channel A -evaluate set 50%% +channel ""$FixtureDir\c_alpha50.png""" 2>&1 | Out-Null
+& magick -size 96x64 gradient:red-blue "$FixtureDir/c_astuff.png" 2>&1 | Out-Null
+# These two used to funnel through `cmd /c "... 50%% ..."`, where the doubled
+# percent is CMD's escape and the wrapper merges stderr.  Run directly, magick
+# wants the single `%`, and `2>&1 | Out-Null` discards the stream the same way.
+& magick "$FixtureDir/c_astuff.png" -alpha set -channel A -evaluate set 50% +channel "$FixtureDir/c_alpha50.png" 2>&1 | Out-Null
 # Hard alpha edge on a transparent field: the worst case for the alpha error
 # queue, and it also trips the greyscale detection path (ImageMagick reduces this
 # to graya, so the tree is built with a different child count again).
-cmd /c "magick -size 96x64 xc:none -fill ""rgba(200,40,120,0.35)"" -draw ""circle 48,32 48,10"" ""$FixtureDir\c_ashape.png""" 2>&1 | Out-Null
+& magick -size 96x64 xc:none -fill "rgba(200,40,120,0.35)" -draw "circle 48,32 48,10" "$FixtureDir/c_ashape.png" 2>&1 | Out-Null
 
 # -FixturesOnly stops here, on purpose.
 #

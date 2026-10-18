@@ -5,8 +5,19 @@
 #include "rd_opencl.h"
 #include "rd_progress.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+// fork/exec/wait (sys/wait), pipes and /dev/null (fcntl), FD_CLOEXEC,
+// PATH search (unistd), signal handler install (csignal).
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // No CUDA API is called from this file -- rd_video.cpp asks CudaAvailable() whether
 // to request NVDEC and CudaAllocPinned() for staging, and both live in the .cu files,
@@ -36,6 +47,51 @@
 namespace rd {
 namespace {
 
+#ifndef _WIN32
+// Splits an ffmpeg argument string into argv the way CreateProcess's caller
+// built it: whitespace separates tokens outside double quotes, quotes group
+// (and are consumed, as on Windows -- `"a b"cd` is one token `a bcd`), and a
+// backslash before a quote escapes that quote.  NOT the full CommandLineToArgvW
+// backslash-counting rules: every string reaching here is produced by
+// VideoQuotePath plus fixed flags, so the only backslashes present are inside
+// unquoted tokens where they are literal.
+//
+// No shell is involved, deliberately.  The Windows path never had one, and a
+// `sh -c` here would reinterpret `$(...)` and backticks inside file names as
+// substitutions -- the command line treated them literally, and file names are
+// attacker-controlled in a way command lines are not.
+void SplitCommand(const std::string& s, std::vector<std::string>* out) {
+  std::string cur;
+  bool in_quotes = false;
+  bool started = false;  // a quoted empty string is still a token
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '\\' && i + 1 < s.size() && s[i + 1] == '"') {
+      cur += '"';
+      ++i;
+      started = true;
+      continue;
+    }
+    if (c == '"') {
+      in_quotes = !in_quotes;
+      started = true;
+      continue;
+    }
+    if ((c == ' ' || c == '\t') && !in_quotes) {
+      if (started) {
+        out->push_back(cur);
+        cur.clear();
+        started = false;
+      }
+      continue;
+    }
+    cur += c;
+    started = true;
+  }
+  if (started) out->push_back(cur);
+}
+#endif  // !_WIN32
+
 // ---------------------------------------------------------------------------
 // Child process with a redirected pipe.  ReadFile/WriteFile are used directly
 // rather than FILE* because the payload is binary and the CRT would mangle it.
@@ -59,6 +115,7 @@ class Child {
     if (std::getenv("RD_TRACE") != nullptr) {
       std::fprintf(stderr, "[spawn:%s] %s %s\n", role, exe.c_str(), args.c_str());
     }
+#ifdef _WIN32
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = nullptr;
@@ -149,6 +206,119 @@ class Child {
     }
     CloseHandle(nul);
     return true;
+#else
+    // pipe() has no inheritable-handle distinction: what SetHandleInformation
+    // did with HANDLE_FLAG_INHERIT on the parent's ends -- stop a later
+    // CreateProcess from inheriting them, which is what lets THIS parent ever
+    // see EOF -- is done with FD_CLOEXEC here, for the same reason and with
+    // the same consequence: a parent end leaked into a later exec means the
+    // pipe never reports EOF and Read() blocks forever.
+    int stdout_pipe[2] = {-1, -1};  // child writes [1]; parent reads [0]
+    int stdin_pipe[2] = {-1, -1};   // child reads [0]; parent writes [1]
+    if (capture_stdout && ::pipe(stdout_pipe) != 0) {
+      *error = "pipe failed (stdout capture)";
+      return false;
+    }
+    if (feed_stdin && ::pipe(stdin_pipe) != 0) {
+      if (capture_stdout) {
+        (void)::close(stdout_pipe[0]);
+        (void)::close(stdout_pipe[1]);
+      }
+      *error = "pipe failed (stdin feed)";
+      return false;
+    }
+    if (capture_stdout) (void)::fcntl(stdout_pipe[0], F_SETFD, FD_CLOEXEC);
+    if (feed_stdin) (void)::fcntl(stdin_pipe[1], F_SETFD, FD_CLOEXEC);
+    // The 16 MiB handoff window from the comment above, best effort: an
+    // unprivileged process is capped at /proc/sys/fs/pipe-max-size (1 MiB by
+    // default) and the write ends are the ones that get sized here, so a
+    // refusal leaves the kernel default capacity -- more wakeups, same bytes.
+    // Ignored rather than reported: it changes throughput, never correctness.
+    if (capture_stdout) (void)::fcntl(stdout_pipe[1], F_SETPIPE_SZ, 16 << 20);
+    if (feed_stdin) (void)::fcntl(stdin_pipe[0], F_SETPIPE_SZ, 16 << 20);
+
+    // The NUL counterpart: whichever direction we do not drive, plus stderr
+    // always.  ffmpeg's diagnostics went to NUL on Windows; if they landed on
+    // our stderr here instead, every log-scraping check would be reading lines
+    // the other platform never produces.
+    const int nulfd = ::open("/dev/null", O_RDWR);
+    if (nulfd < 0) {
+      if (capture_stdout) {
+        (void)::close(stdout_pipe[0]);
+        (void)::close(stdout_pipe[1]);
+      }
+      if (feed_stdin) {
+        (void)::close(stdin_pipe[0]);
+        (void)::close(stdin_pipe[1]);
+      }
+      *error = "cannot open /dev/null";
+      return false;
+    }
+
+    // argv for execv, from SplitCommand above.  Built BEFORE fork: in the
+    // child it would mean mutating shared heap state mid-call, and this keeps
+    // the child branch to dup2/close/execv/_exit.
+    std::vector<std::string> tokens;
+    SplitCommand(args, &tokens);
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>(exe.c_str()));
+    for (std::string& t : tokens) argv.push_back(t.data());
+    argv.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+      (void)::close(nulfd);
+      if (capture_stdout) {
+        (void)::close(stdout_pipe[0]);
+        (void)::close(stdout_pipe[1]);
+      }
+      if (feed_stdin) {
+        (void)::close(stdin_pipe[0]);
+        (void)::close(stdin_pipe[1]);
+      }
+      *error = "fork failed for " + exe;
+      return false;
+    }
+    if (pid == 0) {
+      // Child.  _exit, never exit(3): exit would run the atexit handlers this
+      // process registered (ImageMagick terminus, static destructors) against
+      // a forked copy of their state, while the parent still uses it.
+      const int in_fd = feed_stdin ? stdin_pipe[0] : nulfd;
+      const int out_fd = capture_stdout ? stdout_pipe[1] : nulfd;
+      if (::dup2(in_fd, STDIN_FILENO) < 0 || ::dup2(out_fd, STDOUT_FILENO) < 0 ||
+          ::dup2(nulfd, STDERR_FILENO) < 0) {
+        _exit(127);
+      }
+      // Close every original end -- the dup'd sources among them.  None of
+      // these fds may survive into ffmpeg: a surviving pipe end on either
+      // side is exactly the inherited-handle leak SetHandleInformation
+      // existed to prevent on Windows.  0/1/2 are the fresh duplicates now.
+      if (capture_stdout) {
+        (void)::close(stdout_pipe[0]);
+        (void)::close(stdout_pipe[1]);
+      }
+      if (feed_stdin) {
+        (void)::close(stdin_pipe[0]);
+        (void)::close(stdin_pipe[1]);
+      }
+      (void)::close(nulfd);
+      ::execv(exe.c_str(), argv.data());
+      _exit(127);  // exec failed; Wait() reports 127, the shell convention
+    }
+    // Parent: keep only our ends.  Dropping the child's end is what makes EOF
+    // reachable; dropping nulfd keeps the count straight.
+    (void)::close(nulfd);
+    if (capture_stdout) {
+      (void)::close(stdout_pipe[1]);
+      read_fd_ = stdout_pipe[0];
+    }
+    if (feed_stdin) {
+      (void)::close(stdin_pipe[0]);
+      write_fd_ = stdin_pipe[1];
+    }
+    pid_ = pid;
+    return true;
+#endif
   }
 
   // Reads exactly `bytes` unless the stream ends.  Returns bytes read.
@@ -156,6 +326,7 @@ class Child {
     std::size_t done = 0;
     auto* out = static_cast<char*>(dst);
     while (done < bytes) {
+#ifdef _WIN32
       DWORD got = 0;
       const DWORD want = static_cast<DWORD>(
           (bytes - done) > 0x1000000u ? 0x1000000u : (bytes - done));
@@ -168,6 +339,28 @@ class Child {
       }
       if (got == 0) break;  // EOF
       done += got;
+#else
+      const std::size_t want =
+          (bytes - done) > 0x1000000u ? 0x1000000u : (bytes - done);
+      const ssize_t got = ::read(read_fd_, out + done, want);
+      if (got < 0) {
+        if (errno == EINTR) {
+          // The signal handler only set a flag; the pipeline polls that flag
+          // at its own checkpoints.  Resuming the read is therefore the
+          // correct reaction here -- letting EINTR escape would unwind this
+          // as a pipe ERROR, and an interrupt has to take the clean-shutdown
+          // path instead.
+          continue;
+        }
+        if (getenv("RD_TRACE") != nullptr) {
+          std::fprintf(stderr, "[video] read failed after %zu bytes, err=%s\n",
+                       done, std::strerror(errno));
+        }
+        break;
+      }
+      if (got == 0) break;  // EOF
+      done += static_cast<std::size_t>(got);
+#endif
     }
     return done;
   }
@@ -176,30 +369,78 @@ class Child {
     std::size_t done = 0;
     const auto* in = static_cast<const char*>(src);
     while (done < bytes) {
+#ifdef _WIN32
       DWORD put = 0;
       const DWORD want = static_cast<DWORD>(
           (bytes - done) > 0x1000000u ? 0x1000000u : (bytes - done));
       if (!WriteFile(write_handle_, in + done, want, &put, nullptr)) return false;
       if (put == 0) return false;
       done += put;
+#else
+      const std::size_t want =
+          (bytes - done) > 0x1000000u ? 0x1000000u : (bytes - done);
+      const ssize_t put = ::write(write_fd_, in + done, want);
+      if (put < 0) {
+        if (errno == EINTR) continue;  // same rationale as Read
+        return false;
+      }
+      if (put == 0) return false;
+      done += static_cast<std::size_t>(put);
+#endif
     }
     return true;
   }
 
   void CloseStdin() {
+#ifdef _WIN32
     if (write_handle_ != INVALID_HANDLE_VALUE) {
       CloseHandle(write_handle_);
       write_handle_ = INVALID_HANDLE_VALUE;
     }
+#else
+    if (write_fd_ >= 0) {
+      (void)::close(write_fd_);
+      write_fd_ = -1;
+    }
+#endif
   }
 
   // Waits for exit; returns the exit code (or -1).
   int Wait(unsigned timeout_ms = 120000) {
+#ifdef _WIN32
     if (process_ == INVALID_HANDLE_VALUE) return -1;
     if (WaitForSingleObject(process_, timeout_ms) != WAIT_OBJECT_0) return -1;
     DWORD code = 0;
     if (!GetExitCodeProcess(process_, &code)) return -1;
     return static_cast<int>(code);
+#else
+    if (pid_ <= 0) return -1;
+    // A second Wait after a reap returns the cached code -- WaitForSingleObject
+    // on an already-signalled handle did the same on Windows instead of
+    // re-failing, and callers do wait-then-check-exit-code.
+    if (reaped_) return exit_code_;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+      int status = 0;
+      const pid_t r = ::waitpid(pid_, &status, WNOHANG);
+      if (r == pid_) {
+        reaped_ = true;
+        exit_code_ = WIFEXITED(status)
+                         ? WEXITSTATUS(status)
+                         : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        return exit_code_;
+      }
+      if (r < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return -1;
+      // waitpid has no timed wait; 10 ms polls are the standard substitute and
+      // are invisible next to an ffmpeg encode.
+      ::usleep(10000);
+    }
+#endif
   }
 
   // Terminates the child if it is still running, then releases the handles.
@@ -210,6 +451,7 @@ class Child {
   // that has already exited and been waited on is left alone, so the normal path
   // still gets ffmpeg's real exit code and its chance to finalise the container.
   void Close() {
+#ifdef _WIN32
     if (process_ != nullptr) {
       if (WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) {
         TerminateProcess(process_, 1);
@@ -226,13 +468,43 @@ class Child {
     if (read_handle_ != INVALID_HANDLE_VALUE) CloseHandle(read_handle_);
     write_handle_ = INVALID_HANDLE_VALUE;
     read_handle_ = INVALID_HANDLE_VALUE;
+#else
+    if (pid_ > 0) {
+      if (!reaped_) {
+        int status = 0;
+        const pid_t r = ::waitpid(pid_, &status, WNOHANG);
+        if (r == 0) {
+          // Still running: SIGKILL is the TerminateProcess above, for the same
+          // reason the comment there gives -- a destructor must not orphan
+          // ffmpeg still holding the output file.  An exited-but-never-waited
+          // child is simply reaped here, no signal involved.
+          (void)::kill(pid_, SIGKILL);
+          (void)::waitpid(pid_, &status, 0);
+        }
+        reaped_ = true;
+      }
+      pid_ = -1;
+    }
+    if (write_fd_ >= 0) (void)::close(write_fd_);
+    if (read_fd_ >= 0) (void)::close(read_fd_);
+    write_fd_ = -1;
+    read_fd_ = -1;
+#endif
   }
 
  private:
+#ifdef _WIN32
   HANDLE process_ = nullptr;
   HANDLE thread_handle_ = nullptr;
   HANDLE read_handle_ = INVALID_HANDLE_VALUE;
   HANDLE write_handle_ = INVALID_HANDLE_VALUE;
+#else
+  pid_t pid_ = -1;
+  int read_fd_ = -1;
+  int write_fd_ = -1;
+  bool reaped_ = false;
+  int exit_code_ = -1;
+#endif
 };
 
 double NowMs() {
@@ -242,11 +514,51 @@ double NowMs() {
 }
 
 bool ToolOnPath(const char* name, std::string* full) {
+#ifdef _WIN32
   char buf[MAX_PATH + 1] = {0};
   const DWORD n = SearchPathA(nullptr, name, ".exe", MAX_PATH, buf, nullptr);
   if (n == 0 || n > MAX_PATH) return false;
   *full = buf;
   return true;
+#else
+  // SearchPathA's counterpart, same semantics: first executable match on
+  // $PATH wins, and the ".exe" suffix SearchPathA appended does not exist
+  // here -- callers pass bare tool names ("ffmpeg", "ffprobe"), so nothing
+  // is suffixed.  A name carrying its own '/' is a path already and is
+  // checked as given (SearchPathA did the same: no directory component
+  // means PATH search, otherwise use it directly).
+  const std::string n = name;
+  if (n.find('/') != std::string::npos) {
+    if (::access(n.c_str(), X_OK) == 0) {
+      *full = n;
+      return true;
+    }
+    return false;
+  }
+  const char* env = std::getenv("PATH");
+  if (env == nullptr || env[0] == '\0') return false;
+  const std::string p = env;
+  std::size_t start = 0;
+  for (;;) {
+    const std::size_t end = p.find(':', start);
+    const std::string dir =
+        p.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    // An empty entry (leading ':', "::", trailing ':') means the current
+    // directory by POSIX rules.  Skipped deliberately: running ./whatever the
+    // cwd happens to contain is not a search this program asked for, and the
+    // Windows SearchPathA had no cwd-without-path-item behaviour to match.
+    if (!dir.empty()) {
+      const std::string cand = dir + "/" + n;
+      if (::access(cand.c_str(), X_OK) == 0) {
+        *full = cand;
+        return true;
+      }
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return false;
+#endif
 }
 
 // rgba64le (or rgb48le) bytes -> RgbaF, with an optional box filter when stride > 1.
@@ -680,6 +992,7 @@ const std::string& HostDitherError() {
   return g_host_dither_error;
 }
 
+#ifdef _WIN32
 extern "C" BOOL WINAPI ConsoleHandler(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
       type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
@@ -689,6 +1002,16 @@ extern "C" BOOL WINAPI ConsoleHandler(DWORD type) {
   }
   return FALSE;
 }
+#else
+// The sigaction counterpart: same contract as ConsoleHandler above, same body.
+// The three signals map to what the Windows branch covered -- SIGINT is Ctrl-C,
+// SIGTERM is the kill an operator sends a long render, SIGHUP is the terminal
+// hanging up.  Console-close, logoff and shutdown have no POSIX reading on this
+// path (no console object to close, no session in a container).
+extern "C" void PosixSignalHandler(int /*signo*/) {
+  g_interrupted.store(true);
+}
+#endif
 
 // Registration is idempotent: the handler now installs BEFORE the palette phase
 // as well as at the pre-existing sites, and two registrations would outlive a
@@ -698,13 +1021,36 @@ static bool g_handler_installed = false;
 
 void InstallInterruptHandler() {
   if (g_handler_installed) return;
+#ifdef _WIN32
   SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+#else
+  struct sigaction sa {};
+  sa.sa_handler = PosixSignalHandler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;  // no SA_RESTART: see the EINTR rationale in Child::Read
+  (void)::sigaction(SIGINT, &sa, nullptr);
+  (void)::sigaction(SIGTERM, &sa, nullptr);
+  (void)::sigaction(SIGHUP, &sa, nullptr);
+#endif
   g_handler_installed = true;
 }
 
 void RemoveInterruptHandler() {
   if (!g_handler_installed) return;
+#ifdef _WIN32
   SetConsoleCtrlHandler(ConsoleHandler, FALSE);
+#else
+  // Back to default, not to "ignored": after removal a second Ctrl-C must kill
+  // the process the way it would any program, exactly as falling through to the
+  // default handler did on Windows.
+  struct sigaction sa {};
+  sa.sa_handler = SIG_DFL;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  (void)::sigaction(SIGINT, &sa, nullptr);
+  (void)::sigaction(SIGTERM, &sa, nullptr);
+  (void)::sigaction(SIGHUP, &sa, nullptr);
+#endif
   g_handler_installed = false;
 }
 
@@ -1775,7 +2121,7 @@ bool VideoBuildPalette(const std::string& path, const VideoOptions& opt,
                  "[video] palette: 'all' reduced to %lld sampled frame(s) "
                  "(limits: --palette-max-samples %d, montage area %lld Mpixel)\n",
                  static_cast<long long>(want), opt.palette_max_samples,
-                 kMaxMontagePixels >> 20);
+                 static_cast<long long>(kMaxMontagePixels >> 20));
   }
   if (want > 256) {
     // Progress, not a warning.  At ~0.12 s per sample six at a time, several hundred
@@ -2582,17 +2928,39 @@ class Pipeline {
                    fraction);
       fraction = 1.0;
     }
+#ifdef _WIN32
     MEMORYSTATUSEX status;
     status.dwLength = sizeof(status);
+    const bool have_mem = GlobalMemoryStatusEx(&status) != FALSE;
+    const unsigned long long total_phys = status.ullTotalPhys;
+    const unsigned long long avail_phys = status.ullAvailPhys;
+#else
+    // The sysconf figures GlobalMemoryStatusEx supplies on Windows: total and
+    // available physical RAM, both -1 on error (which have_mem then reports as
+    // false, taking the 2 GiB fallback below the same way a failed
+    // GlobalMemoryStatusEx does).
+    const long pages = ::sysconf(_SC_PHYS_PAGES);
+    const long avail_pages = ::sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = ::sysconf(_SC_PAGE_SIZE);
+    const bool have_mem = pages > 0 && avail_pages >= 0 && page_size > 0;
+    const unsigned long long total_phys =
+        have_mem ? static_cast<unsigned long long>(pages) *
+                       static_cast<unsigned long long>(page_size)
+                 : 0ull;
+    const unsigned long long avail_phys =
+        have_mem ? static_cast<unsigned long long>(avail_pages) *
+                       static_cast<unsigned long long>(page_size)
+                 : 0ull;
+#endif
     std::size_t budget = 0;
     std::size_t avail = 0;
     constexpr std::size_t kDecoderHeadroom = 768ull << 20;
     constexpr std::size_t kKeepFree = 1536ull << 20;
     const std::size_t reserve = kDecoderHeadroom;
-    if (GlobalMemoryStatusEx(&status)) {
+    if (have_mem) {
       const std::size_t share = static_cast<std::size_t>(
-          static_cast<double>(status.ullTotalPhys) * fraction);
-      avail = static_cast<std::size_t>(status.ullAvailPhys);
+          static_cast<double>(total_phys) * fraction);
+      avail = static_cast<std::size_t>(avail_phys);
       budget = share < avail ? share : avail;
       // Never aim to leave less than kKeepFree for the OS.  A queue that fills all
       // of RAM is what turns a slow render into a crashed machine.
@@ -2724,7 +3092,8 @@ bool VideoProcess(const std::string& in, const std::string& out,
   // Both tools, once.  The second VideoFindTools further down used to ask for ffprobe
   // only, having already been handed ffmpeg -- two walks of the same PATH search for
   // two answers from the same two environment variables.  It is one lookup now, and it
-  // is a PATH search either way: ToolOnPath is SearchPathA, so this saves no process
+  // is a PATH search either way: ToolOnPath searches $PATH on every platform,
+  // so this saves no process
   // spawns.  The spawns it looked like it saved are item 3's, below.
   std::string ffmpeg;
   std::string ffprobe;

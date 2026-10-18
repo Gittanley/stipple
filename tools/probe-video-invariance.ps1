@@ -488,7 +488,12 @@ if (-not $magick) {
           # much slack is not a guard.  The envelope above is what makes 1.0 defensible, and
           # it took six colour counts and five block lengths to earn it; one run does not.
           $CeilingPct = 1.0
-          $aeText = (& cmd /c "`"$magick`" compare -metric AE `"$gotPng`" `"$refPng`" null: 2>&1" | Out-String).Trim()
+          # `compare -metric` prints its number to stderr.  2>&1 merges it into the
+          # pipeline and "$_" renders each record to its message text -- the same
+          # clean string the old `cmd /c "... 2>&1"` produced, without cmd, which
+          # does not exist on Linux (every case here failed with an empty AE).
+          $aeText = ((& $magick compare -metric AE "$gotPng" "$refPng" null: 2>&1 |
+                      ForEach-Object { "$_" }) | Out-String).Trim()
           # This ImageMagick reports a NORMALISED metric -- "229.48 (0.00398402)" -- not a
           # bare integer.  The count is the first token and the fraction is the second; a
           # check written against the integer form alone reads the fraction and passes

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // rd_cli.cpp -- rdither, the Phase 1 command line front end.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -9,8 +10,16 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <windows.h>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+// realpath(3) needs PATH_MAX; stdlib.h (via <cstdlib> above) already declares
+// realpath itself.
+#include <climits>
+#endif
 
 #include "rd_checkpoint.h"
 #include "rd_im.h"
@@ -402,6 +411,18 @@ void PrintVideoSummary(const rd::VideoResult& result, bool quiet) {
   }
 }
 
+// Deletes a file and drops the result: every call site in this file treats an
+// undeletable file as clutter rather than failure (the comment at each one says
+// so), and this keeps that contract identical on both platforms -- DeleteFileA
+// exactly where it was before, remove(3) where there was no such call.
+static void DeleteIfPresent(const char* path) {
+#ifdef _WIN32
+  (void)DeleteFileA(path);
+#else
+  (void)std::remove(path);
+#endif
+}
+
 // Concatenates the recorded segments into the requested output.  Every segment
 // came from the same encoder settings, so the concat demuxer can stream copy
 // without re-encoding -- no quality loss and no extra time.
@@ -439,10 +460,21 @@ bool JoinSegments(const std::string& out_path, const rd::Checkpoint& cp,
       // Absolute paths, because the concat demuxer resolves entries relative to
       // the *list file's* directory.  A relative entry would become
       // "outdir/outdir/segment.mkv" and fail to open.
+#ifdef _WIN32
       char full[MAX_PATH * 4];
       const DWORD n = GetFullPathNameA(s.path.c_str(), sizeof(full), full, nullptr);
       const std::string p = (n > 0 && n < sizeof(full)) ? std::string(full, n)
                                                         : s.path;
+#else
+      // realpath(3) resolves to the same absolute path GetFullPathNameA did,
+      // with one extra condition: the file must exist.  That holds here and
+      // only here -- these are segments just written by the encoder -- and the
+      // fallback below (use the path as given) is the same fallback the
+      // Windows branch takes when the buffer is too small.
+      char full[PATH_MAX];
+      const char* rp = ::realpath(s.path.c_str(), full);
+      const std::string p = rp != nullptr ? std::string(rp) : s.path;
+#endif
       // concat demuxer quoting: single quotes, with embedded quotes doubled.
       std::string esc;
       for (char ch : p) {
@@ -457,7 +489,7 @@ bool JoinSegments(const std::string& out_path, const rd::Checkpoint& cp,
                            rd::VideoQuotePath(out_path);
   int code = -1;
   const bool joined = rd::VideoRunTool(ffmpeg, args, 900000, &code, error);
-  (void)DeleteFileA(list.c_str());
+  DeleteIfPresent(list.c_str());
   if (!joined) return false;
   if (rd::FileSize(out_path) == 0) {
     *error = "the joined output is empty";
@@ -473,7 +505,7 @@ bool JoinSegments(const std::string& out_path, const rd::Checkpoint& cp,
   // so a crash in between finds recorded segments missing, redoes them, and never
   // the reverse, which would orphan the parts with nothing left to name them.
   for (const rd::SegmentRecord& s : cp.segments) {
-    (void)DeleteFileA(s.path.c_str());
+    DeleteIfPresent(s.path.c_str());
   }
   return true;
 }
@@ -890,7 +922,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
       std::fprintf(stderr, "resume     : starting fresh (%s)\n", why.c_str());
     }
   } else {
-    (void)DeleteFileA(ckpt_path.c_str());
+    DeleteIfPresent(ckpt_path.c_str());
   }
 
   const std::int64_t seg_frames = opt.segment_frames;
@@ -945,7 +977,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
     const std::string seg_path = rd::SegmentPathFor(out_path, seg);
     // Discard any partial file from a previous attempt: its presence would be
     // mistaken for progress by a careless resume, and it is being rewritten.
-    (void)DeleteFileA(seg_path.c_str());
+    DeleteIfPresent(seg_path.c_str());
 
     opt.start_frame = first;
     opt.frames_in_segment = want;
@@ -1045,7 +1077,7 @@ int RunVideo(const std::string& in_path, const std::string& out_path,
                  "resume, or join them by hand.\n");
     return 1;
   }
-  (void)DeleteFileA(ckpt_path.c_str());
+  DeleteIfPresent(ckpt_path.c_str());
   if (!opt.quiet) {
     std::printf("output     : %s (%zu segment(s) joined)\n", out_path.c_str(),
                 cp.segments.size());

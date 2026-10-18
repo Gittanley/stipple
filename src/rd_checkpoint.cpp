@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "rd_checkpoint.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +37,7 @@ std::string DirName(const std::string& path) {
 // a failure here is not fatal, because MOVEFILE_WRITE_THROUGH has already put the
 // rename on stable storage.
 void FlushDirectory(const std::string& dir) {
+#ifdef _WIN32
   HANDLE h = CreateFileA(dir.c_str(), GENERIC_READ,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                          nullptr, OPEN_EXISTING,
@@ -39,6 +46,17 @@ void FlushDirectory(const std::string& dir) {
   if (h == INVALID_HANDLE_VALUE) return;
   (void)FlushFileBuffers(h);
   (void)CloseHandle(h);
+#else
+  // fsync on a directory fd flushes the directory's own entries (the rename in
+  // step 3), which is the same thing FlushFileBuffers on the directory handle
+  // did there.  A filesystem that refuses it (some network and FUSE mounts) is
+  // reported the same way a failed open is on Windows: not fatal, because the
+  // rename itself has already completed.
+  const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return;
+  (void)::fsync(fd);
+  (void)::close(fd);
+#endif
 }
 
 }  // namespace
@@ -47,12 +65,23 @@ void FileIdentity(const std::string& path, std::uint64_t* bytes,
                   std::int64_t* mtime) {
   *bytes = 0;
   *mtime = 0;
+#ifdef _WIN32
   WIN32_FILE_ATTRIBUTE_DATA data{};
   if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return;
   *bytes = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) |
            data.nFileSizeLow;
   *mtime = (static_cast<std::int64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
            data.ftLastWriteTime.dwLowDateTime;
+#else
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return;
+  *bytes = static_cast<std::uint64_t>(st.st_size);
+  // Seconds since the epoch, where the Windows branch hands out 100ns ticks
+  // since 1601.  The value only ever compares against another FileIdentity()
+  // reading from the same platform -- a checkpoint records it and a later run
+  // re-reads it -- so the unit difference never crosses a comparison.
+  *mtime = static_cast<std::int64_t>(st.st_mtime);
+#endif
 }
 
 std::uint64_t FileSize(const std::string& path) {
@@ -84,13 +113,14 @@ bool CheckpointSave(const std::string& path, const Checkpoint& cp,
     }
 
     // 1. write the whole record to a temp file
+    const std::string text = out.str();
+#ifdef _WIN32
     HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
       *error = "cannot create " + tmp;
       return false;
     }
-    const std::string text = out.str();
     DWORD written = 0;
     const BOOL ok = WriteFile(h, text.data(),
                               static_cast<DWORD>(text.size()), &written, nullptr);
@@ -110,6 +140,32 @@ bool CheckpointSave(const std::string& path, const Checkpoint& cp,
     (void)DeleteFileA(tmp.c_str());
     return false;
   }
+#else
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+      *error = "cannot create " + tmp;
+      return false;
+    }
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    // 2. push the FILE DATA to stable storage before it is allowed to be the
+    // real record.  fflush alone only hands the bytes to the kernel.
+    const bool flushed = std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+    (void)std::fclose(f);
+    if (!ok || !flushed) {
+      *error = "short or unflushed write to " + tmp;
+      (void)std::remove(tmp.c_str());
+      return false;
+    }
+  }
+  // 3. atomic replace on the same filesystem.  rename(2) does not itself wait
+  // for stable storage the way MOVEFILE_WRITE_THROUGH did; step 4's directory
+  // fsync plus the file fsync above are what supply that here.
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    *error = "cannot move " + tmp + " into place";
+    (void)std::remove(tmp.c_str());
+    return false;
+  }
+#endif
   // 4. and make the directory entry itself durable
   FlushDirectory(DirName(path));
   return true;

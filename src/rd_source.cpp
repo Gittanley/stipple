@@ -2,10 +2,16 @@
 // rd_source.cpp -- RAM-first allocation with a memory-mapped disk fallback.
 #include "rd_source.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -25,16 +31,30 @@ namespace {
 // returns in Create that construct no PixelStore: there ~SpillFile is the only
 // destructor that runs.
 struct SpillFile {
+#ifdef _WIN32
   HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+  int fd = -1;
+#endif
   std::string path;
 
   ~SpillFile() {
+#ifdef _WIN32
     if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
     if (!path.empty()) ::DeleteFileA(path.c_str());
+#else
+    // The name was already unlinked in MakeSpillFile, so closing this fd is
+    // the whole of the cleanup that is left; the unlink stays to mirror the
+    // Windows branch's redundant DeleteFileA for the failure returns that
+    // construct no PixelStore (it reports nothing, same as there).
+    if (fd >= 0) (void)::close(fd);
+    if (!path.empty()) (void)::unlink(path.c_str());
+#endif
   }
 };
 
 bool MakeSpillFile(SpillFile* out, std::string* error) {
+#ifdef _WIN32
   char temp_dir[MAX_PATH + 1] = {0};
   DWORD n = ::GetTempPathA(MAX_PATH, temp_dir);
   // MAX_PATH bounds the BUFFER, not the prefix.  GetTempPathA returns the length
@@ -65,6 +85,28 @@ bool MakeSpillFile(SpillFile* out, std::string* error) {
     *error = "CreateFile failed for spill file";
     return false;
   }
+#else
+  // mkstemp creates and opens in one step, and the unlink right after makes
+  // the Windows FILE_FLAG_DELETE_ON_CLOSE guarantee stronger rather than
+  // weaker: the name never exists long enough for another process to open,
+  // while the bytes live as long as this fd -- and then, after the fd closes,
+  // as long as any mmap still held, which is the property PixelStore::Create
+  // leans on when this destructor runs at the end of that function.
+  const char* tmpdir = std::getenv("TMPDIR");
+  if (tmpdir == nullptr || tmpdir[0] == '\0') tmpdir = "/tmp";
+  std::string tmpl = std::string(tmpdir) + "/rdxXXXXXX";
+  // std::string is contiguous and NUL-terminated (C++17), so &tmpl[0] is a
+  // mutable buffer of size()+1 that mkstemp can rewrite in place: six X's
+  // replaced, the existing NUL at the end never moved.
+  const int fd = ::mkstemp(&tmpl[0]);
+  if (fd < 0) {
+    *error = "mkstemp failed for spill file";
+    return false;
+  }
+  out->path = tmpl;
+  (void)::unlink(tmpl.c_str());
+  out->fd = fd;
+#endif
   return true;
 }
 
@@ -98,8 +140,17 @@ PixelStore* PixelStore::Create(std::size_t width, std::size_t height,
       store->pinned_ = true;
       return store;
     }
+#ifdef _WIN32
     void* mem = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
                                PAGE_READWRITE);
+#else
+    // The heap counterpart of VirtualAlloc for this branch: the size was just
+    // checked against max_ram_bytes, so this is ordinary allocation, and glibc
+    // returns memory aligned to at least 16 bytes -- what RgbaF (16 B) needs.
+    // nullptr falls through to the disk path, exactly as VirtualAlloc failing
+    // did; the dtor's non-mapped, non-pinned branch frees it below.
+    void* mem = std::malloc(bytes);
+#endif
     if (mem != nullptr) {
       store->data_ = static_cast<RgbaF*>(mem);
       return store;
@@ -113,6 +164,7 @@ PixelStore* PixelStore::Create(std::size_t width, std::size_t height,
     delete store;
     return nullptr;
   }
+#ifdef _WIN32
   // Extend the file to the full mapping size.
   LARGE_INTEGER file_size;
   file_size.QuadPart = static_cast<LONGLONG>(bytes);
@@ -142,17 +194,58 @@ PixelStore* PixelStore::Create(std::size_t width, std::size_t height,
   store->mapping_size_ = bytes;
   store->spill_path_ = spill.path;
   return store;
+#else
+  // ftruncate is the SetFilePointerEx+SetEndOfFile pair; MAP_SHARED is
+  // CreateFileMapping+MapViewOfFile.  There is no separate mapping object to
+  // hold on POSIX -- the mapping is `view` itself -- which is why mapping_
+  // stays nullptr here: nothing will CloseHandle it, and ~PixelStore munmaps
+  // using data_ and mapping_size_ alone.
+  if (::ftruncate(spill.fd, static_cast<off_t>(bytes)) != 0) {
+    *error = "could not size the spill file";
+    delete store;
+    return nullptr;
+  }
+  void* view = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                      spill.fd, 0);
+  if (view == MAP_FAILED) {
+    *error = "mmap failed for spill file";
+    delete store;
+    return nullptr;
+  }
+  // The mapping outlives this scope's fd on purpose: ~SpillFile closes the fd
+  // at the end of this function and the pages remain valid -- mmap holds its
+  // own reference to the file.  Unlinked at creation, so there is no name left
+  // for anyone to unlink underneath it either.
+  store->data_ = static_cast<RgbaF*>(view);
+  store->mapped_ = true;
+  store->mapping_ = nullptr;
+  store->mapping_size_ = bytes;
+  store->spill_path_ = spill.path;
+  return store;
+#endif
 }
 
 PixelStore::~PixelStore() {
   if (data_ == nullptr) return;
   if (mapped_) {
+#ifdef _WIN32
     ::UnmapViewOfFile(data_);
     if (mapping_ != nullptr) ::CloseHandle(static_cast<HANDLE>(mapping_));
+#else
+    // No section handle exists on this platform (see Create): munmap through
+    // the recorded size is the complete release, and the spill fd was already
+    // closed by ~SpillFile back in Create.
+    (void)::munmap(data_, mapping_size_);
+#endif
   } else if (pinned_) {
     ::rd::CudaFreePinned(data_);
   } else {
+#ifdef _WIN32
     ::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+    // Matches the allocation branch: malloc on the RAM path.
+    std::free(data_);
+#endif
   }
 }
 

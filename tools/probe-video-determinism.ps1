@@ -147,7 +147,7 @@ function Get-DecodedHash([string]$mkv) {
 # consistently drops three frames would report a consistent number, and a report that
 # agrees with itself is not evidence.
 function Get-FrameCount([string]$mkv) {
-  $n = cmd /c "ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 ""$mkv""" 2>$null
+  $n = & ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$mkv" 2>$null
   if (-not $n) { return -1 }
   return [int]$n
 }

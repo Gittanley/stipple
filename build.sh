@@ -60,7 +60,16 @@
 set -u
 
 RD_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${RD_HERE}/build"
+# RD_BUILD_DIR: a second build tree on one checkout, relative to this file or
+# absolute.  The reason it exists: build/ on a Windows dev machine holds an
+# MSVC CMakeCache, a cache cannot be shared across generators, and the second
+# configure would fail on it -- so a box that builds BOTH ways needs distinct
+# trees.  CI and every single-platform machine just take the default.
+BUILD_DIR="${RD_BUILD_DIR:-${RD_HERE}/build}"
+case "$BUILD_DIR" in
+  /*) ;;
+  *)  BUILD_DIR="${RD_HERE}/${BUILD_DIR}" ;;
+esac
 
 WITH_CUDA=ON
 DO_CLEAN=0

@@ -2,8 +2,13 @@
 // rd_progress.cpp -- the implementation.  See rd_progress.h for the why.
 #include "rd_progress.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -40,10 +45,18 @@ bool StderrIsConsole() {
   if (force != nullptr && force[0] != '\0') {
     return force[0] == '1';
   }
+#ifdef _WIN32
   HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
   if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
   DWORD mode = 0;
   return GetConsoleMode(h, &mode) != FALSE;
+#else
+  // isatty makes the same distinction GetConsoleMode does here: a tty is a
+  // console, a file or a pipe is not.  The RD_PROGRESS_TTY override above is
+  // what makes the in-place branch testable on either platform; this branch is
+  // only the default answer.
+  return ::isatty(STDERR_FILENO) != 0;
+#endif
 }
 
 // Visible width, used to pad the erase.  dwSize.X is the *buffer* width, which
@@ -52,6 +65,7 @@ bool StderrIsConsole() {
 // still erases; the 400 cap is a paranoia guard against a bogus huge value
 // turning the pad into a megabyte of spaces.
 int ConsoleWidth() {
+#ifdef _WIN32
   HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
   CONSOLE_SCREEN_BUFFER_INFO csbi;
   if (h == nullptr || h == INVALID_HANDLE_VALUE) return 0;
@@ -60,6 +74,18 @@ int ConsoleWidth() {
   if (w < 40) return 40;
   if (w > 400) return 400;
   return w;
+#else
+  // TIOCGWINSZ reports the visible WINDOW (like srWindow), not a scrollback
+  // buffer: POSIX terminals have no buffer width concept.  Same clamps for the
+  // same reasons: a narrow terminal still erases, and a bogus huge value must
+  // not turn the pad into a megabyte of spaces.
+  struct winsize ws;
+  if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0) return 0;
+  const int w = static_cast<int>(ws.ws_col);
+  if (w < 40) return 40;
+  if (w > 400) return 400;
+  return w;
+#endif
 }
 
 // Live count of bars currently drawing in place.  Atomic because the

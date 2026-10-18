@@ -82,7 +82,7 @@ $engines = @('cpu', 'blocks', 'opencl')
 
 # Missing fixtures are "cannot test", which is not the same as "failed", and
 # reporting one as the other is how a broken test gets trusted.  Exit 2 says so.
-$missing = @($imgs | Where-Object { -not (Test-Path "$FixtureDir\$_.png") })
+$missing = @($imgs | Where-Object { -not (Test-Path "$FixtureDir/$_.png") })
 if ($missing.Count -gt 0) {
   ''
   # $FixtureDir, NOT $Dir.  This said $Dir, which is this run's own private output
@@ -96,13 +96,16 @@ if ($missing.Count -gt 0) {
   exit 2
 }
 
-# Decode to raw RGBA through cmd /c rather than the PowerShell pipeline.  A native
+# Decode to a raw RGBA FILE, not through the PowerShell pipeline.  A native
 # command's stdout piped through PowerShell is re-encoded, which turns the binary
-# into text and destroys the very thing being hashed.
+# into text and destroys the very thing being hashed -- so the pixels go to a
+# file and the pipeline carries nothing.  The `cmd /c` wrapper that used to launch
+# magick is gone with this port: it kept magick's stderr from becoming PowerShell
+# error records, and `2>$null` does that directly on either platform.
 function Get-PixelHash([string]$png) {
   $raw = [IO.Path]::ChangeExtension($png, '.raw')
   Remove-Item -EA SilentlyContinue $raw
-  cmd /c "magick ""$png"" -depth 8 ""rgba:$raw""" 2>$null | Out-Null
+  & magick "$png" -depth 8 "rgba:$raw" 2>$null | Out-Null
   if (-not (Test-Path $raw)) { return $null }
   $h = (Get-FileHash $raw -Algorithm SHA256).Hash
   Remove-Item -EA SilentlyContinue $raw
@@ -117,7 +120,7 @@ function Get-PixelHash([string]$png) {
 function Get-StrippedHash([string]$png) {
   $tmp = [IO.Path]::ChangeExtension($png, '.strip.png')
   Remove-Item -EA SilentlyContinue $tmp
-  cmd /c "magick ""$png"" -strip ""$tmp""" 2>$null | Out-Null
+  & magick "$png" -strip "$tmp" 2>$null | Out-Null
   if (-not (Test-Path $tmp)) { return $null }
   $h = (Get-FileHash $tmp -Algorithm SHA256).Hash
   Remove-Item -EA SilentlyContinue $tmp
@@ -140,7 +143,7 @@ function Get-StrippedHash([string]$png) {
 # deliberately counts as RUNNABLE -- a broken engine also produces no output, and a
 # looser rule would let a real defect hide behind a skip.
 . "$PSScriptRoot\rd-engine-probe.ps1"
-$avail = Get-RdEngineAvailability -Rdither $rd -Engines $engines -Fixture "$FixtureDir\$($imgs[0]).png"
+$avail = Get-RdEngineAvailability -Rdither $rd -Engines $engines -Fixture "$FixtureDir/$($imgs[0]).png"
 Write-RdEngineSkipReport -Availability $avail | Out-Null
 $skipEngines = @{}
 foreach ($k in $avail.Keys) { if ($avail[$k]) { $skipEngines[$k] = $avail[$k] } }
@@ -164,7 +167,7 @@ $skipped = 0
 ''
 
 foreach ($img in $imgs) {
-  $src = "$FixtureDir\$img.png"
+  $src = "$FixtureDir/$img.png"
   foreach ($eng in $engines) {
     if ($skipEngines.ContainsKey($eng)) {
       $skipped++
@@ -177,7 +180,7 @@ foreach ($img in $imgs) {
     $rawHashes = @{}
     $bad = 0
     for ($i = 1; $i -le $Runs; $i++) {
-      $out = "$Dir\det_${img}_${eng}_$i.png"
+      $out = "$Dir/det_${img}_${eng}_$i.png"
       # Delete first.  A run that fails leaves a stale file, and a stale file
       # hashes fine -- so a crashed engine would report as a stable engine, which
       # is the precise opposite of the truth.
@@ -237,9 +240,9 @@ foreach ($algo in $algos) {
   # $FixtureDir, not $Dir.  This is the algorithm block's INPUT, and it was the one
   # reference the $Dir -> $FixtureDir split missed.  It reported as eight algorithms
   # failing with "produced no output" when all eight are fine.
-  $src2 = "$FixtureDir\c_plasma.png"
+  $src2 = "$FixtureDir/c_plasma.png"
   for ($i = 1; $i -le $algoRuns; $i++) {
-    $o = "$Dir\algo_${algo}_$i.png"
+    $o = "$Dir/algo_${algo}_$i.png"
     Remove-Item -EA SilentlyContinue $o
     & $rd --dither $algo --colors 4 $src2 $o 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $o)) { $bad2++; continue }

@@ -217,7 +217,7 @@ if ($skipped -gt 0) {
 'Frame accounting with audio enabled (-shortest is the risk)'
 ''
 function Count-Frames([string]$f) {
-  $n = cmd /c "ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 ""$f""" 2>$null
+  $n = & ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f" 2>$null
   if (-not $n) { return -1 }
   return [int]$n
 }

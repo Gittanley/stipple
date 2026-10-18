@@ -81,32 +81,32 @@ try {
     # Small fixtures on purpose. This is a property of SEEKING, not of resolution, and
     # 320x180 keeps the whole check to a couple of seconds.
     & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=24' `
-        -frames:v 120 -pix_fmt yuv420p -c:v libx264 -g 24 "$w\c24.mp4" 2>&1 | Out-Null
+        -frames:v 120 -pix_fmt yuv420p -c:v libx264 -g 24 "$w/c24.mp4" 2>&1 | Out-Null
     & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=24' `
-        -frames:v 120 -pix_fmt yuv420p -c:v libx264 -g 60 "$w\g60.mp4" 2>&1 | Out-Null
+        -frames:v 120 -pix_fmt yuv420p -c:v libx264 -g 60 "$w/g60.mp4" 2>&1 | Out-Null
     & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=30000/1001' `
-        -frames:v 60 -pix_fmt yuv420p -c:v libx264 -g 15 "$w\c2997.mp4" 2>&1 | Out-Null
+        -frames:v 60 -pix_fmt yuv420p -c:v libx264 -g 15 "$w/c2997.mp4" 2>&1 | Out-Null
     foreach ($f in @('c24', 'g60', 'c2997')) {
-        if (-not (Test-Path "$w\$f.mp4")) { Write-Host "split decode: cannot run -- fixture $f failed"; exit 2 }
+        if (-not (Test-Path "$w/$f.mp4")) { Write-Host "split decode: cannot run -- fixture $f failed"; exit 2 }
     }
 
     $results = @()
-    $results += Test-Split 'CFR 24 fps, g=24' "$w\c24.mp4" 60 24 24
-    $results += Test-Split 'CFR 24 fps, g=60 (long GOP)' "$w\g60.mp4" 120 30 24
-    $results += Test-Split 'CFR 30000/1001 fps' "$w\c2997.mp4" 60 15 29.97
-    $results += Test-Split 'CFR, count not a multiple of chunk' "$w\c24.mp4" 50 20 24
+    $results += Test-Split 'CFR 24 fps, g=24' "$w/c24.mp4" 60 24 24
+    $results += Test-Split 'CFR 24 fps, g=60 (long GOP)' "$w/g60.mp4" 120 30 24
+    $results += Test-Split 'CFR 30000/1001 fps' "$w/c2997.mp4" 60 15 29.97
+    $results += Test-Split 'CFR, count not a multiple of chunk' "$w/c24.mp4" 50 20 24
 
     # VFR: two segments at different rates concatenated with -c copy, so durations genuinely
     # vary and frame_index/fps is not a timestamp.
     & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=30' `
-        -frames:v 30 -pix_fmt yuv420p -c:v libx264 -g 10 "$w\a.mp4" 2>&1 | Out-Null
+        -frames:v 30 -pix_fmt yuv420p -c:v libx264 -g 10 "$w/a.mp4" 2>&1 | Out-Null
     & ffmpeg -y -hide_banner -loglevel error -f lavfi -i 'testsrc=size=320x180:rate=8' `
-        -frames:v 16 -pix_fmt yuv420p -c:v libx264 -g 8 "$w\b.mp4" 2>&1 | Out-Null
-    if ((Test-Path "$w\a.mp4") -and (Test-Path "$w\b.mp4")) {
-        "file '$w\a.mp4'" | Set-Content "$w\list.txt" -Encoding utf8
-        "file '$w\b.mp4'" | Add-Content "$w\list.txt" -Encoding utf8
-        & ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i "$w\list.txt" -c copy "$w\vfr.mp4" 2>&1 | Out-Null
-        $results += Test-Split 'VFR (30fps then 8fps)' "$w\vfr.mp4" 46 15 30
+        -frames:v 16 -pix_fmt yuv420p -c:v libx264 -g 8 "$w/b.mp4" 2>&1 | Out-Null
+    if ((Test-Path "$w/a.mp4") -and (Test-Path "$w/b.mp4")) {
+        "file '$w\a.mp4'" | Set-Content "$w/list.txt" -Encoding utf8
+        "file '$w\b.mp4'" | Add-Content "$w/list.txt" -Encoding utf8
+        & ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i "$w/list.txt" -c copy "$w/vfr.mp4" 2>&1 | Out-Null
+        $results += Test-Split 'VFR (30fps then 8fps)' "$w/vfr.mp4" 46 15 30
     } else {
         $results += @{ Name = 'VFR (30fps then 8fps)'; Verdict = 'COULD-NOT-RUN'; Bad = 0 }
     }
