@@ -444,7 +444,7 @@ jobs:
   # runs-on: ubuntu-latest is a REAL Linux VM -- real kernel, real apt, real
   # compiler.  It is not emulation and not a cross-compile.
   #
-  # WHAT IS EXPECTED TO FAIL, and why this job reports it rather than hiding it.
+  # WHAT USED TO FAIL HERE, and why this job reports rather than hides it.
   #
   # THE BLOCKER HAS MOVED TWICE, and this comment tracked the first one for a commit
   # after it stopped being true.  Recording that, because the failure mode is the point:
@@ -456,31 +456,32 @@ jobs:
   #      for.  FIXED: the runner builds IM7 Q16-HDRI from source, and CMakeLists.txt
   #      has a `linux` flavour.  Configure now completes.
   #
-  #   2. THE CURRENT BLOCKER, and it is the source, not the build system: five files
-  #      include <windows.h> unconditionally -- rd_source.cpp, rd_checkpoint.cpp,
-  #      rd_progress.cpp, rd_cli.cpp, rd_video.cpp -- and the Windows API surface is
-  #      not merely headers.  CreateFileMapping wants mmap, GetConsoleMode wants
-  #      isatty/termios.  rd_source.cpp:6 is where the build stops.
+  #   2. Five files included <windows.h> unconditionally -- rd_source.cpp,
+  #      rd_checkpoint.cpp, rd_progress.cpp, rd_cli.cpp, rd_video.cpp -- and the
+  #      Windows API surface is not merely headers.  CreateFileMapping wants mmap,
+  #      GetConsoleMode wants isatty/termios.  FIXED in `3595378`: each file keeps
+  #      its Windows body byte-identical under `#ifdef _WIN32` and gains an `#else`
+  #      POSIX branch.  One more defect waited past the compiler: verify.ps1's
+  #      default -Rdither was the MSVC-only path and this job passes no -Rdither,
+  #      so the first run threw at the existence check before a single case.
+  #      FIXED in `e264661`.
   #
-  # `continue-on-error` stays for the same reason either way: a hard failure on an
-  # unsupported platform turns every push red and trains everyone to ignore the job.
-  # The step does not hide the outcome -- it writes the real reason into the run
-  # summary and names which of the two blockers above it is.
+  # MEASURED on run 39087225277 (e264661): build green; verify.ps1 exit 2;
+  # tally 132 passed, 0 failed against the runner's own ImageMagick 7.1.2-31
+  # Q16-HDRI; the coverage line names the 10 stages that need a second engine
+  # or a GPU, which is expected on this machine and is warned about, not waved
+  # through.  So `continue-on-error` came off in the same change as this
+  # rewrite: this job is a gate now.
   #
-  # WHEN IT DOES PASS, this becomes a real gate and `continue-on-error` comes off.
-  # That is what writing it this way is for.
-  #
-  # WHY IT STILL RUNS THE SUITE rather than only compiling.  A build that links is
+  # WHY IT RUNS THE SUITE rather than only compiling.  A build that links is
   # the least interesting thing this job could check.  Bit-exactness against
-  # ImageMagick is the project's core claim, and it has never been tested against a
-  # Linux ImageMagick.  If the two disagree, that is the single most important
-  # thing anyone could learn about this project, and it is learnable here.
+  # ImageMagick is the project's core claim, and before `3595378` it had never
+  # been tested against a Linux ImageMagick.  It has been now -- which is the
+  # result this job was written to be able to produce.
   linux:
     name: build + verify (Linux, no CUDA, no GPU)
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # See above: a not-yet-supported platform must not turn every push red.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -595,8 +596,9 @@ jobs:
       - name: Record the outcome honestly
         # This step runs whether or not the build did, which is the whole design.
         # A failure here writes the real reason into the run summary instead of
-        # leaving it in a log scroll, and a success says plainly that it is not
-        # yet a claim about Linux support.
+        # leaving it in a log scroll, and a success says what this step can
+        # actually prove: that the tree compiled.  The verify step below is
+        # where the claim about Linux gets made.
         if: always()
         run: |
           {
@@ -610,45 +612,29 @@ jobs:
           if [ "${{ steps.build.outcome }}" = "success" ]; then
             echo "build.sh configured and compiled on ubuntu-latest."
             echo
-            echo "**This is not yet a claim that Linux is supported.** The ImageMagick"
-            echo "flavour CMakeLists.txt understands is \`windows\` or \`conda\`, both of"
-            echo "which expect MSVC import libraries. If this step passed, either a"
-            echo "\`linux\` flavour has been added since this job was written, or the"
-            echo "build succeeded without linking ImageMagick. Check which."
+            echo "That is the expected result since \`3595378\`: the \`linux\` ImageMagick"
+            echo "flavour exists, the five windows.h files carry \`#ifdef _WIN32\` / \`#else\`"
+            echo "POSIX branches, and a build failure here is a regression rather than an"
+            echo "unsupported platform. The verify step below makes the actual claim."
           elif [ "${{ steps.build.outcome }}" = "skipped" ]; then
             echo "**build.sh was never run.** A step before it failed, so this says"
             echo "nothing about Linux and nothing about build.sh. Read the step above"
             echo "this one for the real cause."
           else
-            # The build ran and failed, which is the EXPECTED outcome on a machine
-            # with no POSIX port of this source tree yet.  (This branch used to be
-            # unreachable: a duplicate success-echo block and a second `else` made
-            # the whole step a bash syntax error, and `continue-on-error` above
+            # The build ran and failed.  That USED to be the expected outcome --
+            # five files included windows.h unconditionally and no POSIX port
+            # existed.  The port landed in `3595378`, so this branch now means a
+            # regression on a platform proven to build, and softening it into
+            # "unsupported platform" would hide exactly that.  (It also used to
+            # be unreachable: a duplicate success-echo block and a second `else`
+            # made the whole step a bash syntax error, and `continue-on-error`
             # hid the fact that it had never once posted a summary.)
-            echo "build.sh failed, which is the EXPECTED outcome on a machine with no"
-            echo "POSIX port of this source tree yet."
-            echo
-            echo "WHAT IS DONE: ImageMagick 7 Q16-HDRI builds from source on the runner,"
-            echo "and CMakeLists.txt has a \`linux\` flavour for it. Both landed, and the"
-            echo "configure step completes."
-            echo
-            echo "WHAT IS NOT DONE: the source is Windows-only. Five files include"
-            echo "windows.h unconditionally, and the Windows API surface is not just"
-            echo "headers -- CreateFileMapping needs mmap, GetConsoleMode needs isatty /"
-            echo "termios. So this job stops at the first such include, which is"
-            echo "src/rd_source.cpp:6. The build log above names the exact line."
-            echo
-            echo "A PREREQUISITE THAT IS NOW FIXED, and worth knowing about before the"
-            echo "port lands. The linux ImageMagick flavour in CMakeLists.txt never set"
-            echo "RD_IM_CORE_LIB or RD_IM_WAND_LIB, and target_link_libraries passes both"
-            echo "unconditionally -- so they expanded to empty strings, handed the linker"
-            echo "nothing, and every MagickCore reference would have been an undefined"
-            echo "symbol. It links MagickCore-7.Q16HDRI / MagickWand-7.Q16HDRI now. That"
-            echo "is latent here (this job stops before linking), proven by expanding the"
-            echo "same unset-variable call in a scratch project, which failed LNK2019 and"
-            echo "linked clean once a real library name was set. So the port will reach"
-            echo "the link step and find it already correct, rather than finding a second"
-            echo "Linux-only defect there."
+            echo "build.sh FAILED. Since \`3595378\` that is a regression, not an"
+            echo "unsupported platform: the five windows.h files (rd_source,"
+            echo "rd_checkpoint, rd_progress, rd_cli, rd_video) built clean on"
+            echo "ubuntu-latest with their \`#ifdef _WIN32\` / \`#else\` POSIX branches,"
+            echo "and run 39087225277 took this job green end to end. The build log"
+            echo "below names the failing line."
             echo
             echo '```'
             tail -40 build-linux.log 2>/dev/null || echo "(no build log)"
@@ -658,12 +644,14 @@ jobs:
 
       - name: Verify, if the binary exists
         # Runs the suite only when there is something to run it against.  The
-        # tally is NOT asserted against a fixed number, unlike the Windows job,
-        # because this configuration has never produced one: there is no Linux
-        # baseline to assert against, and inventing one would be the "standard
-        # authored from a number from a different configuration" failure again.
-        # What is asserted is the weaker, honest thing: zero failures, and a
-        # coverage line that says nothing was skipped outright.
+        # tally is NOT asserted against a fixed number, unlike the Windows job.
+        # A Linux baseline exists (132 passed, 0 failed, run 39087225277), but
+        # it moves with the fixture set and with which engines the build
+        # contains, and pinning it would turn every added case into a red job.
+        # What is asserted is the count-free honest thing: exit in {0, 2, 4},
+        # zero failures, and at least one bit-exact case actually run.  Stages
+        # that could not run are warned about in this step, never absorbed
+        # silently into a pass.
         if: steps.build.outcome == 'success'
         shell: pwsh
         run: |
