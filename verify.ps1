@@ -28,7 +28,12 @@
   to catch, living in the suite itself.
 #>
 param(
-  [string]$Rdither   = ".\build\Release\rdither.exe",
+  # Default = the binary the platform's own build produces: MSVC puts it in
+  # build\Release\rdither.exe, build.sh (single-config Makefiles) puts it at
+  # build/rdither.  CI's Linux step invokes verify.ps1 with no -Rdither, so this
+  # default IS the path it tested -- the Windows-only form threw at the existence
+  # check before a single case ran.
+  [string]$Rdither   = $IsWindows ? ".\build\Release\rdither.exe" : "./build/rdither",
   [string]$Magick    = "magick",
   [int[]] $Colors    = @(2, 4, 16, 32, 64, 256),
   [string]$ImageDir  = "tests",
@@ -244,7 +249,7 @@ $env:MAGICK_HOME = if ($env:MAGICK_HOME) { $env:MAGICK_HOME } else { "C:\Program
 # on Linux.
 if (-not $env:TEMP) { $env:TEMP = [IO.Path]::GetTempPath() }
 
-if (-not (Test-Path $Rdither)) { throw "rdither not found at $Rdither (run build.bat first)" }
+if (-not (Test-Path $Rdither)) { throw "rdither not found at $Rdither (run build.bat on Windows or build.sh on Linux first)" }
 # Every probe below runs in a PowerShell 7 child (`& pwsh -NoProfile -File ...`).
 # Without pwsh on PATH each call raises CommandNotFoundException, which is
 # statement-terminating and EAP=Continue swallows into the log: execution
