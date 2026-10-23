@@ -29,6 +29,17 @@ option(RD_WITH_CUDA "Build the CUDA engine" ON)
 option(RD_WITH_OPENCL "Build the OpenCL engine" ON)
 set(RD_OPENCL_SDK "" CACHE PATH
     "Root of the Khronos OpenCL SDK (the folder containing include/CL and lib)")
+# Opt-in speed, measured rather than assumed: on the Xeon E5-2620 v3 (Haswell)
+# /arch:AVX2 ran the 1280x720 plasma case ~17% faster than the default SSE2
+# build (median 1.389s vs 1.670s, 7 runs each) with pixel-identical output --
+# magick compare AE=0, and the full suite against that binary scored the same
+# 132 passed / 0 failed as the baseline.  A companion /Ob3 /GL /LTCG build on
+# top of it measured the same speed within noise (1.379s, ranges overlap), so
+# LTO buys nothing here and is NOT part of this option.
+# OFF by default because the binary then needs AVX2 to run at all (Intel
+# Haswell 2013+, AMD Excavator 2015+): a default like that would silently
+# raise the CPU floor below which the current binary still works.  MSVC only.
+option(RD_AVX2 "Compile with /arch:AVX2 (~17% faster on AVX2 CPUs; run time then REQUIRES AVX2; MSVC only)" OFF)
 # Per-pixel atomics that report how many octree nodes a search visits.  Off by
 # default and not runtime-switchable: with them compiled in they cost a measured
 # 2.5x on the dither stage.  See RD_CC_COUNT in include/rd_cuda_common.cuh.
@@ -387,6 +398,13 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>)
+  if(RD_AVX2)
+    # Same CXX-only form as the block above: /arch:AVX2 is not an nvcc switch,
+    # and feeding it to nvcc as a host flag would only confuse the diagnostic.
+    target_compile_options(rdither PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+  endif()
+elseif(RD_AVX2)
+  message(STATUS "RD_AVX2 is MSVC-only; this compiler is not MSVC, so it was ignored (use -march=native directly if you want the equivalent).")
 endif()
 
 # The import libraries live in lib/, the matching DLLs one level up.  Only the
